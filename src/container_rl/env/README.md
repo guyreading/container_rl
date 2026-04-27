@@ -13,8 +13,7 @@ This project implements the game rules as a **Gymnasium functional JAX environme
 | File | Description |
 |------|-------------|
 | `container_rules.md` | Full board game rules summary (from BGG) |
-| `container.py` | v1 — Skeleton FunctionalJaxEnv with state definition, action space (8 actions), placeholder logic |
-| `container_v2.py` | v2 — Complete refactor with ActionEncoder (11 action types, ~2500 discrete actions), multi-player state, auction mechanics, and encoding/decoding tests |
+| `container.py` | Complete refactor with ActionEncoder (11 action types, ~2500 discrete actions), multi-player state, auction mechanics, and encoding/decoding tests |
 
 ## Architecture
 
@@ -62,7 +61,7 @@ This project implements the game rules as a **Gymnasium functional JAX environme
 ## Running
 
 ```python
-from container_v2 import ContainerJaxEnv
+from container_rl.env.container import ContainerJaxEnv
 
 env = ContainerJaxEnv(num_players=2, num_colors=5)
 obs, info = env.reset()

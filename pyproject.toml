@@ -21,6 +21,10 @@ license = {text = "MIT"}
 dependencies = [
   "typer",
   "rich",
+  "gymnasium>=1.3.0",
+  "jax>=0.10.0",
+  "flax>=0.12.7",
+  "pygame>=2.6.1",
 ]
 requires-python = ">= 3.12"
 
@@ -29,6 +33,7 @@ dev = [
     { include-group = "lint" },
     { include-group = "test" },
     { include-group = "typecheck" },
+    "container-rl",
 ]
 lint = [
     "ruff",
@@ -95,3 +100,11 @@ exclude_also = [
 [tool.uv]
 package = true
 default-groups = ["dev"]
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.uv.sources]
+container-rl = { workspace = true }
