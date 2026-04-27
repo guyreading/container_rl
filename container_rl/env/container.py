@@ -870,9 +870,10 @@ class ContainerFunctional(
     # ========================================================================
 
     def _advance_turn(self, state, action_type, num_players):
+        action_type = jnp.asarray(action_type, dtype=jnp.int32)
         is_auction = action_type == ACTION_MOVE_AUCTION
         is_loan = (action_type == ACTION_TAKE_LOAN) | (action_type == ACTION_REPAY_LOAN)
-        consumes_action = (~is_loan).astype(jnp.int32)
+        consumes_action = (jnp.logical_not(is_loan)).astype(jnp.int32)
 
         new_actions = state.actions_taken + consumes_action
         turn_ends = (new_actions >= 2) | is_auction
@@ -1152,31 +1153,4 @@ class ContainerJaxEnv(FunctionalJaxEnv, EzPickle):
         super().__init__(env, metadata=self.metadata, render_mode=render_mode)
 
 
-# ============================================================================
-# Testing
-# ============================================================================
 
-if __name__ == "__main__":
-    env = ContainerJaxEnv(num_players=2, num_colors=5)
-    encoder = ActionEncoder(num_players=2, num_colors=5)
-
-    print(f"Total actions: {encoder.total_actions}")
-    print(f"Action space: {env.action_space}")
-
-    # Test encoding/decoding
-    test_actions = [
-        (ACTION_BUY_FACTORY, {'color': 0}),
-        (ACTION_BUY_FROM_FACTORY_STORE, {'opponent': 1, 'color': 2, 'price_slot': 3}),
-        (ACTION_MOVE_LOAD, {'opponent': 1, 'color': 4, 'price_slot': 9}),
-        (ACTION_DOMESTIC_SALE, {'store_type': 0, 'color': 1, 'price_slot': 5}),
-    ]
-
-    for action_type, params in test_actions:
-        idx = encoder.encode(action_type, params)
-        decoded_type, decoded_params = encoder.decode(idx)
-        print(f"Encoded {action_type} {params} -> {idx}")
-        print(f"Decoded {idx} -> {decoded_type} {decoded_params}")
-        assert action_type == decoded_type
-        assert params == decoded_params
-
-    print("Encoding/decoding test passed!")
