@@ -1,14 +1,26 @@
-"""TUI for playing the Container board game via the terminal."""
+"""TUI for playing the Container board game via the terminal.
+
+Features:
+- Terminal-resident display (no scrolling)
+- Player boxes in a horizontal row
+- State history with left/right arrow navigation
+- Keyboard-controlled action selection
+"""
 
 from __future__ import annotations
 
+import os
+import select
+import sys
+import termios
+import tty
 from typing import TYPE_CHECKING
 
 import jax
 import typer
 from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
-from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
 from rich.text import Text
 
@@ -42,7 +54,7 @@ jax.config.update("jax_disable_jit", True)
 app = typer.Typer()
 console = Console()
 
-# ── colour palette for container colours ─────────────────────────────────────
+# ── colour palette ───────────────────────────────────────────────────────────
 
 COLOR_NAMES = ["Red", "Blue", "Green", "Yellow", "Purple"]
 COLOR_STYLES = ["red", "blue", "green", "yellow", "magenta"]
@@ -50,26 +62,14 @@ COLOR_EMOJI = ["🔴", "🔵", "🟢", "🟡", "🟣"]
 
 
 def _cname(idx: int, num_colors: int) -> str:
-    if idx < len(COLOR_NAMES):
-        return COLOR_NAMES[idx]
-    return f"Color {idx}"
+    return COLOR_NAMES[idx] if idx < len(COLOR_NAMES) else f"Color {idx}"
 
 
 def _cstyle(idx: int) -> str:
-    if idx < len(COLOR_STYLES):
-        return COLOR_STYLES[idx]
-    return "white"
+    return COLOR_STYLES[idx] if idx < len(COLOR_STYLES) else "white"
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
-
-
-def _resolve_opponent(opp_idx: int, current_player: int, num_players: int) -> int:
-    """Map opponent menu index (1-based, skipping current player) to player index."""
-    candidates = [p for p in range(num_players) if p != current_player]
-    if 1 <= opp_idx <= len(candidates):
-        return candidates[opp_idx - 1]
-    return (current_player + 1) % num_players
 
 
 def _opponent_menu_indices(current_player: int, num_players: int) -> list[int]:
@@ -79,32 +79,7 @@ def _opponent_menu_indices(current_player: int, num_players: int) -> list[int]:
 # ── state rendering ──────────────────────────────────────────────────────────
 
 
-def _render_store_table(store, player: int, num_colors: int) -> Table:
-    """Render a store array as a Rich table: rows=colors, cols=price slots."""
-    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1), show_edge=False)
-    table.add_column("Color", style="bold", width=8)
-    for s in range(PRICE_SLOTS):
-        table.add_column(f"${s + 1}", justify="right", width=4)
-    table.add_column("Tot", justify="right", width=4)
-
-    for c in range(num_colors):
-        counts = [int(store[player, c, s]) for s in range(PRICE_SLOTS)]
-        total = sum(counts)
-        if total == 0:
-            continue
-        row = [f"[{_cstyle(c)}]{_cname(c, num_colors)}[/{_cstyle(c)}]"]
-        for cnt in counts:
-            row.append(str(cnt) if cnt > 0 else "·")
-        row.append(str(total))
-        table.add_row(*row)
-
-    if len(table.rows) == 0:
-        table.add_row("[dim](empty)[/dim]", *([""] * (PRICE_SLOTS + 1)))
-    return table
-
-
 def _render_store_compact(store, player: int, num_colors: int) -> str:
-    """Render a store as a compact single-line-per-color format."""
     lines = []
     for c in range(num_colors):
         entries = []
@@ -119,359 +94,377 @@ def _render_store_compact(store, player: int, num_colors: int) -> str:
     return "\n".join(lines)
 
 
+def _render_store_table(store, player: int, num_colors: int) -> Table:
+    table = Table(show_header=True, header_style="bold", box=None, padding=(0, 1), show_edge=False)
+    table.add_column("Col", style="bold", width=5)
+    for s in range(PRICE_SLOTS):
+        table.add_column(f"${s + 1}", justify="right", width=3)
+    table.add_column("∑", justify="right", width=3)
+
+    for c in range(num_colors):
+        counts = [int(store[player, c, s]) for s in range(PRICE_SLOTS)]
+        total = sum(counts)
+        if total == 0:
+            continue
+        row = [f"[{_cstyle(c)}]{_cname(c, num_colors)}[/{_cstyle(c)}]"]
+        row += [str(cnt) if cnt > 0 else "·" for cnt in counts]
+        row.append(str(total))
+        table.add_row(*row)
+
+    if len(table.rows) == 0:
+        table.add_row("[dim](empty)[/dim]", *([""] * (PRICE_SLOTS + 1)))
+    return table
+
+
 def _render_island(island_store, player: int, num_colors: int) -> str:
-    """Render island store as a compact string."""
     parts = []
     for c in range(num_colors):
         cnt = int(island_store[player, c])
         if cnt > 0:
-            parts.append(f"[{_cstyle(c)}]{cnt}x {_cname(c, num_colors)}[/{_cstyle(c)}]")
+            parts.append(f"[{_cstyle(c)}]{cnt}×{_cname(c, num_colors)}[/{_cstyle(c)}]")
     return "  ".join(parts) if parts else "[dim](empty)[/dim]"
 
 
-def _render_ship(ship_contents, ship_location, player: int) -> str:
-    """Render ship contents and location as a string."""
-    row = ship_contents[player]
-    loc = int(ship_location[player])
+def _render_ship(state: EnvState, player: int) -> str:
+    row = state.ship_contents[player]
     parts = []
     for i in range(SHIP_CAPACITY):
         c = int(row[i])
-        if c > 0:
-            parts.append(f"[{_cstyle(c - 1)}]{'■'}[/{_cstyle(c - 1)}]")
-        else:
-            parts.append("·")
-    cargo_str = " ".join(parts)
+        parts.append(f"[{_cstyle(c - 1)}]{'■'}[/{_cstyle(c - 1)}]" if c > 0 else "·")
 
+    loc = int(state.ship_location[player])
     if loc == LOCATION_OPEN_SEA:
-        location_str = "[cyan]Open Sea[/cyan]"
+        loc_str = "[cyan]Open Sea[/cyan]"
     elif loc == LOCATION_AUCTION_ISLAND:
-        location_str = "[yellow]Auction Island[/yellow]"
+        loc_str = "[yellow]Auction Isl.[/yellow]"
     elif loc >= LOCATION_HARBOUR_OFFSET:
-        location_str = f"[green]Player {loc - LOCATION_HARBOUR_OFFSET + 1}'s Harbour[/green]"
+        loc_str = f"[green]P{loc - LOCATION_HARBOUR_OFFSET + 1}'s Harbour[/green]"
     else:
-        location_str = str(loc)
-
-    return f"{cargo_str}  @  {location_str}"
-
-
-def _render_player_panel(state: EnvState, player: int, num_colors: int, is_current: bool) -> Panel:
-    """Render one player's full board."""
-    cash = int(state.cash[player])
-    loans = int(state.loans[player])
-    warehouses = int(state.warehouse_count[player])
-    secret = int(state.secret_value_color[player])
-
-    factories = []
-    for c in range(num_colors):
-        if int(state.factory_colors[player, c]) > 0:
-            factories.append(f"[{_cstyle(c)}]{_cname(c, num_colors)}[/{_cstyle(c)}]")
-    factory_str = ", ".join(factories) if factories else "[dim]none[/dim]"
-
-    nw = _compute_net_worth_simple(state, player, num_colors)
-
-    header_parts = []
-    if is_current:
-        header_parts.append("[bold white on green] ► CURRENT TURN [/bold white on green] ")
-    header_parts.append(f"[bold]Player {player + 1}[/bold]")
-    title = " ".join(header_parts)
-
-    elements: list = [
-        Text.from_markup(f"💵 Cash: ${cash}  |  🏦 Loans: {loans}  |  🏭 Warehouses: {warehouses}"),
-        Text.from_markup(f"🤫 Secret 10/5: [{_cstyle(secret)}]{_cname(secret, num_colors)}[/{_cstyle(secret)}]"),
-        Text.from_markup(f"📊 Net Worth: ~${nw}"),
-        Text.from_markup(f"🏭 Factories: {factory_str}"),
-        Text(),
-        Text("📦 Factory Store:", style="bold"),
-        Text.from_markup(_render_store_compact(state.factory_store, player, num_colors)),
-        Text(),
-        Text("🏪 Harbour Store:", style="bold"),
-        Text.from_markup(_render_store_compact(state.harbour_store, player, num_colors)),
-        Text(),
-        Text.from_markup(f"🏝️ Island: {_render_island(state.island_store, player, num_colors)}"),
-        Text.from_markup(f"🚢 Ship: {_render_ship(state.ship_contents, state.ship_location, player)}"),
-    ]
-
-    style = "green" if is_current else "white"
-    return Panel(Group(*elements), title=title, border_style=style)
+        loc_str = str(loc)
+    return f"{' '.join(parts)}  @ {loc_str}"
 
 
-def _render_supply(state: EnvState, num_colors: int) -> Panel:
-    """Render container supply status."""
-    parts = []
-    exhausted = 0
-    for c in range(num_colors):
-        cnt = int(state.container_supply[c])
-        if cnt <= 0:
-            parts.append(f"[{_cstyle(c)}]{_cname(c, num_colors)}[/{_cstyle(c)}]: [red]EXHAUSTED[/red]")
-            exhausted += 1
-        else:
-            parts.append(f"[{_cstyle(c)}]{_cname(c, num_colors)}[/{_cstyle(c)}]: {cnt}")
-    text = "  ".join(parts)
-    text += f"\n[bold]Exhausted colours: {exhausted}/2 needed to end game[/bold]"
-    return Panel(text, title="Container Supply", border_style="yellow")
-
-
-def _compute_net_worth_simple(state: EnvState, player: int, num_colors: int) -> int:
-    """Quick net worth approximation for display (doesn't do full discard logic)."""
+def _compute_net_worth(state: EnvState, player: int, num_colors: int) -> int:
     cash = int(state.cash[player])
     loans_penalty = int(state.loans[player]) * 11
     harbour_val = int(jax.numpy.sum(state.harbour_store[player])) * 2
     ship_val = int(jax.numpy.sum(state.ship_contents[player] > 0)) * 3
-    island_row = state.island_store[player]
     secret = int(state.secret_value_color[player])
-    has_all = int(jax.numpy.all(island_row > 0))
+    island = state.island_store[player]
+    has_all = int(jax.numpy.all(island > 0))
     island_val = 0
     for c in range(num_colors):
-        cnt = int(island_row[c])
+        cnt = int(island[c])
         if cnt > 0:
-            if c == secret:
-                island_val += cnt * (10 if has_all else 5)
-            else:
-                island_val += cnt * 2
+            island_val += cnt * (10 if (c == secret and has_all) else 5 if c == secret else 2)
     return cash + harbour_val + ship_val + island_val - loans_penalty
 
 
-def render_full_state(state: EnvState, num_players: int, num_colors: int, last_action: str = "") -> list:
-    """Render the complete game state as a list of renderables."""
-    out: list = []
+def _player_card(state: EnvState, player: int, nc: int, is_current: bool, width: int = 28) -> Text:
+    """Render a compact one-player card as a Text object."""
+    cash = int(state.cash[player])
+    loans = int(state.loans[player])
+    wh = int(state.warehouse_count[player])
+    secret = int(state.secret_value_color[player])
+    nw = _compute_net_worth(state, player, nc)
 
-    header_text = Text(
-        f"🚢 CONTAINER  |  Turn: Player {int(state.current_player) + 1}  |  Actions taken: {int(state.actions_taken)}",
-        style="bold white on blue",
-    )
-    if last_action:
-        header_text.append(f"\n[dim]Last: {last_action}[/dim]")
-    out.append(Panel(header_text))
+    factories = []
+    for c in range(nc):
+        if int(state.factory_colors[player, c]):
+            factories.append(f"[{_cstyle(c)}]{_cname(c, nc)}[/{_cstyle(c)}]")
+    fac_str = ", ".join(factories) if factories else "[dim]none[/dim]"
 
-    out.append(_render_supply(state, num_colors))
+    current_badge = " [bold white on green]◄[/bold white on green]" if is_current else ""
+    header = f"[bold]P{player + 1}{current_badge}[/bold]  ${nw}"
+    line = "─" * max(0, width - len(header) + 10)
 
-    for p in range(num_players):
-        is_current = int(state.current_player) == p
-        out.append(_render_player_panel(state, p, num_colors, is_current))
-
-    out.append(Panel("Type /help for commands  |  /quit to exit", style="dim"))
-
+    out = Text()
+    out.append(header + "\n")
+    out.append(f"{line}\n")
+    out.append(f"  💵 ${cash}  🏦 {loans} loans  🏭 {wh} wh\n")
+    out.append(f"  🤫 [{_cstyle(secret)}]{_cname(secret, nc)}[/{_cstyle(secret)}]\n")
+    out.append(f"  Factories: {fac_str}\n")
+    out.append("\n")
+    out.append("  [bold]Factory Store:[/bold]\n")
+    out.append(f"{_render_store_compact(state.factory_store, player, nc)}\n")
+    out.append("  [bold]Harbour Store:[/bold]\n")
+    out.append(f"{_render_store_compact(state.harbour_store, player, nc)}\n")
+    out.append(f"  🏝️ {_render_island(state.island_store, player, nc)}\n")
+    out.append(f"  🚢 {_render_ship(state, player)}")
     return out
 
 
-# ── action selection ─────────────────────────────────────────────────────────
+def _supply_bar(state, nc: int) -> Text:
+    parts = []
+    exhausted = 0
+    for c in range(nc):
+        cnt = int(state.container_supply[c])
+        if cnt <= 0:
+            parts.append(f"[{_cstyle(c)}]{_cname(c, nc)}[/{_cstyle(c)}]: [red]0[/red]")
+            exhausted += 1
+        else:
+            bar = "█" * min(cnt, 10)
+            parts.append(f"[{_cstyle(c)}]{_cname(c, nc)}[/{_cstyle(c)}]: {bar} {cnt}")
+    text = "  │  ".join(parts)
+    text += f"  │  [bold]Exhausted: {exhausted}/2[/bold]"
+    return Text.from_markup(text)
 
 
-def _pick_color(num_colors: int, prompt: str = "Choose colour") -> int:
-    console.print()
-    for c in range(num_colors):
-        emoji = COLOR_EMOJI[c] if c < len(COLOR_EMOJI) else ""
-        console.print(f"  [{_cstyle(c)}]{c + 1}. {emoji} {_cname(c, num_colors)}[/{_cstyle(c)}]")
-    choice = IntPrompt.ask(prompt, choices=[str(i + 1) for i in range(num_colors)], show_choices=False)
-    return choice - 1
-
-
-def _pick_price_slot(prompt: str = "Choose price slot") -> int:
-    slot = IntPrompt.ask(f"{prompt} ($1-$10)", choices=[str(i) for i in range(1, PRICE_SLOTS + 1)], show_choices=False)
-    return slot - 1
-
-
-def _pick_opponent(current_player: int, num_players: int) -> int:
-    candidates = _opponent_menu_indices(current_player, num_players)
-    if len(candidates) == 1:
-        return candidates[0]
-    console.print()
-    for i, p in enumerate(candidates):
-        console.print(f"  {i + 1}. Player {p + 1}")
-    choice = IntPrompt.ask("Choose opponent", choices=[str(i + 1) for i in range(len(candidates))], show_choices=False)
-    return candidates[choice - 1]
-
-
-def _show_store_preview(state: EnvState, player: int, num_colors: int, store_type: str = "factory") -> None:
-    """Show a preview of another player's store to help with buying decisions."""
-    store = state.factory_store if store_type == "factory" else state.harbour_store
-    console.print(f"\n[bold]Player {player + 1}'s {store_type.title()} Store:[/bold]")
-    table = _render_store_table(store, player, num_colors)
-    console.print(table)
-
-
-def _pick_store_container(state: EnvState, player: int, num_colors: int, store_type: str) -> dict | None:
-    """Let user pick a container from another player's store. Returns params or None if cancelled."""
-    store = state.factory_store if store_type == "factory" else state.harbour_store
-    _show_store_preview(state, player, num_colors, store_type)
-
-    available = []
-    for c in range(num_colors):
-        for s in range(PRICE_SLOTS):
-            if int(store[player, c, s]) > 0:
-                available.append((c, s))
-
-    if not available:
-        console.print("[red]No containers available in this store.[/red]")
-        return None
-
-    console.print("\n[bold]Available containers:[/bold]")
-    for i, (c, s) in enumerate(available):
-        cnt = int(store[player, c, s])
-        console.print(
-            f"  [{_cstyle(c)}]{i + 1}. {cnt}x {_cname(c, num_colors)}[/{_cstyle(c)}]"
-            f" at [yellow]${s + 1}[/yellow]"
-        )
-
-    num_opts = len(available)
-    choice = IntPrompt.ask(
-        "Pick a container (or 0 to cancel)",
-        choices=["0"] + [str(i + 1) for i in range(num_opts)],
-        show_choices=False,
+def _action_help() -> Text:
+    return Text.from_markup(
+        " [1]BuyFactory  [2]BuyWarehouse  [3]Produce  [4]BuyFromFactory  [5]LoadShip\n"
+        " [6]MoveToSea   [7]Auction    [p]Pass    [l]TakeLoan        [r]RepayLoan  [d]DomesticSale\n"
+        " [←→] history  [q]uit"
     )
-    if choice == 0:
+
+
+def _render_frame(
+    state: EnvState,
+    nc: int,
+    num_players: int,
+    hist_msg: str = "",
+    prompt: str = "",
+    action_feedback: str = "",
+) -> Group:
+    """Build the full terminal frame."""
+    elements = []
+
+    # ── header ──
+    turn = int(state.current_player)
+    actions = int(state.actions_taken)
+    header = f"🚢 CONTAINER  │  Player {turn + 1}'s turn  │  Action {actions + 1}/2"
+    if hist_msg:
+        header += f"  │  {hist_msg}"
+    elements.append(Panel(Text(header, style="bold white on blue")))
+
+    # ── supply ──
+    elements.append(Panel(_supply_bar(state, nc), title="Supply", border_style="yellow"))
+
+    # ── player cards row ──
+    cards = []
+    for p in range(num_players):
+        is_current = int(state.current_player) == p
+        cards.append(_player_card(state, p, nc, is_current))
+
+    from rich.columns import Columns
+    elements.append(Columns(cards, equal=False, expand=True))
+
+    # ── action feedback ──
+    if action_feedback:
+        elements.append(Panel(Text(action_feedback, style="green"), border_style="green"))
+
+    # ── action help ──
+    elements.append(Panel(_action_help(), title="Actions", border_style="cyan"))
+
+    # ── prompt ──
+    if prompt:
+        elements.append(Panel(Text(prompt, style="bold yellow"), border_style="yellow"))
+
+    return Group(*elements)
+
+
+# ── keyboard input ───────────────────────────────────────────────────────────
+
+
+_stdin_fd = sys.stdin.fileno()
+
+
+def _getch() -> str:
+    """Read a single character from stdin, handling escape sequences (blocks)."""
+    fd = _stdin_fd
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd, when=termios.TCSADRAIN)
+        ch = os.read(fd, 1).decode()
+        if ch == "\x1b":
+            r, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if r:
+                ch2 = os.read(fd, 1).decode()
+                if ch2 == "[":
+                    r2, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if r2:
+                        ch3 = os.read(fd, 1).decode()
+                        return f"\x1b[{ch3}"
+                    return "\x1b["
+                return ch + ch2
+            return ch
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def _getch_timeout(timeout: float = 0.01) -> str:
+    """Read a single character, handling arrow-key escape sequences."""
+    fd = _stdin_fd
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd, when=termios.TCSADRAIN)
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not r:
+            return ""
+        ch = os.read(fd, 1).decode()
+        if ch == "\x1b":
+            r2, _, _ = select.select([sys.stdin], [], [], 0.05)
+            if r2:
+                ch2 = os.read(fd, 1).decode()
+                if ch2 == "[":
+                    r3, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    if r3:
+                        ch3 = os.read(fd, 1).decode()
+                        return f"\x1b[{ch3}"
+                    return "\x1b["
+                return ch + ch2
+            return ch
+        return ch
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+# ── input dialogs (work within the live display) ─────────────────────────────
+
+
+def _input_number(prompt: str, max_val: int, live: Live, nc: int, np_: int, current_state) -> int | None:
+    """Read a number 1-max_val via keystrokes while showing prompt in live display."""
+    buf = ""
+    while True:
+        live.update(
+            _render_frame(current_state, nc, np_, prompt=f"{prompt} [{buf}]")
+        )
+        ch = _getch_timeout(10.0)
+        if ch == "":
+            continue
+        if ch in ("\r", "\n"):
+            if buf.isdigit():
+                val = int(buf)
+                if 1 <= val <= max_val:
+                    return val
+            # Invalid, clear buf
+            buf = ""
+        elif ch in ("\x7f", "\x08"):  # backspace
+            buf = buf[:-1]
+        elif ch == "\x1b":  # ESC to cancel
+            return None
+        elif ch.isdigit():
+            buf += ch
+
+
+def _input_choice(options: list[str], live: Live, nc: int, np_: int, current_state) -> int | None:
+    """Present a list of options and let user select with number keys or ESC to cancel."""
+    prompt_text = "\n".join(f"  {i + 1}. {opt}" for i, opt in enumerate(options))
+    prompt_text += "\n\n[dim]Number to select, ESC to cancel[/dim]"
+    return _input_number(prompt_text, len(options), live, nc, np_, current_state)
+
+
+# ── sub-action menu (choose colors, opponents, etc.) ─────────────────────────
+
+
+def _submenu_buy_factory(state: EnvState, live: Live, nc: int, np_: int, num_players: int) -> dict | None:
+    player = int(state.current_player)
+    owned = {c for c in range(nc) if int(state.factory_colors[player, c]) > 0}
+    options = []
+    option_colors = []
+    for c in range(nc):
+        emoji = COLOR_EMOJI[c] if c < len(COLOR_EMOJI) else ""
+        status = " [dim](already owned)[/dim]" if c in owned else ""
+        options.append(f"[{_cstyle(c)}]{emoji} {_cname(c, nc)}[/{_cstyle(c)}]{status}")
+        option_colors.append(c)
+    if not options:
+        return None
+    choice = _input_choice(options, live, nc, np_, state)
+    if choice is None:
+        return None
+    return {"color": option_colors[choice - 1]}
+
+
+def _submenu_pick_store(
+    state: EnvState, target: int, store_type: str, live: Live, nc: int, np_: int
+) -> dict | None:
+    store = state.factory_store if store_type == "factory" else state.harbour_store
+    available = []
+    for c in range(nc):
+        for s in range(PRICE_SLOTS):
+            if int(store[target, c, s]) > 0:
+                available.append((c, s))
+    if not available:
+        return None
+    options = []
+    for c, s in available:
+        cnt = int(store[target, c, s])
+        options.append(f"[{_cstyle(c)}]{cnt}× {_cname(c, nc)}[/{_cstyle(c)}] at [yellow]${s + 1}[/yellow]")
+    choice = _input_choice(options, live, nc, np_, state)
+    if choice is None:
         return None
     c, s = available[choice - 1]
     return {"color": c, "price_slot": s}
 
 
-def get_human_action(state: EnvState, encoder: ActionEncoder, num_players: int, num_colors: int) -> int:
-    """Interactive action selection for a human player."""
+def _submenu_pick_opponent(state: EnvState, live: Live, nc: int, np_: int, num_players: int) -> int | None:
     player = int(state.current_player)
+    candidates = _opponent_menu_indices(player, num_players)
+    if len(candidates) == 1:
+        return candidates[0]
+    options = [f"Player {p + 1}" for p in candidates]
+    choice = _input_choice(options, live, nc, np_, state)
+    if choice is None:
+        return None
+    return candidates[choice - 1]
 
-    console.print(f"\n[bold]Player {player + 1}'s turn — choose an action:[/bold]\n")
 
-    actions = [
-        ("1", "Buy Factory", ACTION_BUY_FACTORY),
-        ("2", "Buy Warehouse", ACTION_BUY_WAREHOUSE),
-        ("3", "Produce containers", ACTION_PRODUCE),
-        ("4", "Buy from Factory Store", ACTION_BUY_FROM_FACTORY_STORE),
-        ("5", "Move to Harbour + Load", ACTION_MOVE_LOAD),
-        ("6", "Move to Open Sea", ACTION_MOVE_SEA),
-        ("7", "Move to Auction Island", ACTION_MOVE_AUCTION),
-        ("p", "Pass [dim](Enter/space)[/dim]", ACTION_PASS),
-        ("l", "Take Loan", ACTION_TAKE_LOAN),
-        ("r", "Repay Loan", ACTION_REPAY_LOAN),
-        ("d", "Domestic Sale", ACTION_DOMESTIC_SALE),
+def _submenu_domestic_sale(state: EnvState, live: Live, nc: int, np_: int, num_players: int) -> dict | None:
+    player = int(state.current_player)
+    # First pick store type
+    store_options = [
+        "Factory Store (falls back to Harbour if empty)",
+        "Harbour Store",
     ]
+    choice = _input_choice(store_options, live, nc, np_, state)
+    if choice is None:
+        return None
+    store_type = choice - 1
 
-    for key, name, _ in actions:
-        console.print(f"  [{key}] {name}")
-
-    while True:
-        raw = Prompt.ask("\nAction").strip().lower()
-        if raw in ("", "p", " "):
-            return encoder.encode(ACTION_PASS, {})
-        for key, _name, atype in actions:
-            if raw == key:
-                action_type = atype
-                break
-        else:
-            console.print("[red]Invalid choice. Try again (or Enter to Pass).[/red]")
-            continue
-        break
-
-    params: dict = {}
-
-    if action_type == ACTION_BUY_FACTORY:
-        color = _pick_color(num_colors, "Choose factory colour")
-        params = {"color": color}
-
-    elif action_type == ACTION_BUY_WAREHOUSE:
-        pass
-
-    elif action_type == ACTION_PRODUCE:
-        pass
-
-    elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
-        target = _pick_opponent(player, num_players)
-        picked = _pick_store_container(state, target, num_colors, "factory")
-        if picked is None:
-            return get_human_action(state, encoder, num_players, num_colors)
-        opp_menu_idx = _opponent_menu_indices(player, num_players).index(target)
-        params = {"opponent": opp_menu_idx + 1, "color": picked["color"], "price_slot": picked["price_slot"]}
-
-    elif action_type == ACTION_MOVE_LOAD:
-        target = _pick_opponent(player, num_players)
-        picked = _pick_store_container(state, target, num_colors, "harbour")
-        if picked is None:
-            return get_human_action(state, encoder, num_players, num_colors)
-        opp_menu_idx = _opponent_menu_indices(player, num_players).index(target)
-        params = {"opponent": opp_menu_idx + 1, "color": picked["color"], "price_slot": picked["price_slot"]}
-
-    elif action_type == ACTION_MOVE_SEA:
-        pass
-
-    elif action_type == ACTION_MOVE_AUCTION:
-        pass
-
-    elif action_type == ACTION_PASS:
-        pass
-
-    elif action_type == ACTION_TAKE_LOAN:
-        pass
-
-    elif action_type == ACTION_REPAY_LOAN:
-        pass
-
-    elif action_type == ACTION_DOMESTIC_SALE:
-        console.print("\n[bold]Choose source:[/bold]")
-        console.print("  1. Factory Store (falls back to Harbour if empty)")
-        console.print("  2. Harbour Store")
-        store_choice = IntPrompt.ask("Source", choices=["1", "2"], show_choices=False)
-        store_type = store_choice - 1
-
-        own_store = state.factory_store if store_type == 0 else state.harbour_store
-        available = []
-        for c in range(num_colors):
+    own_store = state.factory_store if store_type == 0 else state.harbour_store
+    available = []
+    for c in range(nc):
+        for s in range(PRICE_SLOTS):
+            if int(own_store[player, c, s]) > 0:
+                available.append((c, s))
+    if not available and store_type == 0:
+        own_store = state.harbour_store
+        for c in range(nc):
             for s in range(PRICE_SLOTS):
-                cnt = int(own_store[player, c, s])
-                if cnt > 0:
+                if int(own_store[player, c, s]) > 0:
                     available.append((c, s))
-        if not available and store_type == 0:
-            own_store = state.harbour_store
-            for c in range(num_colors):
-                for s in range(PRICE_SLOTS):
-                    if int(own_store[player, c, s]) > 0:
-                        available.append((c, s))
-
-        if not available:
-            console.print("[red]No containers available for domestic sale.[/red]")
-            return get_human_action(state, encoder, num_players, num_colors)
-
-        console.print("\n[bold]Your containers:[/bold]")
-        for i, (c, s) in enumerate(available):
-            cnt = int(own_store[player, c, s])
-            console.print(
-                f"  [{_cstyle(c)}]{i + 1}. {cnt}x {_cname(c, num_colors)}[/{_cstyle(c)}]"
-                f" at [yellow]${s + 1}[/yellow]"
-            )
-        num_opts = len(available)
-        choice = IntPrompt.ask(
-            "Pick a container (or 0 to cancel)",
-            choices=["0"] + [str(i + 1) for i in range(num_opts)],
-            show_choices=False,
-        )
-        if choice == 0:
-            return get_human_action(state, encoder, num_players, num_colors)
-        c, s = available[choice - 1]
-        params = {"store_type": store_type, "color": c, "price_slot": s}
-
-    return encoder.encode(action_type, params)
+    if not available:
+        return None
+    options = [
+        f"[{_cstyle(c)}]{int(own_store[player, c, s])}× {_cname(c, nc)}[/{_cstyle(c)}] at [yellow]${s + 1}[/yellow]"
+        for c, s in available
+    ]
+    choice = _input_choice(options, live, nc, np_, state)
+    if choice is None:
+        return None
+    c, s = available[choice - 1]
+    return {"store_type": store_type, "color": c, "price_slot": s}
 
 
-def _describe_action(action_type: int, params: dict, num_colors: int) -> str:
-    """Return a human-readable description of an action."""
+# ── describe actions ─────────────────────────────────────────────────────────
+
+
+def _describe_action(action_type: int, params: dict, nc: int) -> str:
     if action_type == ACTION_BUY_FACTORY:
-        return f"Buy {_cname(params.get('color', 0), num_colors)} factory"
+        return f"Buy {_cname(params.get('color', 0), nc)} factory"
     elif action_type == ACTION_BUY_WAREHOUSE:
         return "Buy warehouse"
     elif action_type == ACTION_PRODUCE:
         return "Produce containers"
     elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
-        opp = params.get("opponent", 1)
-        c = params.get("color", 0)
-        s = params.get("price_slot", 0)
-        return f"Buy {_cname(c, num_colors)} from P{opp}'s factory @ ${s + 1}"
+        return f"Buy {_cname(params.get('color', 0), nc)} from P{params.get('opponent', 1)}'s factory"
     elif action_type == ACTION_MOVE_LOAD:
-        opp = params.get("opponent", 1)
-        c = params.get("color", 0)
-        s = params.get("price_slot", 0)
-        return f"Load {_cname(c, num_colors)} from P{opp}'s harbour @ ${s + 1}"
+        return f"Load {_cname(params.get('color', 0), nc)} from P{params.get('opponent', 1)}'s harbour"
     elif action_type == ACTION_MOVE_SEA:
         return "Move to Open Sea"
     elif action_type == ACTION_MOVE_AUCTION:
-        return "Hold auction at Auction Island"
+        return "Auction at Auction Island"
     elif action_type == ACTION_PASS:
         return "Pass"
     elif action_type == ACTION_TAKE_LOAN:
@@ -479,79 +472,65 @@ def _describe_action(action_type: int, params: dict, num_colors: int) -> str:
     elif action_type == ACTION_REPAY_LOAN:
         return "Repay loan"
     elif action_type == ACTION_DOMESTIC_SALE:
-        c = params.get("color", 0)
-        return f"Domestic sale of {_cname(c, num_colors)}"
+        return f"Domestic sale of {_cname(params.get('color', 0), nc)}"
     return f"Action {action_type}"
 
 
 # ── AI opponent ──────────────────────────────────────────────────────────────
 
 
-def get_ai_action(state: EnvState, rng_key, num_players: int, num_colors: int) -> int:
-    """Simple heuristic AI for non-human players."""
+def get_ai_action(state: EnvState, rng_key, num_players: int, num_colors: int) -> tuple[int, object]:
     import jax.numpy as jnp
     from jax import random
 
     player = int(state.current_player)
     encoder = ActionEncoder(num_players, num_colors)
-
     key, subkey = random.split(rng_key)
 
     produced = int(state.produced_this_turn) > 0
-    factory_count = int(jnp.sum(state.factory_colors[player]))
-    warehouse_count = int(state.warehouse_count[player])
+    fc = int(jnp.sum(state.factory_colors[player]))
+    wc = int(state.warehouse_count[player])
     cash = int(state.cash[player])
     loans = int(state.loans[player])
-    has_space_factory = int(jnp.sum(state.factory_store[player])) < factory_count * 2
-    has_space_harbour = int(jnp.sum(state.harbour_store[player])) < warehouse_count
+    has_space_f = int(jnp.sum(state.factory_store[player])) < fc * 2
+    has_space_h = int(jnp.sum(state.harbour_store[player])) < wc
 
-    if has_space_factory and not produced:
+    if has_space_f and not produced:
         return encoder.encode(ACTION_PRODUCE, {}), subkey
 
     if loans > 0 and cash >= 11:
         return encoder.encode(ACTION_REPAY_LOAN, {}), subkey
 
-    if has_space_harbour:
-        opp_indices = _opponent_menu_indices(player, num_players)
+    opp_indices = _opponent_menu_indices(player, num_players)
+    if has_space_h:
         for opp in opp_indices:
             for c in range(num_colors):
                 for s in range(PRICE_SLOTS):
                     if int(state.factory_store[opp, c, s]) > 0 and cash >= (s + 1):
-                        opp_menu_idx = opp_indices.index(opp)
-                        params = {
-                            "opponent": opp_menu_idx + 1,
-                            "color": c,
-                            "price_slot": s,
-                        }
+                        params = {"opponent": opp_indices.index(opp) + 1, "color": c, "price_slot": s}
                         return encoder.encode(ACTION_BUY_FROM_FACTORY_STORE, params), subkey
 
-    owned_colors = {c for c in range(num_colors) if int(state.factory_colors[player, c]) > 0}
+    owned = {c for c in range(num_colors) if int(state.factory_colors[player, c]) > 0}
     for c in range(num_colors):
-        if c not in owned_colors and factory_count < 5 and cash >= (factory_count + 1) * 2:
+        if c not in owned and fc < 5 and cash >= (fc + 1) * 2:
             return encoder.encode(ACTION_BUY_FACTORY, {"color": c}), subkey
 
-    if warehouse_count < 10 and cash >= (warehouse_count + 1):
+    if wc < 10 and cash >= (wc + 1):
         return encoder.encode(ACTION_BUY_WAREHOUSE, {}), subkey
 
-    cargo_count = int(jnp.sum(state.ship_contents[player] > 0))
-    if cargo_count > 0 and int(state.ship_location[player]) == LOCATION_OPEN_SEA:
+    cargo = int(jnp.sum(state.ship_contents[player] > 0))
+    if cargo > 0 and int(state.ship_location[player]) == LOCATION_OPEN_SEA:
         return encoder.encode(ACTION_MOVE_AUCTION, {}), subkey
 
-    if cargo_count > 0 and int(state.ship_location[player]) >= LOCATION_HARBOUR_OFFSET:
+    if cargo > 0 and int(state.ship_location[player]) >= LOCATION_HARBOUR_OFFSET:
         return encoder.encode(ACTION_MOVE_SEA, {}), subkey
 
-    if cargo_count < SHIP_CAPACITY:
-        opp_indices = _opponent_menu_indices(player, num_players)
+    if cargo < SHIP_CAPACITY:
         for opp in opp_indices:
             for c in range(num_colors):
                 for s in range(PRICE_SLOTS):
                     if int(state.harbour_store[opp, c, s]) > 0 and cash >= (s + 1):
-                        opp_menu_idx = opp_indices.index(opp)
-                        params = {
-                            "opponent": opp_menu_idx + 1,
-                            "color": c,
-                            "price_slot": s,
-                        }
+                        params = {"opponent": opp_indices.index(opp) + 1, "color": c, "price_slot": s}
                         return encoder.encode(ACTION_MOVE_LOAD, params), subkey
 
     if cash < 5 and loans < 2:
@@ -570,106 +549,196 @@ def play(
     human_players: str = typer.Option("0", "--humans", "-h", help="Comma-separated human player indices (0-based)"),
     seed: int = typer.Option(42, "--seed", "-s", help="Random seed"),
 ) -> None:
-    """Play the Container board game in the terminal."""
+    """Play the Container board game in the terminal with a live TUI."""
     human_set = {int(x.strip()) for x in human_players.split(",") if x.strip()}
     for h in human_set:
         if h < 0 or h >= num_players:
-            console.print(f"[red]Invalid human player index: {h}. Must be 0-{num_players - 1}.[/red]")
+            console.print(f"[red]Invalid human player index: {h}[/red]")
             raise typer.Exit(1)
-
-    if num_colors > 5:
-        console.print(
-            "[yellow]Warning: Only 5 colours have display names."
-            " Extra colours will show as numbers.[/yellow]"
-        )
 
     env = ContainerJaxEnv(num_players=num_players, num_colors=num_colors)
     encoder = ActionEncoder(num_players, num_colors)
     obs, info = env.reset(seed=seed)
-
     rng_key = jax.random.PRNGKey(seed)
 
-    console.clear()
-    console.print("[bold]Welcome to Container! 🚢[/bold]")
-    console.print(f"Players: {num_players}  |  Colours: {num_colors}  |  Seed: {seed}")
-    human_labels = [f"P{p + 1}" for p in sorted(human_set)]
-    console.print(f"Human players: {', '.join(human_labels) if human_labels else 'none (AI-only)'}")
-    console.print("\nPress Enter to start...")
-    input()
-
-    last_action_desc = ""
-    step = 0
+    # state history: list of (state, description, reward)
+    history: list[tuple[EnvState, str, float]] = [(env.state, "(start)", 0.0)]
+    hist_idx = 0  # which history entry we're viewing (-1 = latest after game end)
+    viewing_history = False
     done = False
 
-    while not done:
-        state = env.state
-        current = int(state.current_player)
-        is_terminal = bool(env.func_env.terminal(state, rng_key, env.func_env.params))
+    nc = num_colors
+    np_ = num_players
 
-        if is_terminal:
-            done = True
-            break
+    with Live(_render_frame(env.state, nc, np_), console=console, screen=True, auto_refresh=False) as live:
+        while True:
+            # If done (game over), always show final state
+            display_state = env.state
+            if viewing_history and hist_idx < len(history):
+                display_state = history[hist_idx][0]
 
-        console.clear()
-        for renderable in render_full_state(state, num_players, num_colors, last_action_desc):
-            console.print(renderable)
+            hist_msg = ""
+            if len(history) > 1:
+                hist_msg = f"Step {hist_idx}/{len(history) - 1}  ← → to browse"
+                if viewing_history:
+                    hist_msg += " [bold yellow](HISTORY VIEW - press → for latest)[/bold yellow]"
 
-        if current in human_set:
-            action_idx = get_human_action(state, encoder, num_players, num_colors)
-        else:
-            action_idx, rng_key = get_ai_action(state, rng_key, num_players, num_colors)
+            live.update(
+                _render_frame(
+                    display_state,
+                    nc,
+                    np_,
+                    hist_msg=hist_msg,
+                    action_feedback=history[hist_idx][1] if hist_idx < len(history) else "",
+                )
+            )
+            live.refresh()
 
-        decoder = ActionEncoder(num_players, num_colors)
-        try:
-            atype, params = decoder.decode(action_idx)
-            last_action_desc = f"P{current + 1}: {_describe_action(atype, params, num_colors)}"
-        except Exception:
-            last_action_desc = f"P{current + 1}: action #{action_idx}"
+            if done and not viewing_history:
+                # Show game over screen, wait for quit
+                ch = _getch_timeout(30)
+                if ch in ("q", "\x1b"):
+                    break
+                if ch == "\x1b[D" and len(history) > 1:  # left arrow
+                    viewing_history = True
+                    hist_idx = len(history) - 1
+                continue
 
-        obs, reward, term, trunc, info = env.step(action_idx)
-        step += 1
+            # Read keypress
+            ch = _getch_timeout(30)
+            if ch == "":
+                continue
 
-        if term or trunc:
-            done = True
+            # ── global keys ──
+            if ch in ("q", "Q"):
+                break
 
+            # ── history navigation ──
+            if ch == "\x1b[D":  # left arrow
+                if hist_idx > 0:
+                    hist_idx -= 1
+                    viewing_history = True
+                continue
+            if ch == "\x1b[C":  # right arrow
+                if hist_idx < len(history) - 1:
+                    hist_idx += 1
+                    if hist_idx == len(history) - 1 and not done:
+                        viewing_history = False
+                else:
+                    viewing_history = False
+                continue
+
+            # Can't act when viewing history
+            if viewing_history:
+                continue
+
+            if done:
+                continue
+
+            state = env.state
+            current = int(state.current_player)
+
+            # ── action dispatch ──
+            action_idx = None
+            params = {}
+
+            if ch in ("1", "2", "3", "4", "5", "6", "7", "p", "l", "r", "d", " "):
+                action_map = {
+                    "1": ACTION_BUY_FACTORY,
+                    "2": ACTION_BUY_WAREHOUSE,
+                    "3": ACTION_PRODUCE,
+                    "4": ACTION_BUY_FROM_FACTORY_STORE,
+                    "5": ACTION_MOVE_LOAD,
+                    "6": ACTION_MOVE_SEA,
+                    "7": ACTION_MOVE_AUCTION,
+                    "p": ACTION_PASS,
+                    " ": ACTION_PASS,
+                    "l": ACTION_TAKE_LOAN,
+                    "r": ACTION_REPAY_LOAN,
+                    "d": ACTION_DOMESTIC_SALE,
+                }
+                atype = action_map[ch]
+
+                # Sub-menus for actions that need parameters
+                if atype == ACTION_BUY_FACTORY:
+                    result = _submenu_buy_factory(state, live, nc, np_, num_players)
+                    if result is None:
+                        continue
+                    params = result
+                elif atype == ACTION_BUY_FROM_FACTORY_STORE:
+                    target = _submenu_pick_opponent(state, live, nc, np_, num_players)
+                    if target is None:
+                        continue
+                    picked = _submenu_pick_store(state, target, "factory", live, nc, np_)
+                    if picked is None:
+                        continue
+                    opp_idx = _opponent_menu_indices(current, num_players).index(target)
+                    params = {"opponent": opp_idx + 1, "color": picked["color"], "price_slot": picked["price_slot"]}
+                elif atype == ACTION_MOVE_LOAD:
+                    target = _submenu_pick_opponent(state, live, nc, np_, num_players)
+                    if target is None:
+                        continue
+                    picked = _submenu_pick_store(state, target, "harbour", live, nc, np_)
+                    if picked is None:
+                        continue
+                    opp_idx = _opponent_menu_indices(current, num_players).index(target)
+                    params = {"opponent": opp_idx + 1, "color": picked["color"], "price_slot": picked["price_slot"]}
+                elif atype == ACTION_DOMESTIC_SALE:
+                    result = _submenu_domestic_sale(state, live, nc, np_, num_players)
+                    if result is None:
+                        continue
+                    params = result
+                elif atype in (ACTION_PASS, ACTION_TAKE_LOAN, ACTION_REPAY_LOAN, ACTION_PRODUCE,
+                               ACTION_MOVE_SEA, ACTION_MOVE_AUCTION, ACTION_BUY_WAREHOUSE):
+                    pass
+
+                action_idx = encoder.encode(atype, params)
+            else:
+                continue
+
+            # ── either human or AI plays the action ──
+            if current not in human_set:
+                # AI: override the human-selected action
+                action_idx, rng_key = get_ai_action(state, rng_key, num_players, num_colors)
+
+            # Decode for description
+            decoder = ActionEncoder(num_players, num_colors)
+            try:
+                decoded_type, decoded_params = decoder.decode(action_idx)
+                desc = f"P{current + 1}: {_describe_action(decoded_type, decoded_params, nc)}"
+            except Exception:
+                desc = f"P{current + 1}: action #{action_idx}"
+
+            obs, reward, term, trunc, info = env.step(action_idx)
+            reward_f = float(reward)
+
+            # Check if game actually ended (env.state might be stale if term was already set)
+            if env.func_env.terminal(env.state, rng_key, env.func_env.params):
+                term = True
+
+            # Append to history
+            history.append((env.state, desc, reward_f))
+            hist_idx = len(history) - 1
+            viewing_history = False
+
+            if term or trunc:
+                done = True
+
+    # Restore terminal, show final scores
     console.clear()
     state = env.state
-    for renderable in render_full_state(state, num_players, num_colors, last_action_desc):
-        console.print(renderable)
-
-    console.print("\n[bold green]═══════════════════════════[/bold green]")
-    console.print("[bold green]  GAME OVER!  [/bold green]")
-    console.print("[bold green]═══════════════════════════[/bold green]\n")
-
+    console.print("[bold green]═══ GAME OVER ═══[/bold green]\n")
     table = Table(title="Final Scores")
-    table.add_column("Player", style="bold")
+    table.add_column("Player")
     table.add_column("Cash")
-    table.add_column("Loans")
-    table.add_column("Island")
-    table.add_column("Harbour")
-    table.add_column("Ship")
     table.add_column("Net Worth", style="bold green")
-
     for p in range(num_players):
         cash = int(state.cash[p])
-        loans = int(state.loans[p])
-        island_cnt = int(jax.numpy.sum(state.island_store[p]))
-        harbour_cnt = int(jax.numpy.sum(state.harbour_store[p]))
-        ship_cnt = int(jax.numpy.sum(state.ship_contents[p] > 0))
-        nw = _compute_net_worth_simple(state, p, num_colors)
-        table.add_row(
-            f"Player {p + 1}" + (" [cyan](you)[/cyan]" if p in human_set else ""),
-            f"${cash}",
-            str(loans),
-            str(island_cnt),
-            str(harbour_cnt),
-            str(ship_cnt),
-            f"[bold]${nw}[/bold]",
-        )
-
+        nw = _compute_net_worth(state, p, nc)
+        tag = " [cyan](you)[/cyan]" if p in human_set else ""
+        table.add_row(f"Player {p + 1}{tag}", f"${cash}", f"[bold]${nw}[/bold]")
     console.print(table)
-
-    winner = max(range(num_players), key=lambda p: _compute_net_worth_simple(state, p, num_colors))
+    winner = max(range(num_players), key=lambda p: _compute_net_worth(state, p, nc))
     console.print(f"\n[bold yellow]Player {winner + 1} wins! 🏆[/bold yellow]")
 
 
