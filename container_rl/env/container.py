@@ -54,38 +54,36 @@ ACTION_REPAY_LOAN = 9
 ACTION_DOMESTIC_SALE = 10
 NUM_ACTION_TYPES = 11
 
-# Multi-head action architecture
-# Fixed heads:
+# Multi-head action architecture (5 heads)
 HEAD_ACTION_TYPE = 0
 HEAD_OPPONENT = 1
 HEAD_COLOR = 2
 HEAD_PRICE_SLOT = 3
-NUM_FIXED_HEADS = 4
+HEAD_PURCHASE = 4
+NUM_HEADS_FIXED = 5
 
-# Recurrent purchase head (for actions 3 and 4)
-# Each purchase step picks from n_colors * PRICE_SLOTS options plus STOP
-MAX_PURCHASE_STEPS = 10  # max(max_warehouses, ship_capacity)
-PURCHASE_STOP = MAX_COLORS * PRICE_SLOTS  # STOP sentinel (50 when nc=5)
-PURCHASE_OPTIONS = PURCHASE_STOP  # alias: number of (color, slot) combos
-PURCHASE_WITH_STOP = PURCHASE_STOP + 1  # 51 options total
-HEAD_PURCHASE_START = NUM_FIXED_HEADS  # first purchase step head index
+# Purchase head constants (base values for 5 colors; scaled at runtime)
+def _purchase_stop(num_colors: int) -> int:
+    return num_colors * PRICE_SLOTS
+
+def _purchase_with_stop(num_colors: int) -> int:
+    return num_colors * PRICE_SLOTS + 1
 
 
 def num_heads(num_players: int) -> int:
-    """Total number of action heads for a given player count."""
-    return NUM_FIXED_HEADS + MAX_PURCHASE_STEPS
+    """Total number of action heads (always 5)."""
+    return NUM_HEADS_FIXED
 
 
 def head_sizes(num_players: int, num_colors: int) -> list[int]:
     """Per-head category counts for MultiDiscrete action space."""
-    sizes = [
-        NUM_ACTION_TYPES,          # action_type
-        num_players - 1,            # opponent
-        num_colors,                 # color
-        PRICE_SLOTS,                # price_slot
+    return [
+        NUM_ACTION_TYPES,           # action_type
+        num_players - 1,             # opponent
+        num_colors,                  # color
+        PRICE_SLOTS,                 # price_slot
+        num_colors * PRICE_SLOTS + 1,  # purchase (STOP at index n_colors*PRICE_SLOTS)
     ]
-    sizes.extend([PURCHASE_WITH_STOP] * MAX_PURCHASE_STEPS)
-    return sizes
 
 
 def mask_size(num_players: int, num_colors: int) -> int:
@@ -95,7 +93,7 @@ def mask_size(num_players: int, num_colors: int) -> int:
         + (num_players - 1)
         + num_colors
         + PRICE_SLOTS
-        + PURCHASE_WITH_STOP
+        + num_colors * PRICE_SLOTS + 1
     )
 
 # Ship location encoding
@@ -148,6 +146,11 @@ class EnvState(NamedTuple):
     # Turn tracking
     actions_taken: jax.Array  # number of actions taken this turn (0, 1, or 2)
     produced_this_turn: jax.Array  # 0/1 whether production action already taken
+
+    # Shopping continuation state (for actions 3 and 4)
+    shopping_active: jax.Array  # 0/1 — are we mid-shopping?
+    shopping_action_type: jax.Array  # which action type (3 or 4)
+    shopping_target: jax.Array  # opponent player index
 
     # Step count for episode limits
     step_count: jax.Array
@@ -340,27 +343,24 @@ class ActionEncoder:
 
         nc = self.num_colors
         np_ = self.num_players
-        num_hds = num_heads(np_)
 
         action_type, params = self.decode(action_idx)
-        mh = jnp.full(num_hds, PURCHASE_STOP, dtype=jnp.int32)
-        mh = mh.at[HEAD_ACTION_TYPE].set(action_type)
-        # All purchase steps default to STOP
+        mh = jnp.array([action_type, 0, 0, 0, _purchase_stop(nc)], dtype=jnp.int32)
 
         if action_type == ACTION_BUY_FACTORY:
             mh = mh.at[HEAD_COLOR].set(jnp.clip(params["color"], 0, nc - 1))
 
         elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
-            opp_idx = params["opponent"] - 1  # 0-based relative opponent
+            opp_idx = params["opponent"] - 1
             mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2))
             purchase = params["color"] * PRICE_SLOTS + params["price_slot"]
-            mh = mh.at[HEAD_PURCHASE_START].set(jnp.clip(purchase, 0, PURCHASE_OPTIONS - 1))
+            mh = mh.at[HEAD_PURCHASE].set(jnp.clip(purchase, 0, _purchase_stop(nc) - 1))
 
         elif action_type == ACTION_MOVE_LOAD:
             opp_idx = params["opponent"] - 1
             mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2))
             purchase = params["color"] * PRICE_SLOTS + params["price_slot"]
-            mh = mh.at[HEAD_PURCHASE_START].set(jnp.clip(purchase, 0, PURCHASE_OPTIONS - 1))
+            mh = mh.at[HEAD_PURCHASE].set(jnp.clip(purchase, 0, _purchase_stop(nc) - 1))
 
         elif action_type == ACTION_DOMESTIC_SALE:
             mh = mh.at[HEAD_COLOR].set(jnp.clip(params["color"], 0, nc - 1))
@@ -418,6 +418,7 @@ class ContainerFunctional(
             + 4
             + _np
             + 5
+            + 3  # shopping_active, shopping_action_type, shopping_target
             + mask_size(_np, _nc)
         )
         self.observation_space = spaces.Box(
@@ -436,34 +437,41 @@ class ContainerFunctional(
         """Game state transition implementing full Container rules.
 
         Accepts both legacy flat-integer actions (from ``ActionEncoder``) and
-        multi-head action arrays of shape ``(num_heads(np_),)``.
+        multi-head action arrays of shape ``(5,)``.
         """
         action = jnp.asarray(action, dtype=jnp.int32)
         np_ = params.num_players
         nc = params.num_colors
 
-        # Legacy flat-action path: convert to multi-head.
-        # We use a Python ``if`` rather than :func:`jnp.where` so that only
-        # the relevant branch is traced — ``jnp.where`` traces both sides
-        # unconditionally.
         if action.ndim == 0 or (action.ndim == 1 and action.shape[0] == 1):
             action = self._flat_to_multihd(
                 action.reshape((),) if action.ndim == 1 else action, params
             )
 
-        state = self._pay_interest(state, np_)
+        def _do_shopping(s):
+            return self._shopping_step(s, action, params)
 
-        action_type = action[HEAD_ACTION_TYPE]
-        action_type = jnp.clip(action_type, 0, NUM_ACTION_TYPES - 1)
+        def _do_normal(s):
+            s = self._pay_interest(s, np_)
+            atype = jnp.clip(action[HEAD_ACTION_TYPE], 0, NUM_ACTION_TYPES - 1)
+            s = self._dispatch_action(s, action, key, params)
+            s = jax.lax.cond(
+                s.shopping_active > 0,
+                lambda x: x,
+                lambda x: self._advance_turn(x, atype, np_),
+                s,
+            )
+            return s
 
-        state = self._dispatch_action(state, action, key, params)
-
-        state = self._advance_turn(state, action_type, np_)
+        state = jax.lax.cond(
+            state.shopping_active > 0,
+            _do_shopping,
+            _do_normal,
+            state,
+        )
 
         state = self._check_game_end(state, nc)
-
         state = state._replace(step_count=state.step_count + 1)
-
         return state
 
     def _flat_to_multihd(self, action_idx: jax.Array, params: ContainerParams) -> jax.Array:
@@ -478,11 +486,8 @@ class ContainerFunctional(
         num_hds = num_heads(np_)
         mh = jnp.zeros(num_hds, dtype=jnp.int32)
         mh = mh.at[HEAD_ACTION_TYPE].set(action_type)
-        # Default purchase steps to STOP
-        mh = mh.at[HEAD_PURCHASE_START:].set(PURCHASE_STOP)
+        mh = mh.at[HEAD_PURCHASE].set(_purchase_stop(nc))  # default purchase to STOP
 
-        # Build per-action-type parameter extraction
-        # (we use the same encoding logic as ActionEncoder.decode)
         combos = nc * PRICE_SLOTS
 
         # BUY_FACTORY
@@ -490,7 +495,7 @@ class ContainerFunctional(
         mh = mh.at[HEAD_COLOR].set(
             jnp.where(action_type == ACTION_BUY_FACTORY, color, mh[HEAD_COLOR]))
 
-        # BUY_FROM_FACTORY_STORE: opp_idx, color, price_slot → purchase step 0
+        # BUY_FROM_FACTORY_STORE: opp_idx, color, price_slot → purchase head
         opp_idx = rel_offset // combos
         remainder = rel_offset % combos
         col = remainder // PRICE_SLOTS
@@ -499,17 +504,17 @@ class ContainerFunctional(
             jnp.where(action_type == ACTION_BUY_FROM_FACTORY_STORE,
                       jnp.clip(opp_idx, 0, np_ - 2), mh[HEAD_OPPONENT]))
         purchase0 = col * PRICE_SLOTS + slot
-        mh = mh.at[HEAD_PURCHASE_START].set(
+        mh = mh.at[HEAD_PURCHASE].set(
             jnp.where(action_type == ACTION_BUY_FROM_FACTORY_STORE,
-                      jnp.clip(purchase0, 0, PURCHASE_STOP - 1), mh[HEAD_PURCHASE_START]))
+                      jnp.clip(purchase0, 0, _purchase_stop(nc) - 1), mh[HEAD_PURCHASE]))
 
         # MOVE_LOAD: same encoding
         mh = mh.at[HEAD_OPPONENT].set(
             jnp.where(action_type == ACTION_MOVE_LOAD,
                       jnp.clip(opp_idx, 0, np_ - 2), mh[HEAD_OPPONENT]))
-        mh = mh.at[HEAD_PURCHASE_START].set(
+        mh = mh.at[HEAD_PURCHASE].set(
             jnp.where(action_type == ACTION_MOVE_LOAD,
-                      jnp.clip(purchase0, 0, PURCHASE_STOP - 1), mh[HEAD_PURCHASE_START]))
+                      jnp.clip(purchase0, 0, _purchase_stop(nc) - 1), mh[HEAD_PURCHASE]))
 
         # DOMESTIC_SALE: color, price_slot
         dom_color = remainder // PRICE_SLOTS
@@ -520,9 +525,153 @@ class ContainerFunctional(
         mh = mh.at[HEAD_PRICE_SLOT].set(
             jnp.where(action_type == ACTION_DOMESTIC_SALE,
                       jnp.clip(dom_slot, 0, PRICE_SLOTS - 1), mh[HEAD_PRICE_SLOT]))
-        # store_type currently not exposed as separate head; kept in params
 
         return mh
+
+    # ========================================================================
+    # Shopping helpers (recurrent purchase for actions 3 and 4)
+    # ========================================================================
+
+    def _finish_shopping(self, state: EnvState, action_type: jax.Array, num_players: int) -> EnvState:
+        """Clear shopping state and advance the turn."""
+        state = state._replace(
+            shopping_active=jnp.array(0, dtype=jnp.int32),
+            shopping_action_type=jnp.array(0, dtype=jnp.int32),
+            shopping_target=jnp.array(0, dtype=jnp.int32),
+        )
+        return self._advance_turn(state, action_type, num_players)
+
+    def _do_one_purchase(self, state: EnvState, action_type: jax.Array, target: jax.Array,
+                         action: jax.Array, params: ContainerParams) -> EnvState:
+        """Execute one container purchase.  *action_type* is 3 (factory) or 4 (ship).
+
+        Returns the state with cash, stores, and ship updated if the purchase
+        was valid.  The caller is responsible for setting ``shopping_active``
+        afterwards.
+        """
+        player = state.current_player
+        nc = params.num_colors
+        is_factory = action_type == ACTION_BUY_FROM_FACTORY_STORE
+
+        purchase = action[HEAD_PURCHASE]
+        color = jnp.clip(purchase // PRICE_SLOTS, 0, nc - 1)
+        price_slot = jnp.clip(purchase % PRICE_SLOTS, 0, PRICE_SLOTS - 1)
+        cost = price_slot + 1
+
+        # Source stock
+        fs_avail = state.factory_store[target, color, price_slot]
+        hs_avail = state.harbour_store[target, color, price_slot]
+        available = jnp.where(is_factory, fs_avail, hs_avail)
+
+        # Space check
+        hs_stored = self._count_store_containers(state.harbour_store, player)
+        ship_stored = self._count_ship_cargo(state.ship_contents, player)
+        has_space = jnp.where(
+            is_factory,
+            hs_stored < state.warehouse_count[player],
+            ship_stored < SHIP_CAPACITY,
+        )
+        can_afford = state.cash[player] >= cost
+        do_buy = (available > 0) & has_space & can_afford
+
+        # Cash
+        new_cash = state.cash.at[player].add(jnp.where(do_buy, -cost, 0))
+        new_cash = new_cash.at[target].add(jnp.where(do_buy, cost, 0))
+        state = state._replace(cash=new_cash)
+
+        # Source store
+        state = state._replace(
+            factory_store=state.factory_store.at[target, color, price_slot].set(
+                jnp.where(do_buy & is_factory, fs_avail - 1,
+                          state.factory_store[target, color, price_slot])
+            ),
+            harbour_store=state.harbour_store.at[target, color, price_slot].set(
+                jnp.where(do_buy & (~is_factory), hs_avail - 1,
+                          state.harbour_store[target, color, price_slot])
+            ),
+        )
+
+        # Destination
+        state = state._replace(
+            harbour_store=state.harbour_store.at[player, color, price_slot].set(
+                jnp.where(do_buy & is_factory,
+                          state.harbour_store[player, color, price_slot] + 1,
+                          state.harbour_store[player, color, price_slot])
+            ),
+            ship_contents=state.ship_contents.at[player, jnp.clip(ship_stored, 0, SHIP_CAPACITY - 1)].set(
+                jnp.where(do_buy & (~is_factory), color + 1,
+                          state.ship_contents[player, jnp.clip(ship_stored, 0, SHIP_CAPACITY - 1)])
+            ),
+        )
+
+        # Ship location on first load
+        state = state._replace(
+            ship_location=state.ship_location.at[player].set(
+                jnp.where(do_buy & (~is_factory) & (ship_stored == 0),
+                          LOCATION_HARBOUR_OFFSET + target,
+                          state.ship_location[player])
+            ),
+        )
+
+        return state
+
+    def _can_continue_shopping(self, state: EnvState, action_type: jax.Array,
+                               target: jax.Array, params: ContainerParams) -> jax.Array:
+        """Return True if another purchase is possible for the same action."""
+        player = state.current_player
+        is_factory = action_type == ACTION_BUY_FROM_FACTORY_STORE
+
+        # Space remaining
+        hs_stored = self._count_store_containers(state.harbour_store, player)
+        ship_stored = self._count_ship_cargo(state.ship_contents, player)
+        has_space = jnp.where(
+            is_factory,
+            hs_stored < state.warehouse_count[player],
+            ship_stored < SHIP_CAPACITY,
+        )
+
+        # Affordable stock at target
+        source = jnp.where(
+            is_factory, state.factory_store[target], state.harbour_store[target],
+        )
+        affordable = (jnp.arange(PRICE_SLOTS) + 1) <= state.cash[player]  # (10,)
+        has_affordable = jnp.any((source > 0) & affordable[None, :])
+
+        return has_space & has_affordable
+
+    def _shopping_step(self, state: EnvState, action: jax.Array,
+                       params: ContainerParams) -> EnvState:
+        """Process one purchase step while shopping is active.
+
+        If the purchase head is STOP or no more purchases are possible,
+        the shopping state is cleared and the turn advances.
+        """
+        shop_type = state.shopping_action_type
+        target = state.shopping_target
+        np_ = params.num_players
+        nc = params.num_colors
+
+        is_stop = action[HEAD_PURCHASE] >= nc * PRICE_SLOTS
+
+        def _try_purchase(s):
+            s = self._do_one_purchase(s, shop_type, target, action, params)
+            can = self._can_continue_shopping(s, shop_type, target, params)
+            s = jax.lax.cond(
+                can,
+                lambda x: x._replace(  # still shopping
+                    shopping_active=jnp.array(1, dtype=jnp.int32),
+                ),
+                lambda x: self._finish_shopping(x, shop_type, np_),
+                s,
+            )
+            return s
+
+        return jax.lax.cond(
+            is_stop,
+            lambda s: self._finish_shopping(s, shop_type, np_),
+            _try_purchase,
+            state,
+        )
 
     # ========================================================================
     # Internal helpers
@@ -657,8 +806,9 @@ class ContainerFunctional(
                 slot_mask = jnp.where(state.harbour_store[player, c] > 0, 1, slot_mask)
 
         # ---- purchase mask (union across all opponents) -----------------------
-        pur_mask = jnp.zeros(PURCHASE_WITH_STOP, dtype=jnp.int32)
-        pur_mask = pur_mask.at[PURCHASE_STOP].set(1)
+        p_stop = _purchase_stop(nc)
+        pur_mask = jnp.zeros(_purchase_with_stop(nc), dtype=jnp.int32)
+        pur_mask = pur_mask.at[p_stop].set(1)
         for i in range(np_ - 1):
             opp = (player + 1 + i) % np_
             for c in range(nc):
@@ -860,12 +1010,11 @@ class ContainerFunctional(
     # ========================================================================
 
     def _action_buy_from_factory_store(self, state, action, params):
-        """Buy containers from another player's factory store.
+        """Buy one container from another player's factory store.
 
-        Uses :func:`jax.lax.scan` over purchase steps to allow buying
-        multiple containers in one action. Each step reads from
-        ``action[HEAD_PURCHASE_START + i]`` until STOP or constraints
-        prevent further purchases.
+        Sets ``shopping_active`` if another purchase is possible, so the
+        training loop can call the policy again for the next purchase.
+        Shopping ends when STOP is selected or constraints are exhausted.
         """
         player = state.current_player
         np_ = params.num_players
@@ -874,61 +1023,38 @@ class ContainerFunctional(
         opp_idx = jnp.clip(action[HEAD_OPPONENT], 0, np_ - 2)
         target = self._get_target_player(opp_idx, player, np_)
         target = jnp.clip(target, 0, np_ - 1)
-        valid_target = target != player
 
-        initial_stored = self._count_store_containers(state.harbour_store, player)
-        capacity = state.warehouse_count[player]
+        purchase = action[HEAD_PURCHASE]
+        is_stop = purchase >= nc * PRICE_SLOTS
 
-        def scan_fn(carry, purchase_idx):
-            s, cont, stored = carry
+        new_state = self._do_one_purchase(
+            state, jnp.array(ACTION_BUY_FROM_FACTORY_STORE, dtype=jnp.int32),
+            target, action, params,
+        )
 
-            is_stop = purchase_idx >= PURCHASE_STOP
-            color = jnp.clip(purchase_idx // PRICE_SLOTS, 0, nc - 1)
-            price_slot = jnp.clip(purchase_idx % PRICE_SLOTS, 0, PRICE_SLOTS - 1)
+        can = (~is_stop) & self._can_continue_shopping(
+            new_state,
+            jnp.array(ACTION_BUY_FROM_FACTORY_STORE, dtype=jnp.int32),
+            target, params,
+        )
 
-            available = s.factory_store[target, color, price_slot]
-            cost = price_slot + 1
-            has_space = stored < capacity
-            can_afford = s.cash[player] >= cost
+        new_state = new_state._replace(
+            shopping_active=jnp.where(can, jnp.array(1, dtype=jnp.int32),
+                                      jnp.array(0, dtype=jnp.int32)),
+            shopping_action_type=jnp.where(can, jnp.array(ACTION_BUY_FROM_FACTORY_STORE, dtype=jnp.int32),
+                                           jnp.array(0, dtype=jnp.int32)),
+            shopping_target=jnp.where(can, target, jnp.array(0, dtype=jnp.int32)),
+        )
 
-            do_buy = cont & ~is_stop & valid_target & (available > 0) & has_space & can_afford
-            new_cont = cont & ~is_stop & do_buy
-
-            new_cash = s.cash.at[player].add(jnp.where(do_buy, -cost, 0))
-            new_cash = new_cash.at[target].add(jnp.where(do_buy, cost, 0))
-
-            s = s._replace(
-                cash=new_cash,
-                factory_store=s.factory_store.at[target, color, price_slot].set(
-                    jnp.where(do_buy, available - 1, available)
-                ),
-                harbour_store=s.harbour_store.at[player, color, price_slot].set(
-                    jnp.where(
-                        do_buy,
-                        s.harbour_store[player, color, price_slot] + 1,
-                        s.harbour_store[player, color, price_slot],
-                    )
-                ),
-            )
-            new_stored = stored + jnp.where(do_buy, 1, 0)
-            return (s, new_cont, new_stored), None
-
-        purchase_steps = action[HEAD_PURCHASE_START:HEAD_PURCHASE_START + MAX_PURCHASE_STEPS]
-        init = (state, jnp.array(True), initial_stored)
-        (state, _, _), _ = jax.lax.scan(scan_fn, init, purchase_steps)
-        return state
+        return new_state
 
     # ========================================================================
     # Action (5): Move to Harbour + Load (recurrent shopping)
     # ========================================================================
 
     def _action_move_load(self, state, action, params):
-        """Move ship to harbour and load containers via recurrent shopping.
-
-        Uses :func:`jax.lax.scan` over purchase steps.
-        Ship location is updated to the target harbour only if at least
-        one purchase succeeds.
-        """
+        """Move to harbour and load one container. Sets ``shopping_active``
+        if more purchases are possible."""
         player = state.current_player
         np_ = params.num_players
         nc = params.num_colors
@@ -936,57 +1062,30 @@ class ContainerFunctional(
         opp_idx = jnp.clip(action[HEAD_OPPONENT], 0, np_ - 2)
         target = self._get_target_player(opp_idx, player, np_)
         target = jnp.clip(target, 0, np_ - 1)
-        valid_target = target != player
 
-        initial_cargo = self._count_ship_cargo(state.ship_contents, player)
-        capacity = SHIP_CAPACITY
+        purchase = action[HEAD_PURCHASE]
+        is_stop = purchase >= nc * PRICE_SLOTS
 
-        def scan_fn(carry, purchase_idx):
-            s, cont, stored = carry
-
-            is_stop = purchase_idx >= PURCHASE_STOP
-            color = jnp.clip(purchase_idx // PRICE_SLOTS, 0, nc - 1)
-            price_slot = jnp.clip(purchase_idx % PRICE_SLOTS, 0, PRICE_SLOTS - 1)
-
-            available = s.harbour_store[target, color, price_slot]
-            cost = price_slot + 1
-            has_space = stored < capacity
-            can_afford = s.cash[player] >= cost
-
-            do_buy = cont & ~is_stop & valid_target & (available > 0) & has_space & can_afford
-            new_cont = cont & ~is_stop & do_buy
-
-            new_cash = s.cash.at[player].add(jnp.where(do_buy, -cost, 0))
-            new_cash = new_cash.at[target].add(jnp.where(do_buy, cost, 0))
-
-            # Place container in the next free ship slot (stores color+1 so 0 = empty)
-            slot_idx = jnp.clip(stored, 0, SHIP_CAPACITY - 1)
-
-            s = s._replace(
-                cash=new_cash,
-                harbour_store=s.harbour_store.at[target, color, price_slot].set(
-                    jnp.where(do_buy, available - 1, available)
-                ),
-                ship_contents=s.ship_contents.at[player, slot_idx].set(
-                    jnp.where(do_buy, color + 1, s.ship_contents[player, slot_idx])
-                ),
-            )
-            new_stored = stored + jnp.where(do_buy, 1, 0)
-            return (s, new_cont, new_stored), None
-
-        purchase_steps = action[HEAD_PURCHASE_START:HEAD_PURCHASE_START + MAX_PURCHASE_STEPS]
-        init = (state, jnp.array(True), initial_cargo)
-        (state, _, total_filled), _ = jax.lax.scan(scan_fn, init, purchase_steps)
-
-        # Update ship location if anything was loaded
-        new_loc = LOCATION_HARBOUR_OFFSET + target
-        anything_loaded = total_filled > initial_cargo
-        state = state._replace(
-            ship_location=state.ship_location.at[player].set(
-                jnp.where(anything_loaded, new_loc, state.ship_location[player])
-            )
+        new_state = self._do_one_purchase(
+            state, jnp.array(ACTION_MOVE_LOAD, dtype=jnp.int32),
+            target, action, params,
         )
-        return state
+
+        can = (~is_stop) & self._can_continue_shopping(
+            new_state,
+            jnp.array(ACTION_MOVE_LOAD, dtype=jnp.int32),
+            target, params,
+        )
+
+        new_state = new_state._replace(
+            shopping_active=jnp.where(can, jnp.array(1, dtype=jnp.int32),
+                                      jnp.array(0, dtype=jnp.int32)),
+            shopping_action_type=jnp.where(can, jnp.array(ACTION_MOVE_LOAD, dtype=jnp.int32),
+                                           jnp.array(0, dtype=jnp.int32)),
+            shopping_target=jnp.where(can, target, jnp.array(0, dtype=jnp.int32)),
+        )
+
+        return new_state
 
     # ========================================================================
     # Action (6): Move to Open Sea
@@ -1287,6 +1386,9 @@ class ContainerFunctional(
             auction_round=jnp.array(0, dtype=jnp.int32),
             actions_taken=jnp.array(0, dtype=jnp.int32),
             produced_this_turn=jnp.array(0, dtype=jnp.int32),
+            shopping_active=jnp.array(0, dtype=jnp.int32),
+            shopping_action_type=jnp.array(0, dtype=jnp.int32),
+            shopping_target=jnp.array(0, dtype=jnp.int32),
             step_count=jnp.array(0, dtype=jnp.int32),
         )
         return state
@@ -1336,6 +1438,15 @@ class ContainerFunctional(
             )
         )
         parts.append(jnp.sum(state.auction_cargo > 0).astype(jnp.float32)[None])
+
+        # Shopping continuation state (3 scalars)
+        parts.append(
+            jnp.array([
+                state.shopping_active.astype(jnp.float32),
+                state.shopping_action_type.astype(jnp.float32),
+                state.shopping_target.astype(jnp.float32),
+            ])
+        )
 
         # Append action masks for multi-head policy training
         masks = self._action_masks(state, params)

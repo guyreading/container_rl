@@ -23,7 +23,7 @@ from container_rl.env.container import (  # noqa: E402
     HEAD_COLOR,
     HEAD_OPPONENT,
     HEAD_PRICE_SLOT,
-    HEAD_PURCHASE_START,
+    HEAD_PURCHASE,
     INITIAL_CASH,
     LOAN_AMOUNT,
     LOCATION_AUCTION_ISLAND,
@@ -31,14 +31,13 @@ from container_rl.env.container import (  # noqa: E402
     LOCATION_OPEN_SEA,
     MAX_WAREHOUSES_PER_PLAYER,
     PRICE_SLOTS,
-    PURCHASE_OPTIONS,
-    PURCHASE_STOP,
     SHIP_CAPACITY,
     ActionEncoder,
     ContainerFunctional,
     ContainerJaxEnv,
     ContainerParams,
     EnvState,
+    _purchase_stop,
     num_heads,
 )
 
@@ -86,6 +85,9 @@ def _make_state(**overrides):
         auction_round=jnp.array(0, dtype=jnp.int32),
         actions_taken=jnp.array(0, dtype=jnp.int32),
         produced_this_turn=jnp.array(0, dtype=jnp.int32),
+        shopping_active=jnp.array(0, dtype=jnp.int32),
+        shopping_action_type=jnp.array(0, dtype=jnp.int32),
+        shopping_target=jnp.array(0, dtype=jnp.int32),
         step_count=jnp.array(0, dtype=jnp.int32),
     )
     defaults.update(overrides)
@@ -99,14 +101,14 @@ def _build_multihd(
     """Build a multi-head action array from action_type and optional params.
 
     For actions with parameters (BUY_FACTORY, BUY_FROM_FACTORY_STORE, etc.),
-    pass a dict with the relevant keys.  Purchase steps beyond the first
-    default to STOP.
+    pass a dict with the relevant keys.  Purchase defaults to STOP.
     """
     params = params or {}
     nc = num_colors
     np_ = num_players
+    p_stop = _purchase_stop(nc)
     num_hds = num_heads(np_)
-    mh = jnp.full(num_hds, PURCHASE_STOP, dtype=jnp.int32)
+    mh = jnp.full(num_hds, p_stop, dtype=jnp.int32)
     mh = mh.at[HEAD_ACTION_TYPE].set(action_type)
 
     if action_type == ACTION_BUY_FACTORY:
@@ -116,7 +118,7 @@ def _build_multihd(
         opp_idx = params.get("opponent", 1) - 1  # 1-based to 0-based
         mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2))
         purchase = params.get("color", 0) * PRICE_SLOTS + params.get("price_slot", 0)
-        mh = mh.at[HEAD_PURCHASE_START].set(jnp.clip(purchase, 0, PURCHASE_OPTIONS - 1))
+        mh = mh.at[HEAD_PURCHASE].set(jnp.clip(purchase, 0, p_stop - 1))
 
     elif action_type == ACTION_DOMESTIC_SALE:
         mh = mh.at[HEAD_COLOR].set(jnp.clip(params.get("color", 0), 0, nc - 1))
@@ -134,8 +136,9 @@ def _rel_to_multihd(action_type: int, rel_offset: int, num_players: int = 2, num
     nc = num_colors
     np_ = num_players
     combos = nc * PRICE_SLOTS
+    p_stop = _purchase_stop(nc)
     num_hds = num_heads(np_)
-    mh = jnp.full(num_hds, PURCHASE_STOP, dtype=jnp.int32)
+    mh = jnp.full(num_hds, p_stop, dtype=jnp.int32)
     mh = mh.at[HEAD_ACTION_TYPE].set(action_type)
 
     if action_type == ACTION_BUY_FACTORY:
@@ -148,7 +151,7 @@ def _rel_to_multihd(action_type: int, rel_offset: int, num_players: int = 2, num
         price_slot = remainder % PRICE_SLOTS
         mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2))
         purchase = color * PRICE_SLOTS + price_slot
-        mh = mh.at[HEAD_PURCHASE_START].set(jnp.clip(purchase, 0, PURCHASE_OPTIONS - 1))
+        mh = mh.at[HEAD_PURCHASE].set(jnp.clip(purchase, 0, p_stop - 1))
 
     elif action_type == ACTION_DOMESTIC_SALE:
         remainder = rel_offset % combos
