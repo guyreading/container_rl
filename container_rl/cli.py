@@ -479,7 +479,8 @@ def _describe_action(action_type: int, params: dict, nc: int) -> str:
 # ── AI opponent ──────────────────────────────────────────────────────────────
 
 
-def get_ai_action(state: EnvState, rng_key, num_players: int, num_colors: int) -> tuple[int, object]:
+def get_ai_action(state: EnvState, rng_key, num_players: int, num_colors: int):
+    """Return a multi-head action array for the AI player."""
     import jax.numpy as jnp
     from jax import random
 
@@ -495,11 +496,14 @@ def get_ai_action(state: EnvState, rng_key, num_players: int, num_colors: int) -
     has_space_f = int(jnp.sum(state.factory_store[player])) < fc * 2
     has_space_h = int(jnp.sum(state.harbour_store[player])) < wc
 
+    def _encode(atype, params=None):
+        return encoder.to_multi_head(encoder.encode(atype, params or {}))
+
     if has_space_f and not produced:
-        return encoder.encode(ACTION_PRODUCE, {}), subkey
+        return _encode(ACTION_PRODUCE), subkey
 
     if loans > 0 and cash >= 11:
-        return encoder.encode(ACTION_REPAY_LOAN, {}), subkey
+        return _encode(ACTION_REPAY_LOAN), subkey
 
     opp_indices = _opponent_menu_indices(player, num_players)
     if has_space_h:
@@ -508,22 +512,22 @@ def get_ai_action(state: EnvState, rng_key, num_players: int, num_colors: int) -
                 for s in range(PRICE_SLOTS):
                     if int(state.factory_store[opp, c, s]) > 0 and cash >= (s + 1):
                         params = {"opponent": opp_indices.index(opp) + 1, "color": c, "price_slot": s}
-                        return encoder.encode(ACTION_BUY_FROM_FACTORY_STORE, params), subkey
+                        return _encode(ACTION_BUY_FROM_FACTORY_STORE, params), subkey
 
     owned = {c for c in range(num_colors) if int(state.factory_colors[player, c]) > 0}
     for c in range(num_colors):
         if c not in owned and fc < 5 and cash >= (fc + 1) * 2:
-            return encoder.encode(ACTION_BUY_FACTORY, {"color": c}), subkey
+            return _encode(ACTION_BUY_FACTORY, {"color": c}), subkey
 
     if wc < 10 and cash >= (wc + 1):
-        return encoder.encode(ACTION_BUY_WAREHOUSE, {}), subkey
+        return _encode(ACTION_BUY_WAREHOUSE), subkey
 
     cargo = int(jnp.sum(state.ship_contents[player] > 0))
     if cargo > 0 and int(state.ship_location[player]) == LOCATION_OPEN_SEA:
-        return encoder.encode(ACTION_MOVE_AUCTION, {}), subkey
+        return _encode(ACTION_MOVE_AUCTION), subkey
 
     if cargo > 0 and int(state.ship_location[player]) >= LOCATION_HARBOUR_OFFSET:
-        return encoder.encode(ACTION_MOVE_SEA, {}), subkey
+        return _encode(ACTION_MOVE_SEA), subkey
 
     if cargo < SHIP_CAPACITY:
         for opp in opp_indices:
@@ -531,12 +535,12 @@ def get_ai_action(state: EnvState, rng_key, num_players: int, num_colors: int) -
                 for s in range(PRICE_SLOTS):
                     if int(state.harbour_store[opp, c, s]) > 0 and cash >= (s + 1):
                         params = {"opponent": opp_indices.index(opp) + 1, "color": c, "price_slot": s}
-                        return encoder.encode(ACTION_MOVE_LOAD, params), subkey
+                        return _encode(ACTION_MOVE_LOAD, params), subkey
 
     if cash < 5 and loans < 2:
-        return encoder.encode(ACTION_TAKE_LOAN, {}), subkey
+        return _encode(ACTION_TAKE_LOAN), subkey
 
-    return encoder.encode(ACTION_PASS, {}), subkey
+    return _encode(ACTION_PASS), subkey
 
 
 # ── main game command ────────────────────────────────────────────────────────
