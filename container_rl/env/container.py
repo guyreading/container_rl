@@ -31,14 +31,16 @@ RenderStateType = tuple["pygame.Surface", str, int]  # noqa: F821
 
 MAX_PLAYERS = 4
 MAX_COLORS = 5
-MAX_FACTORIES_PER_PLAYER = MAX_COLORS
-MAX_WAREHOUSES_PER_PLAYER = 10
+MAX_FACTORIES_PER_PLAYER = 4
+MAX_WAREHOUSES_PER_PLAYER = 7
 SHIP_CAPACITY = 5
 PRICE_SLOTS = 10  # $1 through $10
+PRODUCE_PRICE_CHOICES = 4  # production lets you choose prices $1–$4 (slots 0–3)
 INITIAL_CASH = 20
 LOAN_AMOUNT = 10
 LOAN_INTEREST = 1
 FACTORY_STORAGE_MULTIPLIER = 2  # storage = factories * 2
+INITIAL_CONTAINER_SUPPLY = 12  # per color
 
 # Action type indices
 ACTION_BUY_FACTORY = 0
@@ -170,7 +172,7 @@ class ActionEncoder:
         # Calculate action counts for each group
         self.buy_factory_actions = num_colors
         self.buy_warehouse_actions = 1
-        self.produce_actions = 1
+        self.produce_actions = PRODUCE_PRICE_CHOICES
         self.buy_from_factory_actions = (num_players - 1) * num_colors * PRICE_SLOTS
         self.move_load_actions = (num_players - 1) * num_colors * PRICE_SLOTS
         self.move_sea_actions = 1
@@ -223,7 +225,8 @@ class ActionEncoder:
 
         # Produce
         if action_idx < self.offsets['buy_from_factory']:
-            return ACTION_PRODUCE, {}
+            price_slot = action_idx - self.offsets['produce']
+            return ACTION_PRODUCE, {'price_slot': price_slot}
 
         # Buy from factory store
         if action_idx < self.offsets['move_load']:
@@ -292,7 +295,7 @@ class ActionEncoder:
             return self.offsets['buy_warehouse']
 
         elif action_type == ACTION_PRODUCE:
-            return self.offsets['produce']
+            return self.offsets['produce'] + params['price_slot']
 
         elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
             opponent = params['opponent'] - 1  # convert to 0-based among opponents
@@ -349,6 +352,9 @@ class ActionEncoder:
 
         if action_type == ACTION_BUY_FACTORY:
             mh = mh.at[HEAD_COLOR].set(jnp.clip(params["color"], 0, nc - 1))
+
+        elif action_type == ACTION_PRODUCE:
+            mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params["price_slot"], 0, PRODUCE_PRICE_CHOICES - 1))
 
         elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
             opp_idx = params["opponent"] - 1
@@ -515,6 +521,11 @@ class ContainerFunctional(
         mh = mh.at[HEAD_PURCHASE].set(
             jnp.where(action_type == ACTION_MOVE_LOAD,
                       jnp.clip(purchase0, 0, _purchase_stop(nc) - 1), mh[HEAD_PURCHASE]))
+
+        # PRODUCE: price_slot
+        mh = mh.at[HEAD_PRICE_SLOT].set(
+            jnp.where(action_type == ACTION_PRODUCE,
+                      jnp.clip(rel_offset, 0, PRODUCE_PRICE_CHOICES - 1), mh[HEAD_PRICE_SLOT]))
 
         # DOMESTIC_SALE: color, price_slot
         dom_color = remainder // PRICE_SLOTS
@@ -683,7 +694,7 @@ class ContainerFunctional(
         counts = [
             nc,
             1,
-            1,
+            PRODUCE_PRICE_CHOICES,
             (np_ - 1) * nc * PRICE_SLOTS,
             (np_ - 1) * nc * PRICE_SLOTS,
             1,
@@ -971,7 +982,7 @@ class ContainerFunctional(
             space_ok = stored_so_far < capacity
             do_produce = can_produce & owns & supply_ok & space_ok
 
-            place_slot = 4
+            place_slot = jnp.clip(action[HEAD_PRICE_SLOT], 0, PRODUCE_PRICE_CHOICES - 1)
             place_slot = jnp.clip(place_slot, 0, PRICE_SLOTS - 1)
 
             s = s._replace(

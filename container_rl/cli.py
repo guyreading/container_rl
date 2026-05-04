@@ -178,19 +178,18 @@ def _player_card(state: EnvState, player: int, nc: int, is_current: bool, width:
     header = f"[bold]P{player + 1}{current_badge}[/bold]  ${nw}"
     line = "─" * max(0, width - len(header) + 10)
 
-    out = Text()
-    out.append(header + "\n")
-    out.append(f"{line}\n")
-    out.append(f"  💵 ${cash}  🏦 {loans} loans  🏭 {wh} wh\n")
-    out.append(f"  🤫 [{_cstyle(secret)}]{_cname(secret, nc)}[/{_cstyle(secret)}]\n")
-    out.append(f"  Factories: {fac_str}\n")
+    out = Text.from_markup(header + "\n")
+    out.append(line + "\n")
+    out.append_text(Text.from_markup(f"  💵 ${cash}  🏦 {loans} loans  🏭 {wh} wh\n"))
+    out.append_text(Text.from_markup(f"  🤫 [{_cstyle(secret)}]{_cname(secret, nc)}[/{_cstyle(secret)}]\n"))
+    out.append_text(Text.from_markup(f"  Factories: {fac_str}\n"))
     out.append("\n")
-    out.append("  [bold]Factory Store:[/bold]\n")
-    out.append(f"{_render_store_compact(state.factory_store, player, nc)}\n")
-    out.append("  [bold]Harbour Store:[/bold]\n")
-    out.append(f"{_render_store_compact(state.harbour_store, player, nc)}\n")
-    out.append(f"  🏝️ {_render_island(state.island_store, player, nc)}\n")
-    out.append(f"  🚢 {_render_ship(state, player)}")
+    out.append_text(Text.from_markup("  [bold]Factory Store:[/bold]\n"))
+    out.append_text(Text.from_markup(_render_store_compact(state.factory_store, player, nc) + "\n"))
+    out.append_text(Text.from_markup("  [bold]Harbour Store:[/bold]\n"))
+    out.append_text(Text.from_markup(_render_store_compact(state.harbour_store, player, nc) + "\n"))
+    out.append_text(Text.from_markup(f"  🏝️ {_render_island(state.island_store, player, nc)}\n"))
+    out.append_text(Text.from_markup(f"  🚢 {_render_ship(state, player)}"))
     return out
 
 
@@ -258,7 +257,7 @@ def _render_frame(
 
     # ── prompt ──
     if prompt:
-        elements.append(Panel(Text(prompt, style="bold yellow"), border_style="yellow"))
+        elements.append(Panel(Text.from_markup(prompt, style="bold yellow"), border_style="yellow"))
 
     return Group(*elements)
 
@@ -266,58 +265,52 @@ def _render_frame(
 # ── keyboard input ───────────────────────────────────────────────────────────
 
 
-_stdin_fd = sys.stdin.fileno()
+_stdin_fd: int = sys.stdin.fileno()
+_orig_term_attrs: list | None = None  # saved terminal attrs for restore on exit
 
 
-def _getch() -> str:
-    """Read a single character from stdin, handling escape sequences (blocks)."""
+def _enter_raw_mode() -> None:
+    """Enter cbreak mode once for the entire session. Must call _exit_raw_mode to restore."""
+    global _orig_term_attrs
+    _orig_term_attrs = termios.tcgetattr(_stdin_fd)
+    tty.setcbreak(_stdin_fd, when=termios.TCSANOW)
+
+
+def _exit_raw_mode() -> None:
+    """Restore the terminal to its original mode."""
+    global _orig_term_attrs
+    if _orig_term_attrs is not None:
+        termios.tcsetattr(_stdin_fd, termios.TCSANOW, _orig_term_attrs)
+        _orig_term_attrs = None
+
+
+def _read_key(timeout: float | None = None) -> str:
+    """Read a single character, handling escape sequences.
+
+    If timeout is None, blocks until a key is pressed.
+    If timeout is a number, waits at most that many seconds, returning '' if none.
+    """
     fd = _stdin_fd
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd, when=termios.TCSADRAIN)
-        ch = os.read(fd, 1).decode()
-        if ch == "\x1b":
-            r, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if r:
-                ch2 = os.read(fd, 1).decode()
-                if ch2 == "[":
-                    r2, _, _ = select.select([sys.stdin], [], [], 0.05)
-                    if r2:
-                        ch3 = os.read(fd, 1).decode()
-                        return f"\x1b[{ch3}"
-                    return "\x1b["
-                return ch + ch2
-            return ch
-        return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-
-
-def _getch_timeout(timeout: float = 0.01) -> str:
-    """Read a single character, handling arrow-key escape sequences."""
-    fd = _stdin_fd
-    old = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd, when=termios.TCSADRAIN)
+    if timeout is None:
+        r, _, _ = select.select([sys.stdin], [], [])
+    else:
         r, _, _ = select.select([sys.stdin], [], [], timeout)
-        if not r:
-            return ""
-        ch = os.read(fd, 1).decode()
-        if ch == "\x1b":
-            r2, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if r2:
-                ch2 = os.read(fd, 1).decode()
-                if ch2 == "[":
-                    r3, _, _ = select.select([sys.stdin], [], [], 0.05)
-                    if r3:
-                        ch3 = os.read(fd, 1).decode()
-                        return f"\x1b[{ch3}"
-                    return "\x1b["
-                return ch + ch2
-            return ch
+    if not r:
+        return ""
+    ch = os.read(fd, 1).decode()
+    if ch == "\x1b":
+        r2, _, _ = select.select([sys.stdin], [], [], 0.05)
+        if r2:
+            ch2 = os.read(fd, 1).decode()
+            if ch2 == "[":
+                r3, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if r3:
+                    ch3 = os.read(fd, 1).decode()
+                    return f"\x1b[{ch3}"
+                return "\x1b["
+            return ch + ch2
         return ch
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return ch
 
 
 # ── input dialogs (work within the live display) ─────────────────────────────
@@ -330,7 +323,8 @@ def _input_number(prompt: str, max_val: int, live: Live, nc: int, np_: int, curr
         live.update(
             _render_frame(current_state, nc, np_, prompt=f"{prompt} [{buf}]")
         )
-        ch = _getch_timeout(10.0)
+        live.refresh()
+        ch = _read_key(10.0)
         if ch == "":
             continue
         if ch in ("\r", "\n"):
@@ -342,10 +336,15 @@ def _input_number(prompt: str, max_val: int, live: Live, nc: int, np_: int, curr
             buf = ""
         elif ch in ("\x7f", "\x08"):  # backspace
             buf = buf[:-1]
-        elif ch == "\x1b":  # ESC to cancel
+        elif ch in ("\x1b", "q", "Q"):  # ESC or q to cancel
             return None
         elif ch.isdigit():
             buf += ch
+            # Auto-submit when a single digit is pressed and max is <= 9
+            if len(buf) == 1 and max_val <= 9:
+                val = int(buf)
+                if 1 <= val <= max_val:
+                    return val
 
 
 def _input_choice(options: list[str], live: Live, nc: int, np_: int, current_state) -> int | None:
@@ -447,6 +446,20 @@ def _submenu_domestic_sale(state: EnvState, live: Live, nc: int, np_: int, num_p
     return {"store_type": store_type, "color": c, "price_slot": s}
 
 
+def _submenu_produce(state: EnvState, live: Live, nc: int, np_: int, num_players: int) -> dict | None:
+    """Pick a price for produced containers (applies to all factory colours produced)."""
+    player = int(state.current_player)
+    factories = [c for c in range(nc) if int(state.factory_colors[player, c]) > 0]
+    if not factories:
+        return None
+
+    options = [f"${i + 1}" for i in range(4)]
+    choice = _input_choice(options, live, nc, np_, state)
+    if choice is None:
+        return None
+    return {"price_slot": choice - 1}
+
+
 # ── describe actions ─────────────────────────────────────────────────────────
 
 
@@ -456,7 +469,7 @@ def _describe_action(action_type: int, params: dict, nc: int) -> str:
     elif action_type == ACTION_BUY_WAREHOUSE:
         return "Buy warehouse"
     elif action_type == ACTION_PRODUCE:
-        return "Produce containers"
+        return f"Produce containers at ${params.get('price_slot', 0) + 1}"
     elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
         return f"Buy {_cname(params.get('color', 0), nc)} from P{params.get('opponent', 1)}'s factory"
     elif action_type == ACTION_MOVE_LOAD:
@@ -500,7 +513,7 @@ def get_ai_action(state: EnvState, rng_key, num_players: int, num_colors: int):
         return encoder.to_multi_head(encoder.encode(atype, params or {}))
 
     if has_space_f and not produced:
-        return _encode(ACTION_PRODUCE), subkey
+        return _encode(ACTION_PRODUCE, {"price_slot": 1}), subkey  # AI produces at $2
 
     if loans > 0 and cash >= 11:
         return _encode(ACTION_REPAY_LOAN), subkey
@@ -554,196 +567,205 @@ def play(
     seed: int = typer.Option(42, "--seed", "-s", help="Random seed"),
 ) -> None:
     """Play the Container board game in the terminal with a live TUI."""
-    human_set = {int(x.strip()) for x in human_players.split(",") if x.strip()}
-    for h in human_set:
-        if h < 0 or h >= num_players:
-            console.print(f"[red]Invalid human player index: {h}[/red]")
-            raise typer.Exit(1)
+    _enter_raw_mode()
+    try:
+        human_set = {int(x.strip()) for x in human_players.split(",") if x.strip()}
+        for h in human_set:
+            if h < 0 or h >= num_players:
+                console.print(f"[red]Invalid human player index: {h}[/red]")
+                raise typer.Exit(1)
 
-    env = ContainerJaxEnv(num_players=num_players, num_colors=num_colors)
-    encoder = ActionEncoder(num_players, num_colors)
-    obs, info = env.reset(seed=seed)
-    rng_key = jax.random.PRNGKey(seed)
+        env = ContainerJaxEnv(num_players=num_players, num_colors=num_colors)
+        encoder = ActionEncoder(num_players, num_colors)
+        obs, info = env.reset(seed=seed)
+        rng_key = jax.random.PRNGKey(seed)
 
-    # state history: list of (state, description, reward)
-    history: list[tuple[EnvState, str, float]] = [(env.state, "(start)", 0.0)]
-    hist_idx = 0  # which history entry we're viewing (-1 = latest after game end)
-    viewing_history = False
-    done = False
+        # state history: list of (state, description, reward)
+        history: list[tuple[EnvState, str, float]] = [(env.state, "(start)", 0.0)]
+        hist_idx = 0  # which history entry we're viewing (-1 = latest after game end)
+        viewing_history = False
+        done = False
 
-    nc = num_colors
-    np_ = num_players
+        nc = num_colors
+        np_ = num_players
 
-    with Live(_render_frame(env.state, nc, np_), console=console, screen=True, auto_refresh=False) as live:
-        while True:
-            # If done (game over), always show final state
-            display_state = env.state
-            if viewing_history and hist_idx < len(history):
-                display_state = history[hist_idx][0]
+        with Live(_render_frame(env.state, nc, np_), console=console, screen=True, auto_refresh=False) as live:
+            while True:
+                # If done (game over), always show final state
+                display_state = env.state
+                if viewing_history and hist_idx < len(history):
+                    display_state = history[hist_idx][0]
 
-            hist_msg = ""
-            if len(history) > 1:
-                hist_msg = f"Step {hist_idx}/{len(history) - 1}  ← → to browse"
-                if viewing_history:
-                    hist_msg += " [bold yellow](HISTORY VIEW - press → for latest)[/bold yellow]"
+                hist_msg = ""
+                if len(history) > 1:
+                    hist_msg = f"Step {hist_idx}/{len(history) - 1}  ← → to browse"
+                    if viewing_history:
+                        hist_msg += " [bold yellow](HISTORY VIEW - press → for latest)[/bold yellow]"
 
-            live.update(
-                _render_frame(
-                    display_state,
-                    nc,
-                    np_,
-                    hist_msg=hist_msg,
-                    action_feedback=history[hist_idx][1] if hist_idx < len(history) else "",
+                live.update(
+                    _render_frame(
+                        display_state,
+                        nc,
+                        np_,
+                        hist_msg=hist_msg,
+                        action_feedback=history[hist_idx][1] if hist_idx < len(history) else "",
+                    )
                 )
-            )
-            live.refresh()
+                live.refresh()
 
-            if done and not viewing_history:
-                # Show game over screen, wait for quit
-                ch = _getch_timeout(30)
-                if ch in ("q", "\x1b"):
+                if done and not viewing_history:
+                    # Show game over screen, wait for quit
+                    ch = _read_key()
+                    if ch in ("q", "\x1b"):
+                        break
+                    if ch == "\x1b[D" and len(history) > 1:  # left arrow
+                        viewing_history = True
+                        hist_idx = len(history) - 1
+                    continue
+
+                # Read keypress (poll every 50ms so the display stays live)
+                ch = _read_key(timeout=0.05)
+                if ch == "":
+                    continue
+
+                # ── global keys ──
+                if ch in ("q", "Q"):
                     break
-                if ch == "\x1b[D" and len(history) > 1:  # left arrow
-                    viewing_history = True
-                    hist_idx = len(history) - 1
-                continue
 
-            # Read keypress
-            ch = _getch_timeout(30)
-            if ch == "":
-                continue
-
-            # ── global keys ──
-            if ch in ("q", "Q"):
-                break
-
-            # ── history navigation ──
-            if ch == "\x1b[D":  # left arrow
-                if hist_idx > 0:
-                    hist_idx -= 1
-                    viewing_history = True
-                continue
-            if ch == "\x1b[C":  # right arrow
-                if hist_idx < len(history) - 1:
-                    hist_idx += 1
-                    if hist_idx == len(history) - 1 and not done:
+                # ── history navigation ──
+                if ch == "\x1b[D":  # left arrow
+                    if hist_idx > 0:
+                        hist_idx -= 1
+                        viewing_history = True
+                    continue
+                if ch == "\x1b[C":  # right arrow
+                    if hist_idx < len(history) - 1:
+                        hist_idx += 1
+                        if hist_idx == len(history) - 1 and not done:
+                            viewing_history = False
+                    else:
                         viewing_history = False
+                    continue
+
+                # Can't act when viewing history
+                if viewing_history:
+                    continue
+
+                if done:
+                    continue
+
+                state = env.state
+                current = int(state.current_player)
+
+                # ── action dispatch ──
+                action_idx = None
+                params = {}
+
+                if ch in ("1", "2", "3", "4", "5", "6", "7", "p", "l", "r", "d", " "):
+                    action_map = {
+                        "1": ACTION_BUY_FACTORY,
+                        "2": ACTION_BUY_WAREHOUSE,
+                        "3": ACTION_PRODUCE,
+                        "4": ACTION_BUY_FROM_FACTORY_STORE,
+                        "5": ACTION_MOVE_LOAD,
+                        "6": ACTION_MOVE_SEA,
+                        "7": ACTION_MOVE_AUCTION,
+                        "p": ACTION_PASS,
+                        " ": ACTION_PASS,
+                        "l": ACTION_TAKE_LOAN,
+                        "r": ACTION_REPAY_LOAN,
+                        "d": ACTION_DOMESTIC_SALE,
+                    }
+                    atype = action_map[ch]
+
+                    # Sub-menus for actions that need parameters
+                    if atype == ACTION_BUY_FACTORY:
+                        result = _submenu_buy_factory(state, live, nc, np_, num_players)
+                        if result is None:
+                            continue
+                        params = result
+                    elif atype == ACTION_BUY_FROM_FACTORY_STORE:
+                        target = _submenu_pick_opponent(state, live, nc, np_, num_players)
+                        if target is None:
+                            continue
+                        picked = _submenu_pick_store(state, target, "factory", live, nc, np_)
+                        if picked is None:
+                            continue
+                        opp_idx = _opponent_menu_indices(current, num_players).index(target)
+                        params = {"opponent": opp_idx + 1, "color": picked["color"], "price_slot": picked["price_slot"]}
+                    elif atype == ACTION_MOVE_LOAD:
+                        target = _submenu_pick_opponent(state, live, nc, np_, num_players)
+                        if target is None:
+                            continue
+                        picked = _submenu_pick_store(state, target, "harbour", live, nc, np_)
+                        if picked is None:
+                            continue
+                        opp_idx = _opponent_menu_indices(current, num_players).index(target)
+                        params = {"opponent": opp_idx + 1, "color": picked["color"], "price_slot": picked["price_slot"]}
+                    elif atype == ACTION_DOMESTIC_SALE:
+                        result = _submenu_domestic_sale(state, live, nc, np_, num_players)
+                        if result is None:
+                            continue
+                        params = result
+                    elif atype == ACTION_PRODUCE:
+                        result = _submenu_produce(state, live, nc, np_, num_players)
+                        if result is None:
+                            continue
+                        params = result
+                    elif atype in (ACTION_PASS, ACTION_TAKE_LOAN, ACTION_REPAY_LOAN,
+                                   ACTION_MOVE_SEA, ACTION_MOVE_AUCTION, ACTION_BUY_WAREHOUSE):
+                        pass
+
+                    action_idx = encoder.encode(atype, params)
                 else:
-                    viewing_history = False
-                continue
+                    continue
 
-            # Can't act when viewing history
-            if viewing_history:
-                continue
+                # ── either human or AI plays the action ──
+                if current not in human_set:
+                    # AI: override the human-selected action
+                    action_idx, rng_key = get_ai_action(state, rng_key, num_players, num_colors)
 
-            if done:
-                continue
+                # Decode for description
+                decoder = ActionEncoder(num_players, num_colors)
+                try:
+                    decoded_type, decoded_params = decoder.decode(action_idx)
+                    desc = f"P{current + 1}: {_describe_action(decoded_type, decoded_params, nc)}"
+                except Exception:
+                    desc = f"P{current + 1}: action #{action_idx}"
 
-            state = env.state
-            current = int(state.current_player)
+                obs, reward, term, trunc, info = env.step(action_idx)
+                reward_f = float(reward)
 
-            # ── action dispatch ──
-            action_idx = None
-            params = {}
+                # Check if game actually ended (env.state might be stale if term was already set)
+                if env.func_env.terminal(env.state, rng_key, env.func_env.params):
+                    term = True
 
-            if ch in ("1", "2", "3", "4", "5", "6", "7", "p", "l", "r", "d", " "):
-                action_map = {
-                    "1": ACTION_BUY_FACTORY,
-                    "2": ACTION_BUY_WAREHOUSE,
-                    "3": ACTION_PRODUCE,
-                    "4": ACTION_BUY_FROM_FACTORY_STORE,
-                    "5": ACTION_MOVE_LOAD,
-                    "6": ACTION_MOVE_SEA,
-                    "7": ACTION_MOVE_AUCTION,
-                    "p": ACTION_PASS,
-                    " ": ACTION_PASS,
-                    "l": ACTION_TAKE_LOAN,
-                    "r": ACTION_REPAY_LOAN,
-                    "d": ACTION_DOMESTIC_SALE,
-                }
-                atype = action_map[ch]
+                # Append to history
+                history.append((env.state, desc, reward_f))
+                hist_idx = len(history) - 1
+                viewing_history = False
 
-                # Sub-menus for actions that need parameters
-                if atype == ACTION_BUY_FACTORY:
-                    result = _submenu_buy_factory(state, live, nc, np_, num_players)
-                    if result is None:
-                        continue
-                    params = result
-                elif atype == ACTION_BUY_FROM_FACTORY_STORE:
-                    target = _submenu_pick_opponent(state, live, nc, np_, num_players)
-                    if target is None:
-                        continue
-                    picked = _submenu_pick_store(state, target, "factory", live, nc, np_)
-                    if picked is None:
-                        continue
-                    opp_idx = _opponent_menu_indices(current, num_players).index(target)
-                    params = {"opponent": opp_idx + 1, "color": picked["color"], "price_slot": picked["price_slot"]}
-                elif atype == ACTION_MOVE_LOAD:
-                    target = _submenu_pick_opponent(state, live, nc, np_, num_players)
-                    if target is None:
-                        continue
-                    picked = _submenu_pick_store(state, target, "harbour", live, nc, np_)
-                    if picked is None:
-                        continue
-                    opp_idx = _opponent_menu_indices(current, num_players).index(target)
-                    params = {"opponent": opp_idx + 1, "color": picked["color"], "price_slot": picked["price_slot"]}
-                elif atype == ACTION_DOMESTIC_SALE:
-                    result = _submenu_domestic_sale(state, live, nc, np_, num_players)
-                    if result is None:
-                        continue
-                    params = result
-                elif atype in (ACTION_PASS, ACTION_TAKE_LOAN, ACTION_REPAY_LOAN, ACTION_PRODUCE,
-                               ACTION_MOVE_SEA, ACTION_MOVE_AUCTION, ACTION_BUY_WAREHOUSE):
-                    pass
+                if term or trunc:
+                    done = True
 
-                action_idx = encoder.encode(atype, params)
-            else:
-                continue
-
-            # ── either human or AI plays the action ──
-            if current not in human_set:
-                # AI: override the human-selected action
-                action_idx, rng_key = get_ai_action(state, rng_key, num_players, num_colors)
-
-            # Decode for description
-            decoder = ActionEncoder(num_players, num_colors)
-            try:
-                decoded_type, decoded_params = decoder.decode(action_idx)
-                desc = f"P{current + 1}: {_describe_action(decoded_type, decoded_params, nc)}"
-            except Exception:
-                desc = f"P{current + 1}: action #{action_idx}"
-
-            obs, reward, term, trunc, info = env.step(action_idx)
-            reward_f = float(reward)
-
-            # Check if game actually ended (env.state might be stale if term was already set)
-            if env.func_env.terminal(env.state, rng_key, env.func_env.params):
-                term = True
-
-            # Append to history
-            history.append((env.state, desc, reward_f))
-            hist_idx = len(history) - 1
-            viewing_history = False
-
-            if term or trunc:
-                done = True
-
-    # Restore terminal, show final scores
-    console.clear()
-    state = env.state
-    console.print("[bold green]═══ GAME OVER ═══[/bold green]\n")
-    table = Table(title="Final Scores")
-    table.add_column("Player")
-    table.add_column("Cash")
-    table.add_column("Net Worth", style="bold green")
-    for p in range(num_players):
-        cash = int(state.cash[p])
-        nw = _compute_net_worth(state, p, nc)
-        tag = " [cyan](you)[/cyan]" if p in human_set else ""
-        table.add_row(f"Player {p + 1}{tag}", f"${cash}", f"[bold]${nw}[/bold]")
-    console.print(table)
-    winner = max(range(num_players), key=lambda p: _compute_net_worth(state, p, nc))
-    console.print(f"\n[bold yellow]Player {winner + 1} wins! 🏆[/bold yellow]")
+        # Show final scores
+        console.clear()
+        state = env.state
+        console.print("[bold green]═══ GAME OVER ═══[/bold green]\n")
+        table = Table(title="Final Scores")
+        table.add_column("Player")
+        table.add_column("Cash")
+        table.add_column("Net Worth", style="bold green")
+        for p in range(num_players):
+            cash = int(state.cash[p])
+            nw = _compute_net_worth(state, p, nc)
+            tag = " [cyan](you)[/cyan]" if p in human_set else ""
+            table.add_row(f"Player {p + 1}{tag}", f"${cash}", f"[bold]${nw}[/bold]")
+        console.print(table)
+        winner = max(range(num_players), key=lambda p: _compute_net_worth(state, p, nc))
+        console.print(f"\n[bold yellow]Player {winner + 1} wins! 🏆[/bold yellow]")
+    finally:
+        _exit_raw_mode()
 
 
 @app.command()

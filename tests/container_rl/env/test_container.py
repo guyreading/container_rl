@@ -31,6 +31,7 @@ from container_rl.env.container import (  # noqa: E402
     LOCATION_OPEN_SEA,
     MAX_WAREHOUSES_PER_PLAYER,
     PRICE_SLOTS,
+    PRODUCE_PRICE_CHOICES,
     SHIP_CAPACITY,
     ActionEncoder,
     ContainerFunctional,
@@ -114,6 +115,9 @@ def _build_multihd(
     if action_type == ACTION_BUY_FACTORY:
         mh = mh.at[HEAD_COLOR].set(jnp.clip(params.get("color", 0), 0, nc - 1))
 
+    elif action_type == ACTION_PRODUCE:
+        mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params.get("price_slot", 0), 0, PRODUCE_PRICE_CHOICES - 1))
+
     elif action_type in (ACTION_BUY_FROM_FACTORY_STORE, ACTION_MOVE_LOAD):
         opp_idx = params.get("opponent", 1) - 1  # 1-based to 0-based
         mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2))
@@ -193,10 +197,10 @@ class TestActionEncoder:
 
     def test_encode_decode_roundtrip_produce(self):
         encoder = ActionEncoder(2, 5)
-        idx = encoder.encode(ACTION_PRODUCE, {})
+        idx = encoder.encode(ACTION_PRODUCE, {"price_slot": 2})
         atype, params = encoder.decode(idx)
         assert atype == ACTION_PRODUCE
-        assert params == {}
+        assert params["price_slot"] == 2
 
     def test_encode_decode_roundtrip_buy_from_factory_store(self):
         encoder = ActionEncoder(3, 4)
@@ -265,7 +269,7 @@ class TestActionEncoder:
         actions = [
             (ACTION_BUY_FACTORY, {"color": 0}),
             (ACTION_BUY_WAREHOUSE, {}),
-            (ACTION_PRODUCE, {}),
+                        (ACTION_PRODUCE, {"price_slot": 0}),
             (ACTION_BUY_FROM_FACTORY_STORE, {"opponent": 1, "color": 0, "price_slot": 0}),
             (ACTION_MOVE_LOAD, {"opponent": 1, "color": 0, "price_slot": 0}),
             (ACTION_MOVE_SEA, {}),
@@ -430,6 +434,8 @@ class TestHelpers:
         for atype in range(11):
             if atype == ACTION_BUY_FACTORY:
                 params = {"color": 2}
+            elif atype == ACTION_PRODUCE:
+                params = {"price_slot": 2}
             elif atype in (ACTION_BUY_FROM_FACTORY_STORE, ACTION_MOVE_LOAD):
                 params = {"opponent": 1, "color": 0, "price_slot": 3}
             elif atype == ACTION_DOMESTIC_SALE:
@@ -1126,7 +1132,7 @@ class TestTransition:
 
         # Encode a produce action
         encoder = ActionEncoder(2, 5)
-        action_idx = encoder.encode(ACTION_PRODUCE, {})
+        action_idx = encoder.encode(ACTION_PRODUCE, {"price_slot": 0})
         action = jnp.array(action_idx, dtype=jnp.int32)
 
         new_state = func_env.transition(state, action, key, params)
@@ -1232,7 +1238,7 @@ class TestObservationTerminalReward:
         key = random.PRNGKey(42)
 
         encoder = ActionEncoder(2, 5)
-        action_idx = encoder.encode(ACTION_PRODUCE, {})
+        action_idx = encoder.encode(ACTION_PRODUCE, {"price_slot": 0})
         next_state = func_env.transition(state, jnp.array(action_idx), key, params)
 
         reward = func_env.reward(state, action_idx, next_state, key, params)
@@ -1274,7 +1280,7 @@ class TestFullGame:
         steps = 0
         while True:
             # Produce (if valid) or pass
-            action_idx = encoder.encode(ACTION_PRODUCE, {})
+            action_idx = encoder.encode(ACTION_PRODUCE, {"price_slot": 0})
             obs, reward, term, trunc, info = env.step(action_idx)
             steps += 1
             if term:
@@ -1296,7 +1302,7 @@ class TestFullGame:
 
         # Run a few steps through the JIT env
         actions = [
-            (ACTION_PRODUCE, {}),
+                        (ACTION_PRODUCE, {"price_slot": 0}),
             (ACTION_PASS, {}),
             (ACTION_TAKE_LOAN, {}),
             (ACTION_REPAY_LOAN, {}),
@@ -1315,10 +1321,10 @@ class TestFullGame:
         env = ContainerJaxEnv(num_players=2, num_colors=5)
         encoder = ActionEncoder(2, 5)
         obs1, info = env.reset(seed=42)
-        env.step(encoder.encode(ACTION_PRODUCE, {}))
+        env.step(encoder.encode(ACTION_PRODUCE, {"price_slot": 0}))
         env.step(encoder.encode(ACTION_PASS, {}))
         obs2, info = env.reset(seed=42)
-        env.step(encoder.encode(ACTION_PRODUCE, {}))
+        env.step(encoder.encode(ACTION_PRODUCE, {"price_slot": 0}))
         obs3, info = env.reset(seed=42)
 
         # obs1 and obs3 should be identical (same seed)
