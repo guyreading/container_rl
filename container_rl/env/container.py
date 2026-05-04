@@ -172,7 +172,7 @@ class ActionEncoder:
         # Calculate action counts for each group
         self.buy_factory_actions = num_colors
         self.buy_warehouse_actions = 1
-        self.produce_actions = PRODUCE_PRICE_CHOICES
+        self.produce_actions = num_colors * PRODUCE_PRICE_CHOICES
         self.buy_from_factory_actions = (num_players - 1) * num_colors * PRICE_SLOTS
         self.move_load_actions = (num_players - 1) * num_colors * PRICE_SLOTS
         self.move_sea_actions = 1
@@ -225,8 +225,10 @@ class ActionEncoder:
 
         # Produce
         if action_idx < self.offsets['buy_from_factory']:
-            price_slot = action_idx - self.offsets['produce']
-            return ACTION_PRODUCE, {'price_slot': price_slot}
+            rel = action_idx - self.offsets['produce']
+            color = rel // PRODUCE_PRICE_CHOICES
+            price_slot = rel % PRODUCE_PRICE_CHOICES
+            return ACTION_PRODUCE, {'color': color, 'price_slot': price_slot}
 
         # Buy from factory store
         if action_idx < self.offsets['move_load']:
@@ -295,7 +297,7 @@ class ActionEncoder:
             return self.offsets['buy_warehouse']
 
         elif action_type == ACTION_PRODUCE:
-            return self.offsets['produce'] + params['price_slot']
+            return self.offsets['produce'] + params['color'] * PRODUCE_PRICE_CHOICES + params['price_slot']
 
         elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
             opponent = params['opponent'] - 1  # convert to 0-based among opponents
@@ -354,6 +356,7 @@ class ActionEncoder:
             mh = mh.at[HEAD_COLOR].set(jnp.clip(params["color"], 0, nc - 1))
 
         elif action_type == ACTION_PRODUCE:
+            mh = mh.at[HEAD_COLOR].set(jnp.clip(params["color"], 0, nc - 1))
             mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params["price_slot"], 0, PRODUCE_PRICE_CHOICES - 1))
 
         elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
@@ -460,11 +463,14 @@ class ContainerFunctional(
         def _do_normal(s):
             s = self._pay_interest(s, np_)
             atype = jnp.clip(action[HEAD_ACTION_TYPE], 0, NUM_ACTION_TYPES - 1)
+            # Capture whether produce already happened BEFORE dispatching,
+            # so _advance_turn knows whether to count this as an action.
+            was_produced = s.produced_this_turn > 0
             s = self._dispatch_action(s, action, key, params)
             s = jax.lax.cond(
                 s.shopping_active > 0,
                 lambda x: x,
-                lambda x: self._advance_turn(x, atype, np_),
+                lambda x: self._advance_turn(x, atype, np_, was_produced),
                 s,
             )
             return s
@@ -522,10 +528,15 @@ class ContainerFunctional(
             jnp.where(action_type == ACTION_MOVE_LOAD,
                       jnp.clip(purchase0, 0, _purchase_stop(nc) - 1), mh[HEAD_PURCHASE]))
 
-        # PRODUCE: price_slot
+        # PRODUCE: color, price_slot
+        produce_color = rel_offset // PRODUCE_PRICE_CHOICES
+        produce_slot = rel_offset % PRODUCE_PRICE_CHOICES
+        mh = mh.at[HEAD_COLOR].set(
+            jnp.where(action_type == ACTION_PRODUCE,
+                      jnp.clip(produce_color, 0, nc - 1), mh[HEAD_COLOR]))
         mh = mh.at[HEAD_PRICE_SLOT].set(
             jnp.where(action_type == ACTION_PRODUCE,
-                      jnp.clip(rel_offset, 0, PRODUCE_PRICE_CHOICES - 1), mh[HEAD_PRICE_SLOT]))
+                      jnp.clip(produce_slot, 0, PRODUCE_PRICE_CHOICES - 1), mh[HEAD_PRICE_SLOT]))
 
         # DOMESTIC_SALE: color, price_slot
         dom_color = remainder // PRICE_SLOTS
@@ -550,7 +561,7 @@ class ContainerFunctional(
             shopping_action_type=jnp.array(0, dtype=jnp.int32),
             shopping_target=jnp.array(0, dtype=jnp.int32),
         )
-        return self._advance_turn(state, action_type, num_players)
+        return self._advance_turn(state, action_type, num_players, False)
 
     def _do_one_purchase(self, state: EnvState, action_type: jax.Array, target: jax.Array,
                          action: jax.Array, params: ContainerParams) -> EnvState:
@@ -694,7 +705,7 @@ class ContainerFunctional(
         counts = [
             nc,
             1,
-            PRODUCE_PRICE_CHOICES,
+            nc * PRODUCE_PRICE_CHOICES,
             (np_ - 1) * nc * PRICE_SLOTS,
             (np_ - 1) * nc * PRICE_SLOTS,
             1,
@@ -851,7 +862,7 @@ class ContainerFunctional(
         return jnp.where(opp_idx < current_player, opp_idx, opp_idx + 1)
 
     def _factory_cost(self, num_factories_owned):
-        return (num_factories_owned + 1) * 2
+        return (num_factories_owned + 1) * 3
 
     def _warehouse_cost(self, num_warehouses_owned):
         return num_warehouses_owned + 1
@@ -954,6 +965,10 @@ class ContainerFunctional(
         nc = params.num_colors
         right_player = self._get_target_player(0, player, np_)
 
+        color = jnp.clip(action[HEAD_COLOR], 0, nc - 1)
+        place_slot = jnp.clip(action[HEAD_PRICE_SLOT], 0, PRODUCE_PRICE_CHOICES - 1)
+        place_slot = jnp.clip(place_slot, 0, PRICE_SLOTS - 1)
+
         already_produced = state.produced_this_turn > 0
 
         factory_colors_player = state.factory_colors[player]
@@ -962,11 +977,12 @@ class ContainerFunctional(
         current_stored = self._count_store_containers(state.factory_store, player)
         has_space = current_stored < capacity
 
-        supply_available = state.container_supply > 0
+        owns = factory_colors_player[color] > 0
+        supply_ok = state.container_supply[color] > 0
 
-        can_produce = (~already_produced) & has_space & (jnp.any(supply_available & (factory_colors_player > 0)))
+        can_produce = owns & has_space & supply_ok
+        do_pay_union = can_produce & (~already_produced)
 
-        do_pay_union = can_produce
         new_cash = state.cash.at[player].set(
             jnp.where(do_pay_union, state.cash[player] - 1, state.cash[player])
         )
@@ -975,43 +991,24 @@ class ContainerFunctional(
         )
         state = state._replace(cash=new_cash)
 
-        def _produce_one_color(i, carry):
-            s, stored_so_far = carry
-            owns = factory_colors_player[i] > 0
-            supply_ok = state.container_supply[i] > 0
-            space_ok = stored_so_far < capacity
-            do_produce = can_produce & owns & supply_ok & space_ok
-
-            place_slot = jnp.clip(action[HEAD_PRICE_SLOT], 0, PRODUCE_PRICE_CHOICES - 1)
-            place_slot = jnp.clip(place_slot, 0, PRICE_SLOTS - 1)
-
-            s = s._replace(
-                factory_store=s.factory_store.at[player, i, place_slot].set(
-                    jnp.where(
-                        do_produce,
-                        s.factory_store[player, i, place_slot] + 1,
-                        s.factory_store[player, i, place_slot],
-                    )
-                ),
-                container_supply=s.container_supply.at[i].set(
-                    jnp.where(
-                        do_produce,
-                        s.container_supply[i] - 1,
-                        s.container_supply[i],
-                    )
-                ),
-            )
-            stored_so_far = jnp.where(do_produce, stored_so_far + 1, stored_so_far)
-            return s, stored_so_far
-
-        stored = current_stored
-        for c in range(nc):
-            state, stored = _produce_one_color(c, (state, stored))
-
         state = state._replace(
+            factory_store=state.factory_store.at[player, color, place_slot].set(
+                jnp.where(
+                    can_produce,
+                    state.factory_store[player, color, place_slot] + 1,
+                    state.factory_store[player, color, place_slot],
+                )
+            ),
+            container_supply=state.container_supply.at[color].set(
+                jnp.where(
+                    can_produce,
+                    state.container_supply[color] - 1,
+                    state.container_supply[color],
+                )
+            ),
             produced_this_turn=jnp.where(
                 can_produce, jnp.array(1, dtype=state.produced_this_turn.dtype), state.produced_this_turn
-            )
+            ),
         )
 
         return state
@@ -1305,11 +1302,14 @@ class ContainerFunctional(
     # Turn advancement
     # ========================================================================
 
-    def _advance_turn(self, state, action_type, num_players):
+    def _advance_turn(self, state, action_type, num_players, was_produced):
         action_type = jnp.asarray(action_type, dtype=jnp.int32)
         is_auction = action_type == ACTION_MOVE_AUCTION
         is_loan = (action_type == ACTION_TAKE_LOAN) | (action_type == ACTION_REPAY_LOAN)
-        consumes_action = (jnp.logical_not(is_loan)).astype(jnp.int32)
+        is_produce = action_type == ACTION_PRODUCE
+        # Produce only consumes an action the first time (not on subsequent colours)
+        consumes_extra_produce = is_produce & was_produced
+        consumes_action = ((~is_loan) & (~consumes_extra_produce)).astype(jnp.int32)
 
         new_actions = state.actions_taken + consumes_action
         turn_ends = (new_actions >= 2) | is_auction

@@ -116,6 +116,7 @@ def _build_multihd(
         mh = mh.at[HEAD_COLOR].set(jnp.clip(params.get("color", 0), 0, nc - 1))
 
     elif action_type == ACTION_PRODUCE:
+        mh = mh.at[HEAD_COLOR].set(jnp.clip(params.get("color", 0), 0, nc - 1))
         mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params.get("price_slot", 0), 0, PRODUCE_PRICE_CHOICES - 1))
 
     elif action_type in (ACTION_BUY_FROM_FACTORY_STORE, ACTION_MOVE_LOAD):
@@ -197,9 +198,10 @@ class TestActionEncoder:
 
     def test_encode_decode_roundtrip_produce(self):
         encoder = ActionEncoder(2, 5)
-        idx = encoder.encode(ACTION_PRODUCE, {"price_slot": 2})
+        idx = encoder.encode(ACTION_PRODUCE, {"color": 1, "price_slot": 2})
         atype, params = encoder.decode(idx)
         assert atype == ACTION_PRODUCE
+        assert params["color"] == 1
         assert params["price_slot"] == 2
 
     def test_encode_decode_roundtrip_buy_from_factory_store(self):
@@ -269,7 +271,7 @@ class TestActionEncoder:
         actions = [
             (ACTION_BUY_FACTORY, {"color": 0}),
             (ACTION_BUY_WAREHOUSE, {}),
-                        (ACTION_PRODUCE, {"price_slot": 0}),
+                                    (ACTION_PRODUCE, {"color": 0, "price_slot": 0}),
             (ACTION_BUY_FROM_FACTORY_STORE, {"opponent": 1, "color": 0, "price_slot": 0}),
             (ACTION_MOVE_LOAD, {"opponent": 1, "color": 0, "price_slot": 0}),
             (ACTION_MOVE_SEA, {}),
@@ -377,9 +379,9 @@ class TestInitialState:
 class TestHelpers:
     def test_factory_cost(self):
         func_env = _make_func_env()
-        assert int(func_env._factory_cost(0)) == 2  # first extra factory
-        assert int(func_env._factory_cost(1)) == 4
-        assert int(func_env._factory_cost(4)) == 10
+        assert int(func_env._factory_cost(0)) == 3   # first extra factory: $3
+        assert int(func_env._factory_cost(1)) == 6   # second extra: $6
+        assert int(func_env._factory_cost(4)) == 15  # $15
 
     def test_warehouse_cost(self):
         func_env = _make_func_env()
@@ -435,7 +437,7 @@ class TestHelpers:
             if atype == ACTION_BUY_FACTORY:
                 params = {"color": 2}
             elif atype == ACTION_PRODUCE:
-                params = {"price_slot": 2}
+                params = {"color": 0, "price_slot": 2}
             elif atype in (ACTION_BUY_FROM_FACTORY_STORE, ACTION_MOVE_LOAD):
                 params = {"opponent": 1, "color": 0, "price_slot": 3}
             elif atype == ACTION_DOMESTIC_SALE:
@@ -615,8 +617,8 @@ class TestBuyFactory:
         mh = _rel_to_multihd(ACTION_BUY_FACTORY, 2, 2, 5)  # rel_offset=2 means color 2
         new_state = func_env._action_buy_factory(state, mh)
         assert int(new_state.factory_colors[0, 2]) == 1
-        # Cost for 2nd factory: (1+1)*2 = 4
-        assert int(new_state.cash[0]) == INITIAL_CASH - 4
+        # Cost for 2nd factory: (1+1)*3 = 6
+        assert int(new_state.cash[0]) == INITIAL_CASH - 6
 
     def test_cannot_buy_duplicate_color(self):
         func_env = _make_func_env()
@@ -703,22 +705,29 @@ class TestProduce:
         # produced_this_turn is set
         assert int(new_state.produced_this_turn) == 1
 
-    def test_cannot_produce_twice(self):
+    def test_can_produce_multiple_colors_per_turn(self):
+        """After the first produce (which pays $1), further produces place containers without paying."""
         func_env = _make_func_env()
         state = _make_state()
         params = _make_params()
-        mh = _build_multihd(ACTION_PRODUCE)
-        state = func_env._action_produce(state, mh, params)
-        new_state = func_env._action_produce(state, mh, params)
-        # No additional containers
-        assert int(jnp.sum(new_state.factory_store[0])) == int(jnp.sum(state.factory_store[0]))
+        # Give player 0 a second factory so there's enough storage
+        state = state._replace(factory_colors=state.factory_colors.at[0, 2].set(1))
+        mh0 = _build_multihd(ACTION_PRODUCE, {"color": 0, "price_slot": 1})
+        state = func_env._action_produce(state, mh0, params)
+        before_cash = int(state.cash[0])
+        mh1 = _build_multihd(ACTION_PRODUCE, {"color": 2, "price_slot": 2})
+        new_state = func_env._action_produce(state, mh1, params)
+        # Second produce adds containers (no payment since union was already paid)
+        assert int(jnp.sum(new_state.factory_store[0])) == int(jnp.sum(state.factory_store[0])) + 1
+        # No additional payment on second produce
+        assert int(new_state.cash[0]) == before_cash
 
     def test_pays_right_player(self):
         func_env = _make_func_env()
         params = _make_params()
         # Player 1's turn
         state = _make_state(current_player=jnp.array(1, dtype=jnp.int32))
-        mh = _build_multihd(ACTION_PRODUCE)
+        mh = _build_multihd(ACTION_PRODUCE, {"color": 1, "price_slot": 0})
         new_state = func_env._action_produce(state, mh, params)
         # Player 1 pays player 0 (right player in 2-player game)
         assert int(new_state.cash[1]) == INITIAL_CASH - 1
@@ -1132,7 +1141,7 @@ class TestTransition:
 
         # Encode a produce action
         encoder = ActionEncoder(2, 5)
-        action_idx = encoder.encode(ACTION_PRODUCE, {"price_slot": 0})
+        action_idx = encoder.encode(ACTION_PRODUCE, {"color": 0, "price_slot": 0})
         action = jnp.array(action_idx, dtype=jnp.int32)
 
         new_state = func_env.transition(state, action, key, params)
@@ -1238,7 +1247,7 @@ class TestObservationTerminalReward:
         key = random.PRNGKey(42)
 
         encoder = ActionEncoder(2, 5)
-        action_idx = encoder.encode(ACTION_PRODUCE, {"price_slot": 0})
+        action_idx = encoder.encode(ACTION_PRODUCE, {"color": 0, "price_slot": 0})
         next_state = func_env.transition(state, jnp.array(action_idx), key, params)
 
         reward = func_env.reward(state, action_idx, next_state, key, params)
@@ -1280,7 +1289,7 @@ class TestFullGame:
         steps = 0
         while True:
             # Produce (if valid) or pass
-            action_idx = encoder.encode(ACTION_PRODUCE, {"price_slot": 0})
+            action_idx = encoder.encode(ACTION_PRODUCE, {"color": 0, "price_slot": 0})
             obs, reward, term, trunc, info = env.step(action_idx)
             steps += 1
             if term:
@@ -1302,7 +1311,7 @@ class TestFullGame:
 
         # Run a few steps through the JIT env
         actions = [
-                        (ACTION_PRODUCE, {"price_slot": 0}),
+                                    (ACTION_PRODUCE, {"color": 0, "price_slot": 0}),
             (ACTION_PASS, {}),
             (ACTION_TAKE_LOAN, {}),
             (ACTION_REPAY_LOAN, {}),
@@ -1321,10 +1330,10 @@ class TestFullGame:
         env = ContainerJaxEnv(num_players=2, num_colors=5)
         encoder = ActionEncoder(2, 5)
         obs1, info = env.reset(seed=42)
-        env.step(encoder.encode(ACTION_PRODUCE, {"price_slot": 0}))
+        env.step(encoder.encode(ACTION_PRODUCE, {"color": 0, "price_slot": 0}))
         env.step(encoder.encode(ACTION_PASS, {}))
         obs2, info = env.reset(seed=42)
-        env.step(encoder.encode(ACTION_PRODUCE, {"price_slot": 0}))
+        env.step(encoder.encode(ACTION_PRODUCE, {"color": 0, "price_slot": 0}))
         obs3, info = env.reset(seed=42)
 
         # obs1 and obs3 should be identical (same seed)

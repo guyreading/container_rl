@@ -39,6 +39,7 @@ from container_rl.env.container import (
     LOCATION_AUCTION_ISLAND,
     LOCATION_HARBOUR_OFFSET,
     LOCATION_OPEN_SEA,
+    MAX_FACTORIES_PER_PLAYER,
     PRICE_SLOTS,
     SHIP_CAPACITY,
     ActionEncoder,
@@ -209,9 +210,10 @@ def _supply_bar(state, nc: int) -> Text:
     return Text.from_markup(text)
 
 
-def _action_help() -> Text:
+def _action_help(factory_cost: int = 0) -> Text:
+    fac_str = f"BuyFactory (${factory_cost})" if factory_cost > 0 else "BuyFactory"
     return Text.from_markup(
-        " [1]BuyFactory  [2]BuyWarehouse  [3]Produce  [4]BuyFromFactory  [5]LoadShip\n"
+        f" [1]{fac_str}  [2]BuyWarehouse  [3]Produce  [4]BuyFromFactory  [5]LoadShip\n"
         " [6]MoveToSea   [7]Auction    [p]Pass    [l]TakeLoan        [r]RepayLoan  [d]DomesticSale\n"
         " [←→] history  [q]uit"
     )
@@ -252,8 +254,10 @@ def _render_frame(
     if action_feedback:
         elements.append(Panel(Text(action_feedback, style="green"), border_style="green"))
 
-    # ── action help ──
-    elements.append(Panel(_action_help(), title="Actions", border_style="cyan"))
+    # ── action help (with dynamic factory cost) ──
+    fc = sum(1 for c in range(nc) if int(state.factory_colors[turn, c]) > 0)
+    fac_cost = (fc + 1) * 3 if fc < MAX_FACTORIES_PER_PLAYER else 0
+    elements.append(Panel(_action_help(fac_cost), title="Actions", border_style="cyan"))
 
     # ── prompt ──
     if prompt:
@@ -347,9 +351,12 @@ def _input_number(prompt: str, max_val: int, live: Live, nc: int, np_: int, curr
                     return val
 
 
-def _input_choice(options: list[str], live: Live, nc: int, np_: int, current_state) -> int | None:
+def _input_choice(options: list[str], live: Live, nc: int, np_: int, current_state, header: str = "") -> int | None:
     """Present a list of options and let user select with number keys or ESC to cancel."""
-    prompt_text = "\n".join(f"  {i + 1}. {opt}" for i, opt in enumerate(options))
+    prompt_text = ""
+    if header:
+        prompt_text += header + "\n\n"
+    prompt_text += "\n".join(f"  {i + 1}. {opt}" for i, opt in enumerate(options))
     prompt_text += "\n\n[dim]Number to select, ESC to cancel[/dim]"
     return _input_number(prompt_text, len(options), live, nc, np_, current_state)
 
@@ -360,6 +367,8 @@ def _input_choice(options: list[str], live: Live, nc: int, np_: int, current_sta
 def _submenu_buy_factory(state: EnvState, live: Live, nc: int, np_: int, num_players: int) -> dict | None:
     player = int(state.current_player)
     owned = {c for c in range(nc) if int(state.factory_colors[player, c]) > 0}
+    fc = len(owned)
+    cost = (fc + 1) * 3
     options = []
     option_colors = []
     for c in range(nc):
@@ -369,7 +378,8 @@ def _submenu_buy_factory(state: EnvState, live: Live, nc: int, np_: int, num_pla
         option_colors.append(c)
     if not options:
         return None
-    choice = _input_choice(options, live, nc, np_, state)
+    header = f"[bold]Buy a factory — cost: [green]${cost}[/green][/bold]"
+    choice = _input_choice(options, live, nc, np_, state, header=header)
     if choice is None:
         return None
     return {"color": option_colors[choice - 1]}
@@ -446,18 +456,40 @@ def _submenu_domestic_sale(state: EnvState, live: Live, nc: int, np_: int, num_p
     return {"store_type": store_type, "color": c, "price_slot": s}
 
 
-def _submenu_produce(state: EnvState, live: Live, nc: int, np_: int, num_players: int) -> dict | None:
-    """Pick a price for produced containers (applies to all factory colours produced)."""
+def _submenu_produce(
+    state: EnvState, live: Live, nc: int, np_: int, num_players: int,
+    env, encoder, history, rng_key,
+) -> bool:
+    """Collect per-color prices from the user and call env.step() for each factory colour.
+
+    Returns True if the submenu should cancel (user pressed q/ESC).
+    """
     player = int(state.current_player)
     factories = [c for c in range(nc) if int(state.factory_colors[player, c]) > 0]
     if not factories:
-        return None
+        return False
 
-    options = [f"${i + 1}" for i in range(4)]
-    choice = _input_choice(options, live, nc, np_, state)
-    if choice is None:
-        return None
-    return {"price_slot": choice - 1}
+    for color in factories:
+        header = f"[bold]Produce [{_cstyle(color)}]{_cname(color, nc)}[/{_cstyle(color)}] — pick a price:[/bold]"
+        options = [f"${i + 1}" for i in range(4)]
+        choice = _input_choice(options, live, nc, np_, env.state, header=header)
+        if choice is None:
+            return True
+        price_slot = choice - 1
+
+        action_idx = encoder.encode(ACTION_PRODUCE, {"color": color, "price_slot": price_slot})
+        obs, reward, term, trunc, info = env.step(action_idx)
+
+        decoder = ActionEncoder(num_players, nc)
+        try:
+            decoded_type, decoded_params = decoder.decode(action_idx)
+            desc = f"P{player + 1}: {_describe_action(decoded_type, decoded_params, nc)}"
+        except Exception:
+            desc = f"P{player + 1}: action #{action_idx}"
+
+        history.append((env.state, desc, float(reward)))
+
+    return False
 
 
 # ── describe actions ─────────────────────────────────────────────────────────
@@ -469,7 +501,7 @@ def _describe_action(action_type: int, params: dict, nc: int) -> str:
     elif action_type == ACTION_BUY_WAREHOUSE:
         return "Buy warehouse"
     elif action_type == ACTION_PRODUCE:
-        return f"Produce containers at ${params.get('price_slot', 0) + 1}"
+        return f"Produce {_cname(params.get('color', 0), nc)} at ${params.get('price_slot', 0) + 1}"
     elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
         return f"Buy {_cname(params.get('color', 0), nc)} from P{params.get('opponent', 1)}'s factory"
     elif action_type == ACTION_MOVE_LOAD:
@@ -513,7 +545,10 @@ def get_ai_action(state: EnvState, rng_key, num_players: int, num_colors: int):
         return encoder.to_multi_head(encoder.encode(atype, params or {}))
 
     if has_space_f and not produced:
-        return _encode(ACTION_PRODUCE, {"price_slot": 1}), subkey  # AI produces at $2
+        # AI produces the first owned factory color at $2
+        owned_colors = [c for c in range(num_colors) if int(state.factory_colors[player, c]) > 0]
+        ai_color = owned_colors[0] if owned_colors else 0
+        return _encode(ACTION_PRODUCE, {"color": ai_color, "price_slot": 1}), subkey
 
     if loans > 0 and cash >= 11:
         return _encode(ACTION_REPAY_LOAN), subkey
@@ -708,10 +743,18 @@ def play(
                             continue
                         params = result
                     elif atype == ACTION_PRODUCE:
-                        result = _submenu_produce(state, live, nc, np_, num_players)
-                        if result is None:
+                        cancelled = _submenu_produce(
+                            state, live, nc, np_, num_players,
+                            env, encoder, history, rng_key,
+                        )
+                        if cancelled:
                             continue
-                        params = result
+                        hist_idx = len(history) - 1
+                        # check if game ended
+                        rng_key, subkey = jax.random.split(rng_key)
+                        if env.func_env.terminal(env.state, rng_key, env.func_env.params):
+                            done = True
+                        continue
                     elif atype in (ACTION_PASS, ACTION_TAKE_LOAN, ACTION_REPAY_LOAN,
                                    ACTION_MOVE_SEA, ACTION_MOVE_AUCTION, ACTION_BUY_WAREHOUSE):
                         pass
