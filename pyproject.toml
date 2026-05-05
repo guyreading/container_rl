@@ -24,7 +24,9 @@ dependencies = [
   "gymnasium>=1.3.0",
   "jax>=0.10.0",
   "flax>=0.12.7",
+  "optax>=0.2.0",
   "pygame>=2.6.1",
+  "tensorboard>=2.18.0",
 ]
 requires-python = ">= 3.12"
 
