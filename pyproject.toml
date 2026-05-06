@@ -21,7 +21,7 @@ license = {text = "MIT"}
 dependencies = [
   "typer",
   "rich",
-  "gymnasium>=1.3.0",
+  "gymnasium>=1.0.0,<1.3.0",
   "jax>=0.10.0",
   "flax>=0.12.7",
   "pygame>=2.6.1",

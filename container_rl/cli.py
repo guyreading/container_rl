@@ -36,10 +36,12 @@ from container_rl.env.container import (
     ACTION_PRODUCE,
     ACTION_REPAY_LOAN,
     ACTION_TAKE_LOAN,
+    FACTORY_STORAGE_MULTIPLIER,
     LOCATION_AUCTION_ISLAND,
     LOCATION_HARBOUR_OFFSET,
     LOCATION_OPEN_SEA,
     MAX_FACTORIES_PER_PLAYER,
+    PRODUCE_PRICE_CHOICES,
     PRICE_SLOTS,
     SHIP_CAPACITY,
     ActionEncoder,
@@ -469,9 +471,21 @@ def _submenu_produce(
     if not factories:
         return False
 
+    import jax.numpy as jnp
+
     for color in factories:
+        # Skip colours where supply is exhausted or factory space is full,
+        # otherwise the env silently no-ops and wastes the action slot.
+        if int(state.container_supply[color]) == 0:
+            continue
+        fc = int(jnp.sum(state.factory_colors[player]))
+        capacity = fc * FACTORY_STORAGE_MULTIPLIER
+        stored = int(jnp.sum(env.state.factory_store[player]))
+        if stored >= capacity:
+            continue
+
         header = f"[bold]Produce [{_cstyle(color)}]{_cname(color, nc)}[/{_cstyle(color)}] — pick a price:[/bold]"
-        options = [f"${i + 1}" for i in range(4)]
+        options = [f"${i + 1}" for i in range(PRODUCE_PRICE_CHOICES)]
         choice = _input_choice(options, live, nc, np_, env.state, header=header)
         if choice is None:
             return True
@@ -492,6 +506,89 @@ def _submenu_produce(
     return False
 
 
+def _submenu_buy_from_factory(
+    state: EnvState, live: Live, nc: int, np_: int, num_players: int,
+    env, encoder, history, rng_key,
+) -> bool:
+    """Pick an opponent and buy containers from their factory store per colour.
+
+    Loops through each colour where the opponent has stock, lets the user pick
+    a price (from what's available), and calls env.step() for each purchase.
+    The first purchase consumes the action slot; subsequent purchases run as
+    recurrent shopping steps.  Returns True if the submenu was cancelled
+    before any purchase.
+    """
+    import jax.numpy as jnp
+
+    player = int(state.current_player)
+
+    target = _submenu_pick_opponent(state, live, nc, np_, num_players)
+    if target is None:
+        return True
+
+    opp_idx = _opponent_menu_indices(player, num_players).index(target)
+
+    factory_store = state.factory_store
+    available_colors = [
+        c for c in range(nc) if int(jnp.sum(factory_store[target, c])) > 0
+    ]
+    if not available_colors:
+        return False
+
+    first_purchase = True
+
+    for color in available_colors:
+        available_slots = [
+            s for s in range(PRICE_SLOTS)
+            if int(factory_store[target, color, s]) > 0
+        ]
+        if not available_slots:
+            continue
+
+        header = (
+            f"[bold]Buy [{_cstyle(color)}]{_cname(color, nc)}[/{_cstyle(color)}] "
+            f"from P{target + 1}'s factory — pick a price:[/bold]"
+        )
+        options = [f"${s + 1}" for s in available_slots]
+        choice = _input_choice(options, live, nc, np_, env.state, header=header)
+        if choice is None:
+            if first_purchase:
+                return True
+            break
+        price_slot = available_slots[choice - 1]
+
+        action_idx = encoder.encode(
+            ACTION_BUY_FROM_FACTORY_STORE,
+            {"opponent": opp_idx + 1, "color": color, "price_slot": price_slot},
+        )
+        obs, reward, term, trunc, info = env.step(action_idx)
+        first_purchase = False
+
+        decoder = ActionEncoder(num_players, nc)
+        try:
+            decoded_type, decoded_params = decoder.decode(action_idx)
+            desc = f"P{player + 1}: {_describe_action(decoded_type, decoded_params, nc)}"
+        except Exception:
+            desc = f"P{player + 1}: action #{action_idx}"
+
+        history.append((env.state, desc, float(reward)))
+
+        # Shopping may have auto-finished (no more space/cash/stock)
+        if not int(env.state.shopping_active):
+            return False
+
+    # Send STOP if still shopping so the turn can advance
+    if int(env.state.shopping_active) > 0:
+        stop_action = jnp.array(
+            [ACTION_BUY_FROM_FACTORY_STORE, 0, 0, 0, nc * PRICE_SLOTS],
+            dtype=jnp.int32,
+        )
+        obs, reward, term, trunc, info = env.step(stop_action)
+        history.append((env.state, f"P{player + 1}: Stop buying", float(reward)))
+
+    return False
+
+
 # ── describe actions ─────────────────────────────────────────────────────────
 
 
@@ -503,7 +600,7 @@ def _describe_action(action_type: int, params: dict, nc: int) -> str:
     elif action_type == ACTION_PRODUCE:
         return f"Produce {_cname(params.get('color', 0), nc)} at ${params.get('price_slot', 0) + 1}"
     elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
-        return f"Buy {_cname(params.get('color', 0), nc)} from P{params.get('opponent', 1)}'s factory"
+        return f"Buy {_cname(params.get('color', 0), nc)} from P{params.get('opponent', 1)}'s factory at ${params.get('price_slot', 0) + 1}"
     elif action_type == ACTION_MOVE_LOAD:
         return f"Load {_cname(params.get('color', 0), nc)} from P{params.get('opponent', 1)}'s harbour"
     elif action_type == ACTION_MOVE_SEA:
@@ -720,14 +817,17 @@ def play(
                             continue
                         params = result
                     elif atype == ACTION_BUY_FROM_FACTORY_STORE:
-                        target = _submenu_pick_opponent(state, live, nc, np_, num_players)
-                        if target is None:
+                        cancelled = _submenu_buy_from_factory(
+                            state, live, nc, np_, num_players,
+                            env, encoder, history, rng_key,
+                        )
+                        if cancelled:
                             continue
-                        picked = _submenu_pick_store(state, target, "factory", live, nc, np_)
-                        if picked is None:
-                            continue
-                        opp_idx = _opponent_menu_indices(current, num_players).index(target)
-                        params = {"opponent": opp_idx + 1, "color": picked["color"], "price_slot": picked["price_slot"]}
+                        hist_idx = len(history) - 1
+                        rng_key, subkey = jax.random.split(rng_key)
+                        if env.func_env.terminal(env.state, rng_key, env.func_env.params):
+                            done = True
+                        continue
                     elif atype == ACTION_MOVE_LOAD:
                         target = _submenu_pick_opponent(state, live, nc, np_, num_players)
                         if target is None:
