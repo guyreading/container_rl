@@ -25,6 +25,7 @@ dependencies = [
   "jax>=0.10.0",
   "flax>=0.12.7",
   "pygame>=2.6.1",
+  "sb3-contrib>=2.6.0",
   "stable-baselines3>=2.6.0",
   "tensorboard>=2.18.0",
 ]

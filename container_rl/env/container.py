@@ -724,6 +724,51 @@ class ContainerFunctional(
     # Action masks (per-head validity vectors)
     # ========================================================================
 
+    def _center_on_player(self, state: EnvState, player: jax.Array, num_players: int) -> EnvState:
+        """Rotate per-player arrays so *player* lands at index 0.
+
+        Player-index scalars (``auction_seller``, ``shopping_target``,
+        ``current_player``) are remapped so that positional slot 0 always
+        refers to the acting player.
+
+        Global fields (``container_supply``, ``game_over``, …) are passed
+        through unchanged.
+        """
+        p = player
+        shift = -p
+
+        state = state._replace(
+            # ---- per-player arrays (roll axis 0) ---------------------------
+            cash=jnp.roll(state.cash, shift, axis=0),
+            loans=jnp.roll(state.loans, shift, axis=0),
+            factory_colors=jnp.roll(state.factory_colors, shift, axis=0),
+            warehouse_count=jnp.roll(state.warehouse_count, shift, axis=0),
+            factory_store=jnp.roll(state.factory_store, shift, axis=0),
+            harbour_store=jnp.roll(state.harbour_store, shift, axis=0),
+            island_store=jnp.roll(state.island_store, shift, axis=0),
+            ship_contents=jnp.roll(state.ship_contents, shift, axis=0),
+            ship_location=jnp.roll(state.ship_location, shift, axis=0),
+            secret_value_color=jnp.roll(state.secret_value_color, shift, axis=0),
+            auction_bids=jnp.roll(state.auction_bids, shift, axis=0),
+
+            # ---- player-index scalars (remap) ------------------------------
+            current_player=jnp.array(0, dtype=state.current_player.dtype),
+            auction_seller=(
+                (state.auction_seller - p) % num_players
+            ).astype(state.auction_seller.dtype),
+            shopping_target=jnp.where(
+                state.shopping_active > 0,
+                (state.shopping_target - p) % num_players,
+                jnp.array(0, dtype=state.shopping_target.dtype),
+            ),
+        )
+
+        return state
+
+    # ========================================================================
+    # Action masks (per-head validity vectors)
+    # ========================================================================
+
     def _action_masks(self, state: EnvState, params: ContainerParams) -> dict[str, jax.Array]:
         """Return binary masks for each action head (1 = valid, 0 = invalid).
 
@@ -1410,57 +1455,66 @@ class ContainerFunctional(
         rng: PRNGKeyType,
         params: ContainerParams = ContainerParams,
     ) -> jax.Array:
-        """Convert state to observation vector (agent perspective, player 0).
+        """Convert state to an ego-centric observation for the acting player.
 
-        The observation includes the full game state followed by per-head
-        action masks that an RL policy can use to zero out invalid actions.
+        Per-player arrays are rotated so that *current_player* lands at
+        positional slot 0 — the policy always sees "my" data first.
+        Action masks (computed on the original state) are appended at the
+        end so that ``MaskablePPO`` can zero out invalid actions.
         """
-        parts = []
+        player = state.current_player
+        num_players = params.num_players
 
-        parts.append(state.cash.astype(jnp.float32))
-        parts.append(state.loans.astype(jnp.float32))
-        parts.append(state.warehouse_count.astype(jnp.float32))
-        parts.append(state.ship_location.astype(jnp.float32))
+        # Compute masks on the ORIGINAL state (already keyed to current_player internally).
+        masks = self._action_masks(state, params)
 
-        parts.append(state.factory_colors.reshape(-1).astype(jnp.float32))
-        parts.append(state.island_store.reshape(-1).astype(jnp.float32))
-        parts.append(state.factory_store.reshape(-1).astype(jnp.float32))
-        parts.append(state.harbour_store.reshape(-1).astype(jnp.float32))
-        parts.append(state.ship_contents.reshape(-1).astype(jnp.float32))
+        # Rotate state so the acting player is at index 0.
+        centered = self._center_on_player(state, player, num_players)
 
-        parts.append(state.container_supply.astype(jnp.float32))
+        parts: list[jax.Array] = []
+        parts.append(centered.cash.astype(jnp.float32))
+        parts.append(centered.loans.astype(jnp.float32))
+        parts.append(centered.warehouse_count.astype(jnp.float32))
+        parts.append(centered.ship_location.astype(jnp.float32))
+
+        parts.append(centered.factory_colors.reshape(-1).astype(jnp.float32))
+        parts.append(centered.island_store.reshape(-1).astype(jnp.float32))
+        parts.append(centered.factory_store.reshape(-1).astype(jnp.float32))
+        parts.append(centered.harbour_store.reshape(-1).astype(jnp.float32))
+        parts.append(centered.ship_contents.reshape(-1).astype(jnp.float32))
+
+        parts.append(centered.container_supply.astype(jnp.float32))
         parts.append(
             jnp.array(
                 [
-                    state.turn_phase.astype(jnp.float32),
-                    state.current_player.astype(jnp.float32),
-                    state.game_over.astype(jnp.float32),
-                    state.actions_taken.astype(jnp.float32),
+                    centered.turn_phase.astype(jnp.float32),
+                    centered.current_player.astype(jnp.float32),
+                    centered.game_over.astype(jnp.float32),
+                    centered.actions_taken.astype(jnp.float32),
                 ]
             )
         )
-        parts.append(state.secret_value_color.astype(jnp.float32))
+        parts.append(centered.secret_value_color.astype(jnp.float32))
         parts.append(
             jnp.array(
                 [
-                    state.auction_active.astype(jnp.float32),
-                    state.auction_seller.astype(jnp.float32),
+                    centered.auction_active.astype(jnp.float32),
+                    centered.auction_seller.astype(jnp.float32),
                 ]
             )
         )
-        parts.append(jnp.sum(state.auction_cargo > 0).astype(jnp.float32)[None])
+        parts.append(jnp.sum(centered.auction_cargo > 0).astype(jnp.float32)[None])
 
         # Shopping continuation state (3 scalars)
         parts.append(
             jnp.array([
-                state.shopping_active.astype(jnp.float32),
-                state.shopping_action_type.astype(jnp.float32),
-                state.shopping_target.astype(jnp.float32),
+                centered.shopping_active.astype(jnp.float32),
+                centered.shopping_action_type.astype(jnp.float32),
+                centered.shopping_target.astype(jnp.float32),
             ])
         )
 
-        # Append action masks for multi-head policy training
-        masks = self._action_masks(state, params)
+        # Append action masks (computed pre-rotation, already player-relative)
         parts.append(masks["action_type"].astype(jnp.float32))
         parts.append(masks["opponent"].astype(jnp.float32))
         parts.append(masks["color"].astype(jnp.float32))
@@ -1539,8 +1593,9 @@ class ContainerFunctional(
         rng: PRNGKeyType,
         params: ContainerParams = ContainerParams,
     ) -> jax.Array:
-        """Compute reward for agent (player 0) as net worth change."""
-        agent = 0
+        """Compute reward for the acting player (whoever ``current_player`` is)
+        as their net worth change."""
+        agent = state.current_player
         curr_nw = self._net_worth(state, agent, params.num_colors)
         next_nw = self._net_worth(next_state, agent, params.num_colors)
         return (next_nw - curr_nw).astype(jnp.float32)
