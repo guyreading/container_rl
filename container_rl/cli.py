@@ -78,6 +78,16 @@ def _cstyle(idx: int) -> str:
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
+def _describe_cargo(cargo_arr, nc: int) -> str:
+    """Return a short description of an auction cargo array."""
+    parts = []
+    for slot in range(cargo_arr.shape[0]):
+        c = int(cargo_arr[slot])
+        if c > 0:
+            parts.append(f"[{_cstyle(c - 1)}]{_cname(c - 1, nc)}[/{_cstyle(c - 1)}]")
+    return " × ".join(parts) if parts else "(empty)"
+
+
 def _opponent_menu_indices(current_player: int, num_players: int) -> list[int]:
     """Return opponent indices in clockwise order, starting from the player to the right."""
     return [(current_player + 1 + i) % num_players for i in range(num_players - 1)]
@@ -261,9 +271,18 @@ def _render_frame(
         elements.append(Panel(Text(action_feedback, style="green"), border_style="green"))
 
     # ── action help (with dynamic factory cost) ──
-    fc = sum(1 for c in range(nc) if int(state.factory_colors[turn, c]) > 0)
-    fac_cost = (fc + 1) * 3 if fc < MAX_FACTORIES_PER_PLAYER else 0
-    elements.append(Panel(_action_help(fac_cost), title="Actions", border_style="cyan"))
+    if int(state.auction_active) > 0:
+        seller = int(state.auction_seller)
+        round_ = int(state.auction_round)
+        if round_ == 0:
+            help_text = f"Auction in progress — P{seller + 1} is selling"
+        else:
+            help_text = f"Auction — P{seller + 1}: accept or reject?"
+        elements.append(Panel(Text(help_text, style="bold yellow"), title="Auction", border_style="yellow"))
+    else:
+        fc = sum(1 for c in range(nc) if int(state.factory_colors[turn, c]) > 0)
+        fac_cost = (fc + 1) * 3 if fc < MAX_FACTORIES_PER_PLAYER else 0
+        elements.append(Panel(_action_help(fac_cost), title="Actions", border_style="cyan"))
 
     # ── prompt ──
     if prompt:
@@ -942,6 +961,81 @@ def play(
 
                 state = env.state
                 current = int(state.current_player)
+
+                # ── auction mode: collect bids / seller decision ──
+                if int(state.auction_active) > 0:
+                    seller = int(state.auction_seller)
+                    round_ = int(state.auction_round)
+                    is_bidding = round_ == 0
+                    is_decision = round_ == 1
+
+                    if is_bidding and current != seller:
+                        # Non-seller: submit blind bid.
+                        cargo_desc = _describe_cargo(state.auction_cargo, nc)
+                        bid_str = _input_number(
+                            f"[bold]Auction![/bold]  Cargo: {cargo_desc}\n"
+                            f"P{current + 1}: enter your bid ([dim]0 = pass[/dim], max ${int(state.cash[current])}): ",
+                            999, live, nc, np_, state,
+                        )
+                        if bid_str is None:
+                            bid_str = 0
+                        bid_action = jnp.array(
+                            [ACTION_MOVE_AUCTION, 0, 0, 0, bid_str],
+                            dtype=jnp.int32,
+                        )
+                        obs, reward, term, trunc, info = env.step(bid_action)
+                        history.append(
+                            (env.state,
+                             f"P{current + 1}: bid ${bid_str}",
+                             float(reward)),
+                        )
+                    elif is_decision and current == seller:
+                        # Seller: accept or reject.
+                        highest_bid = max(0, int(jnp.max(state.auction_bids)))
+                        choice = _input_choice(
+                            [f"[green]Accept[/green] (gain ${highest_bid} from winner + ${highest_bid} from bank)",
+                             f"[red]Reject[/red] (pay ${highest_bid} to bank, keep goods)"],
+                            live, nc, np_, state,
+                            header=f"[bold]Auction result — highest bid: ${highest_bid}[/bold]",
+                        )
+                        if choice is None:
+                            choice = 1  # default accept
+                        accept = 1 if choice == 1 else 0
+                        dec_action = jnp.array(
+                            [ACTION_MOVE_AUCTION, 0, 0, 0, accept],
+                            dtype=jnp.int32,
+                        )
+                        obs, reward, term, trunc, info = env.step(dec_action)
+                        history.append(
+                            (env.state,
+                             f"P{current + 1}: {'accepted' if accept else 'rejected'} bid",
+                             float(reward)),
+                        )
+                    else:
+                        # AI player: auto-bid or auto-accept for seller.
+                        if current not in human_set:
+                            if is_decision and current == seller:
+                                # AI seller always accepts if there's a bid
+                                bid_amount = 1
+                                desc = f"P{current + 1}: accepted bid"
+                            else:
+                                import random as py_random
+                                max_bid = min(
+                                    int(state.cash[current]),
+                                    int(jnp.sum(state.auction_cargo > 0)) * 10 + 1,
+                                )
+                                bid_amount = py_random.randint(0, max(0, max_bid))
+                                desc = f"P{current + 1}: bid ${bid_amount}"
+                            bid_action = jnp.array(
+                                [ACTION_MOVE_AUCTION, 0, 0, 0, bid_amount],
+                                dtype=jnp.int32,
+                            )
+                            obs, reward, term, trunc, info = env.step(bid_action)
+                            history.append((env.state, desc, float(reward)))
+
+                    if term or trunc:
+                        done = True
+                    continue
 
                 # ── action dispatch ──
                 action_idx = None

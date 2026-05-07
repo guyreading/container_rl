@@ -489,22 +489,30 @@ class ContainerFunctional(
                     s.produce_active > 0, was_produced, s.produce_was_produced,
                 ),
             )
-            # Don't advance turn if still mid-shopping or mid-produce.
+            # Don't advance turn if still mid-shopping, mid-produce, or mid-auction.
             s = jax.lax.cond(
-                (s.shopping_active > 0) | (s.produce_active > 0),
+                (s.shopping_active > 0) | (s.produce_active > 0) | (s.auction_active > 0),
                 lambda x: x,
                 lambda x: self._advance_turn(x, atype, np_, was_produced),
                 s,
             )
             return s
 
+        def _do_auction_continue(s):
+            return self._auction_continue_step(s, action, key, params)
+
         state = jax.lax.cond(
-            state.produce_active > 0,
-            _do_produce_shopping,
+            state.auction_active > 0,
+            _do_auction_continue,
             lambda s: jax.lax.cond(
-                s.shopping_active > 0,
-                _do_shopping,
-                _do_normal,
+                s.produce_active > 0,
+                _do_produce_shopping,
+                lambda s: jax.lax.cond(
+                    s.shopping_active > 0,
+                    _do_shopping,
+                    _do_normal,
+                    s,
+                ),
                 s,
             ),
             state,
@@ -873,7 +881,12 @@ class ContainerFunctional(
         in_harbour = state.ship_location[player] >= LOCATION_HARBOUR_OFFSET
         at_mask = at_mask.at[ACTION_MOVE_SEA].set(in_harbour.astype(jnp.int32))
 
-        at_mask = at_mask.at[ACTION_MOVE_AUCTION].set(jnp.where(at_sea & (ship_cargo > 0), 1, 0))
+        at_mask = at_mask.at[ACTION_MOVE_AUCTION].set(
+            jnp.where(
+                state.auction_active > 0,
+                1,  # always valid during auction
+                jnp.where(at_sea & (ship_cargo > 0), 1, 0),
+            ))
 
         at_mask = at_mask.at[ACTION_PASS].set(1)
 
@@ -1295,103 +1308,158 @@ class ContainerFunctional(
     # ========================================================================
 
     def _action_move_auction(self, state, action, key, params):
+        """Initiate an auction.  Snapshots cargo, clears the ship, and
+        enters recurrent mode so other players can submit bids."""
         player = state.current_player
         np_ = params.num_players
+
         at_sea = state.ship_location[player] == LOCATION_OPEN_SEA
         ship_row = state.ship_contents[player]
         has_cargo = jnp.any(ship_row > 0)
-
         can_auction = at_sea & has_cargo
 
-        key, subkey = random.split(key)
-        cargo = ship_row
-        num_cargo = jnp.sum(cargo > 0)
-
-        bid_max = jnp.maximum(
-            1,
-            (jnp.array(10, dtype=jnp.int32) * num_cargo + 1).astype(jnp.int32),
-        )
-        raw_bids = jnp.where(
-            can_auction,
-            random.randint(subkey, (np_,), 0, bid_max),
-            jnp.zeros(np_, dtype=jnp.int32),
-        )
-        bids = jnp.where(
-            jnp.arange(np_) == player,
-            jnp.zeros((), dtype=jnp.int32),
-            raw_bids,
-        )
-
-        all_zero = jnp.all(bids == 0, axis=0)
-
-        highest_bid = jnp.max(bids)
-        is_max = bids == highest_bid
-        tied = jnp.sum(is_max & (bids > 0)) > 1
-
-        winner = jnp.argmax(is_max.astype(jnp.int32))
-        winner = jnp.where(all_zero, player, winner)
-
-        tie_key, key = random.split(key)
-        tie_bids = jnp.where(
-            tied,
-            random.randint(tie_key, (np_,), 0, 6),
-            jnp.zeros(np_, dtype=jnp.int32),
-        )
-        tie_bids = jnp.where(is_max, tie_bids, jnp.zeros((), dtype=jnp.int32) - 1)
-        tie_winner = jnp.argmax(tie_bids)
-        winner = jnp.where(tied, tie_winner, winner)
-        effective_bid = jnp.where(tied, jnp.max(tie_bids) + highest_bid, highest_bid)
-
-        seller_accepts = effective_bid > 0
-
-        winner_goods = seller_accepts & ~all_zero
-        seller_goods = (~seller_accepts) | all_zero
-
-        accept_gain = jnp.where(
-            can_auction & seller_accepts,
-            effective_bid * 2,
-            jnp.zeros((), dtype=jnp.int32),
-        )
-        reject_loss = jnp.where(
-            can_auction & (~seller_accepts) & (~all_zero),
-            highest_bid,
-            jnp.zeros((), dtype=jnp.int32),
-        )
-
-        new_cash = state.cash.at[player].add(accept_gain - reject_loss)
-        winner_pays = jnp.where(
-            can_auction & winner_goods & (winner != player),
-            effective_bid,
-            jnp.zeros((), dtype=jnp.int32),
-        )
-        new_cash = new_cash.at[winner].add(-winner_pays)
+        next_bidder = (player + 1) % np_  # first non-seller to bid
 
         state = state._replace(
-            cash=new_cash,
+            auction_active=jnp.where(can_auction, jnp.array(1, dtype=jnp.int32),
+                                     jnp.array(0, dtype=jnp.int32)),
+            auction_seller=jnp.where(can_auction, player,
+                                     jnp.zeros((), dtype=jnp.int32)),
+            auction_cargo=jnp.where(can_auction, ship_row,
+                                    jnp.zeros(SHIP_CAPACITY, dtype=jnp.int32)),
+            auction_bids=jnp.where(
+                can_auction,
+                jnp.full(np_, -1, dtype=jnp.int32).at[player].set(0),
+                jnp.zeros(np_, dtype=jnp.int32),
+            ),
+            auction_round=jnp.where(can_auction, jnp.array(0, dtype=jnp.int32),
+                                    jnp.array(0, dtype=jnp.int32)),
             ship_contents=state.ship_contents.at[player].set(
                 jnp.where(can_auction, jnp.zeros(SHIP_CAPACITY, dtype=jnp.int32), ship_row)
             ),
             ship_location=state.ship_location.at[player].set(
                 jnp.where(can_auction, LOCATION_AUCTION_ISLAND, state.ship_location[player])
             ),
+            current_player=jnp.where(can_auction, next_bidder, state.current_player),
         )
+        return state
 
-        def _deposit_goods(s, recipient, do_deposit):
-            for slot in range(SHIP_CAPACITY):
-                c = cargo[slot].astype(jnp.int32)
-                color_idx = c - 1
-                valid = (c > 0).astype(jnp.int32) & jnp.where(can_auction, do_deposit, 0)
-                s = s._replace(
-                    island_store=s.island_store.at[recipient, jnp.maximum(color_idx, 0)].add(
-                        jnp.where(valid > 0, jnp.array(1, dtype=jnp.int32), jnp.array(0, dtype=jnp.int32))
-                    )
-                )
+    # ========================================================================
+    # Recurrent auction (bidding + seller decision)
+    # ========================================================================
+
+    def _auction_continue_step(self, state, action, key, params):
+        """Process one step of the recurrent auction.
+
+        Bidding phase (auction_round == 0): each non-seller player submits
+        a blind bid via HEAD_PURCHASE.  When all bids are collected the
+        phase advances to the seller decision.
+
+        Seller decision (auction_round == 1): the seller's HEAD_PURCHASE
+        signals accept (>0) or reject (0).  The auction resolves and the
+        turn ends.
+        """
+        np_ = params.num_players
+        nc = params.num_colors
+        player = state.current_player
+        seller = state.auction_seller
+        round_ = state.auction_round
+        is_bidding = round_ == 0
+        is_decision = round_ == 1
+
+        bid_amount = jnp.clip(action[HEAD_PURCHASE], 0, state.cash[player])
+
+        def _store_bid(s):
+            bids = s.auction_bids.at[player].set(bid_amount)
+            next_bidder = (player + 1) % np_
+            remaining = jnp.any(bids == -1)
+            s = s._replace(auction_bids=bids)
+            s = jax.lax.cond(
+                remaining,
+                lambda x: x._replace(
+                    current_player=next_bidder,
+                    auction_round=jnp.array(0, dtype=jnp.int32),
+                ),
+                lambda x: x._replace(
+                    auction_round=jnp.array(1, dtype=jnp.int32),
+                    current_player=seller,
+                ),
+                s,
+            )
             return s
 
-        state = _deposit_goods(state, player, seller_goods.astype(jnp.int32))
-        state = _deposit_goods(state, winner, winner_goods.astype(jnp.int32))
+        def _resolve_auction(s):
+            cargo = s.auction_cargo
+            bids = s.auction_bids
 
-        return state
+            all_zero = jnp.all(bids <= 0, axis=0)
+            highest_bid = jnp.max(bids)
+            is_max = bids == highest_bid
+            tied = jnp.sum(is_max & (bids > 0)) > 1
+
+            winner = jnp.argmax(is_max.astype(jnp.int32))
+            winner = jnp.where(all_zero, seller, winner)
+
+            # Tie-break with random second round
+            key1, key2 = random.split(key)
+            tie_bids = jnp.where(
+                tied,
+                random.randint(key1, (np_,), 0, 6),
+                jnp.zeros(np_, dtype=jnp.int32),
+            )
+            tie_bids = jnp.where(is_max, tie_bids, jnp.zeros((), dtype=jnp.int32) - 1)
+            tie_winner = jnp.argmax(tie_bids)
+            winner = jnp.where(tied, tie_winner, winner)
+            effective_bid = jnp.where(tied, jnp.max(tie_bids) + highest_bid, highest_bid)
+
+            accept = jnp.where(is_decision, bid_amount > 0, effective_bid > 0)
+
+            winner_goods = accept & ~all_zero
+            seller_goods = (~accept) | all_zero
+
+            accept_gain = effective_bid * 2
+            reject_loss = jnp.where(~accept & ~all_zero, highest_bid, 0)
+            new_cash = s.cash.at[seller].add(accept_gain - reject_loss)
+            winner_pays = jnp.where(winner_goods & (winner != seller), effective_bid, 0)
+            new_cash = new_cash.at[winner].add(-winner_pays)
+
+            s = s._replace(
+                cash=new_cash,
+                auction_active=jnp.array(0, dtype=jnp.int32),
+            )
+
+            def _deposit_goods(st, recipient, do_deposit):
+                for slot in range(SHIP_CAPACITY):
+                    c = cargo[slot].astype(jnp.int32)
+                    color_idx = c - 1
+                    valid = (c > 0).astype(jnp.int32) & do_deposit.astype(jnp.int32)
+                    st = st._replace(
+                        island_store=st.island_store.at[recipient, jnp.maximum(color_idx, 0)].add(
+                            jnp.where(valid > 0, jnp.array(1, dtype=jnp.int32),
+                                      jnp.array(0, dtype=jnp.int32))
+                        )
+                    )
+                return st
+
+            s = _deposit_goods(s, seller, seller_goods.astype(jnp.int32))
+            s = _deposit_goods(s, winner, winner_goods.astype(jnp.int32))
+
+            # Auction always ends the turn.
+            s = self._advance_turn(s, jnp.array(ACTION_MOVE_AUCTION, dtype=jnp.int32),
+                                   np_, False)
+            return s
+
+        return jax.lax.cond(
+            is_bidding,
+            _store_bid,
+            lambda s: jax.lax.cond(
+                is_decision,
+                _resolve_auction,
+                lambda x: x,
+                s,
+            ),
+            state,
+        )
 
     # ========================================================================
     # Action (8): Pass
