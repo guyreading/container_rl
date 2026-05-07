@@ -220,7 +220,7 @@ def _action_help(factory_cost: int = 0) -> Text:
     fac_str = f"BuyFactory (${factory_cost})" if factory_cost > 0 else "BuyFactory"
     return Text.from_markup(
         f" [1]{fac_str}  [2]BuyWarehouse  [3]Produce  [4]BuyFromFactory  [5]LoadShip\n"
-        " [6]MoveToSea   [7]Auction    [p]Pass    [l]TakeLoan        [r]RepayLoan  [d]DomesticSale\n"
+        " [6]MoveToSea   [7]Auction    [0/space]Pass   [8]TakeLoan   [9]RepayLoan\n"
         " [←→] history  [q]uit"
     )
 
@@ -947,8 +947,10 @@ def play(
                 action_idx = None
                 params = {}
 
-                if ch in ("1", "2", "3", "4", "5", "6", "7", "p", "l", "r", "d", " "):
+                if ch in ("0", "1", "2", "3", "4", "5", "6", "7", "8", "9", " "):
                     action_map = {
+                        "0": ACTION_PASS,
+                        " ": ACTION_PASS,
                         "1": ACTION_BUY_FACTORY,
                         "2": ACTION_BUY_WAREHOUSE,
                         "3": ACTION_PRODUCE,
@@ -956,11 +958,8 @@ def play(
                         "5": ACTION_MOVE_LOAD,
                         "6": ACTION_MOVE_SEA,
                         "7": ACTION_MOVE_AUCTION,
-                        "p": ACTION_PASS,
-                        " ": ACTION_PASS,
-                        "l": ACTION_TAKE_LOAN,
-                        "r": ACTION_REPAY_LOAN,
-                        "d": ACTION_DOMESTIC_SALE,
+                        "8": ACTION_TAKE_LOAN,
+                        "9": ACTION_REPAY_LOAN,
                     }
                     atype = action_map[ch]
 
