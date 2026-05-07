@@ -76,7 +76,8 @@ def _cstyle(idx: int) -> str:
 
 
 def _opponent_menu_indices(current_player: int, num_players: int) -> list[int]:
-    return [p for p in range(num_players) if p != current_player]
+    """Return opponent indices in clockwise order, starting from the player to the right."""
+    return [(current_player + 1 + i) % num_players for i in range(num_players - 1)]
 
 
 # ── state rendering ──────────────────────────────────────────────────────────

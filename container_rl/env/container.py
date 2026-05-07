@@ -954,8 +954,13 @@ class ContainerFunctional(
         return action_type, rel_offset
 
     def _get_target_player(self, opp_idx, current_player, num_players):
-        """Map opponent relative index to actual player, skipping current player."""
-        return jnp.where(opp_idx < current_player, opp_idx, opp_idx + 1)
+        """Map opponent relative index to actual player, clockwise.
+
+        opp_idx=0 is the player immediately to the right, opp_idx=1 is
+        two players clockwise, etc.  This matches the opponent mask
+        ordering in ``_action_masks``.
+        """
+        return (current_player + opp_idx + 1) % num_players
 
     def _factory_cost(self, num_factories_owned):
         return (num_factories_owned + 1) * 3
@@ -1066,7 +1071,7 @@ class ContainerFunctional(
         player = state.current_player
         np_ = params.num_players
         nc = params.num_colors
-        right_player = self._get_target_player(0, player, np_)
+        right_player = (player + 1) % np_
 
         color = jnp.clip(action[HEAD_COLOR], 0, nc - 1)
         slot = jnp.clip(action[HEAD_PRICE_SLOT], 0, PRODUCE_CHOICES - 1)

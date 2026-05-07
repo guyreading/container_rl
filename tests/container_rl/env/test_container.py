@@ -418,20 +418,17 @@ class TestHelpers:
         assert int(func_env._count_ship_cargo(state.ship_contents, 0)) == 2
         assert int(func_env._count_ship_cargo(state.ship_contents, 1)) == 0
 
-    def test_get_target_player_skipping_current(self):
+    def test_get_target_player_clockwise(self):
         func_env = _make_func_env()
-        # Player 0: opp_idx 0 -> player 1 (0 < 0 False, so 0+1=1)
-        assert int(func_env._get_target_player(0, 0, 4)) == 1
-        # Player 0: opp_idx 1 -> player 2
-        assert int(func_env._get_target_player(1, 0, 4)) == 2
-        # Player 2: opp_idx 0 -> player 0 (0 < 2 True, so 0)
-        assert int(func_env._get_target_player(0, 2, 4)) == 0
-        # Player 2: opp_idx 1 -> player 1 (1 < 2 True, so 1)
-        assert int(func_env._get_target_player(1, 2, 4)) == 1
-        # Player 2: opp_idx 2 -> player 3 (2 < 2 False, so 3)
-        assert int(func_env._get_target_player(2, 2, 4)) == 3
-        # Player 3: opp_idx 0 -> player 0 (0 < 3 True, so 0)
-        assert int(func_env._get_target_player(0, 3, 4)) == 0
+        # opp_idx=0 = player to the right (clockwise)
+        assert int(func_env._get_target_player(0, 0, 4)) == 1  # P0→P1
+        assert int(func_env._get_target_player(0, 1, 4)) == 2  # P1→P2
+        assert int(func_env._get_target_player(0, 2, 4)) == 3  # P2→P3
+        assert int(func_env._get_target_player(0, 3, 4)) == 0  # P3→P0
+        # opp_idx=1 = two players clockwise
+        assert int(func_env._get_target_player(1, 0, 4)) == 2  # P0→P2
+        assert int(func_env._get_target_player(1, 2, 4)) == 0  # P2→P0
+        assert int(func_env._get_target_player(2, 2, 4)) == 1  # P2→P1 (3rd opp)
 
     def test_decode_action_matches_encoder(self):
         func_env = _make_func_env(2, 5)
