@@ -449,13 +449,15 @@ class ContainerFunctional(
         state: EnvState,
         action: int | jax.Array,
         key: PRNGKeyType,
-        params: ContainerParams = ContainerParams,
+        params: ContainerParams | None = None,
     ) -> EnvState:
         """Game state transition implementing full Container rules.
 
         Accepts both legacy flat-integer actions (from ``ActionEncoder``) and
         multi-head action arrays of shape ``(5,)``.
         """
+        if params is None:
+            params = self.params
         action = jnp.asarray(action, dtype=jnp.int32)
         np_ = params.num_players
         nc = params.num_colors
@@ -1145,7 +1147,15 @@ class ContainerFunctional(
     def _produce_shopping_step(self, state, action, params):
         np_ = params.num_players
 
-        s = self._action_produce(state, action, params)
+        # Guard: if a non-produce action arrives while produce is
+        # still active, finish the batch immediately.
+        is_produce = action[HEAD_ACTION_TYPE] == ACTION_PRODUCE
+        s = jax.lax.cond(
+            is_produce,
+            lambda x: self._action_produce(x, action, params),
+            lambda x: x,
+            state,
+        )
 
         can = self._can_continue_producing(s)
         s = jax.lax.cond(
@@ -1507,9 +1517,11 @@ class ContainerFunctional(
         return state
 
     def initial(
-        self, rng: PRNGKeyType, params: ContainerParams = ContainerParams
+        self, rng: PRNGKeyType, params: ContainerParams | None = None,
     ) -> EnvState:
         """Initial game state."""
+        if params is None:
+            params = self.params
         # Randomly assign secret value cards
         key1, key2 = random.split(rng)
         secret_value_color = random.randint(
@@ -1567,7 +1579,7 @@ class ContainerFunctional(
         self,
         state: EnvState,
         rng: PRNGKeyType,
-        params: ContainerParams = ContainerParams,
+        params: ContainerParams | None = None,
     ) -> jax.Array:
         """Convert state to an ego-centric observation for the acting player.
 
@@ -1576,6 +1588,8 @@ class ContainerFunctional(
         Action masks (computed on the original state) are appended at the
         end so that ``MaskablePPO`` can zero out invalid actions.
         """
+        if params is None:
+            params = self.params
         player = state.current_player
         num_players = params.num_players
 
@@ -1648,9 +1662,11 @@ class ContainerFunctional(
         self,
         state: EnvState,
         rng: PRNGKeyType,
-        params: ContainerParams = ContainerParams,
+        params: ContainerParams | None = None,
     ) -> jax.Array:
         """Check if game is over."""
+        if params is None:
+            params = self.params
         return state.game_over > 0
 
     def _net_worth(self, state, player, num_colors):
@@ -1709,10 +1725,12 @@ class ContainerFunctional(
         action: ActType,
         next_state: EnvState,
         rng: PRNGKeyType,
-        params: ContainerParams = ContainerParams,
+        params: ContainerParams | None = None,
     ) -> jax.Array:
         """Compute reward for the acting player (whoever ``current_player`` is)
         as their net worth change."""
+        if params is None:
+            params = self.params
         agent = state.current_player
         curr_nw = self._net_worth(state, agent, params.num_colors)
         next_nw = self._net_worth(next_state, agent, params.num_colors)
@@ -1736,8 +1754,10 @@ class ContainerFunctional(
         self,
         state: StateType,
         render_state: RenderStateType,
-        params: ContainerParams = ContainerParams,
+        params: ContainerParams | None = None,
     ) -> tuple[RenderStateType, np.ndarray]:
+        if params is None:
+            params = self.params
         try:
             import pygame
         except ImportError as e:
@@ -1755,7 +1775,7 @@ class ContainerFunctional(
         )
 
     def render_close(
-        self, render_state: RenderStateType, params: ContainerParams = ContainerParams
+        self, render_state: RenderStateType, params: ContainerParams | None = None,
     ) -> None:
         try:
             import pygame

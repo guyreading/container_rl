@@ -36,7 +36,6 @@ from container_rl.env.container import (
     ACTION_PRODUCE,
     ACTION_REPAY_LOAN,
     ACTION_TAKE_LOAN,
-    FACTORY_STORAGE_MULTIPLIER,
     LEAVE_IDLE,
     LOCATION_AUCTION_ISLAND,
     LOCATION_HARBOUR_OFFSET,
@@ -472,24 +471,16 @@ def _submenu_produce(
     if not factories:
         return False
 
-    import jax.numpy as jnp
+    first_purchase = True
 
     for color in factories:
-        # Skip colours where supply is exhausted or factory space is full
-        # (the user can still leave them idle via the menu option).
-        if int(state.container_supply[color]) == 0:
-            continue
-        fc = int(jnp.sum(state.factory_colors[player]))
-        capacity = fc * FACTORY_STORAGE_MULTIPLIER
-        stored = int(jnp.sum(env.state.factory_store[player]))
-        if stored >= capacity:
-            continue
-
         header = f"[bold]Produce [{_cstyle(color)}]{_cname(color, nc)}[/{_cstyle(color)}] — pick a price:[/bold]"
         options = [f"${i + 1}" for i in range(PRODUCE_CHOICES - 1)] + ["[dim]leave idle[/dim]"]
         choice = _input_choice(options, live, nc, np_, env.state, header=header)
         if choice is None:
-            return True
+            if first_purchase:
+                return True
+            break
         if choice == len(options):
             price_slot = LEAVE_IDLE
         else:
@@ -497,6 +488,7 @@ def _submenu_produce(
 
         action_idx = encoder.encode(ACTION_PRODUCE, {"color": color, "price_slot": price_slot})
         obs, reward, term, trunc, info = env.step(action_idx)
+        first_purchase = False
 
         decoder = ActionEncoder(num_players, nc)
         try:
@@ -506,6 +498,19 @@ def _submenu_produce(
             desc = f"P{player + 1}: action #{action_idx}"
 
         history.append((env.state, desc, float(reward)))
+
+    # If the user cancelled early (q/ESC), flush remaining pending colours
+    # as leave-idle so the batch finishes and the turn can advance.
+    if int(env.state.produce_active) > 0:
+        for c in range(nc):
+            if int(env.state.produce_pending[c]) > 0:
+                action_idx = encoder.encode(
+                    ACTION_PRODUCE, {"color": c, "price_slot": LEAVE_IDLE},
+                )
+                obs, reward, term, trunc, info = env.step(action_idx)
+                history.append(
+                    (env.state, f"P{player + 1}: Leave {_cname(c, nc)} idle", float(reward))
+                )
 
     return False
 
