@@ -38,6 +38,9 @@ PRICE_SLOTS = 10  # $1 through $10
 PRODUCE_PRICE_CHOICES = 4  # $1-$4 prices (slots 0-3)
 PRODUCE_CHOICES = PRODUCE_PRICE_CHOICES + 1  # 5 choices: $1-$4 + leave idle
 LEAVE_IDLE = PRODUCE_PRICE_CHOICES  # slot index for "leave this factory idle"
+HARBOUR_PRICE_MIN = 1   # slot for $2
+HARBOUR_PRICE_MAX = 5   # slot for $6
+HARBOUR_PRICE_CHOICES = HARBOUR_PRICE_MAX - HARBOUR_PRICE_MIN + 1  # 5 prices: $2-$6
 INITIAL_CASH = 20
 LOAN_AMOUNT = 10
 LOAN_INTEREST = 1
@@ -638,12 +641,22 @@ class ContainerFunctional(
             ),
         )
 
+        # Destination harbour price (for factory buys): use HEAD_PRICE_SLOT
+        # if in the valid harbour price range, otherwise fall back to the
+        # source price_slot (backward-compatible with old flat actions).
+        harbour_slot_raw = action[HEAD_PRICE_SLOT]
+        dest_slot = jnp.where(
+            (harbour_slot_raw >= HARBOUR_PRICE_MIN) & (harbour_slot_raw <= HARBOUR_PRICE_MAX),
+            harbour_slot_raw,
+            price_slot,
+        )
+
         # Destination
         state = state._replace(
-            harbour_store=state.harbour_store.at[player, color, price_slot].set(
+            harbour_store=state.harbour_store.at[player, color, dest_slot].set(
                 jnp.where(do_buy & is_factory,
-                          state.harbour_store[player, color, price_slot] + 1,
-                          state.harbour_store[player, color, price_slot])
+                          state.harbour_store[player, color, dest_slot] + 1,
+                          state.harbour_store[player, color, dest_slot])
             ),
             ship_contents=state.ship_contents.at[player, jnp.clip(ship_stored, 0, SHIP_CAPACITY - 1)].set(
                 jnp.where(do_buy & (~is_factory), color + 1,
