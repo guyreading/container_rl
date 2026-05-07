@@ -37,11 +37,12 @@ from container_rl.env.container import (
     ACTION_REPAY_LOAN,
     ACTION_TAKE_LOAN,
     FACTORY_STORAGE_MULTIPLIER,
+    LEAVE_IDLE,
     LOCATION_AUCTION_ISLAND,
     LOCATION_HARBOUR_OFFSET,
     LOCATION_OPEN_SEA,
     MAX_FACTORIES_PER_PLAYER,
-    PRODUCE_PRICE_CHOICES,
+    PRODUCE_CHOICES,
     PRICE_SLOTS,
     SHIP_CAPACITY,
     ActionEncoder,
@@ -474,8 +475,8 @@ def _submenu_produce(
     import jax.numpy as jnp
 
     for color in factories:
-        # Skip colours where supply is exhausted or factory space is full,
-        # otherwise the env silently no-ops and wastes the action slot.
+        # Skip colours where supply is exhausted or factory space is full
+        # (the user can still leave them idle via the menu option).
         if int(state.container_supply[color]) == 0:
             continue
         fc = int(jnp.sum(state.factory_colors[player]))
@@ -485,11 +486,14 @@ def _submenu_produce(
             continue
 
         header = f"[bold]Produce [{_cstyle(color)}]{_cname(color, nc)}[/{_cstyle(color)}] — pick a price:[/bold]"
-        options = [f"${i + 1}" for i in range(PRODUCE_PRICE_CHOICES)]
+        options = [f"${i + 1}" for i in range(PRODUCE_CHOICES - 1)] + ["[dim]leave idle[/dim]"]
         choice = _input_choice(options, live, nc, np_, env.state, header=header)
         if choice is None:
             return True
-        price_slot = choice - 1
+        if choice == len(options):
+            price_slot = LEAVE_IDLE
+        else:
+            price_slot = choice - 1
 
         action_idx = encoder.encode(ACTION_PRODUCE, {"color": color, "price_slot": price_slot})
         obs, reward, term, trunc, info = env.step(action_idx)
@@ -598,7 +602,10 @@ def _describe_action(action_type: int, params: dict, nc: int) -> str:
     elif action_type == ACTION_BUY_WAREHOUSE:
         return "Buy warehouse"
     elif action_type == ACTION_PRODUCE:
-        return f"Produce {_cname(params.get('color', 0), nc)} at ${params.get('price_slot', 0) + 1}"
+        slot = params.get('price_slot', 0)
+        if slot == LEAVE_IDLE:
+            return f"Leave {_cname(params.get('color', 0), nc)} idle"
+        return f"Produce {_cname(params.get('color', 0), nc)} at ${slot + 1}"
     elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
         return f"Buy {_cname(params.get('color', 0), nc)} from P{params.get('opponent', 1)}'s factory at ${params.get('price_slot', 0) + 1}"
     elif action_type == ACTION_MOVE_LOAD:
@@ -631,6 +638,7 @@ def get_ai_action(state: EnvState, rng_key, num_players: int, num_colors: int):
     key, subkey = random.split(rng_key)
 
     produced = int(state.produced_this_turn) > 0
+    produce_active = int(state.produce_active) > 0
     fc = int(jnp.sum(state.factory_colors[player]))
     wc = int(state.warehouse_count[player])
     cash = int(state.cash[player])
@@ -640,6 +648,14 @@ def get_ai_action(state: EnvState, rng_key, num_players: int, num_colors: int):
 
     def _encode(atype, params=None):
         return encoder.to_multi_head(encoder.encode(atype, params or {}))
+
+    # If mid-produce batch, keep processing pending colours.
+    if produce_active:
+        for c in range(num_colors):
+            if int(state.produce_pending[c]) > 0:
+                return _encode(ACTION_PRODUCE, {"color": c, "price_slot": 1}), subkey
+        # Fallback: nothing pending, pass to escape
+        return _encode(ACTION_PASS), subkey
 
     if has_space_f and not produced:
         # AI produces the first owned factory color at $2

@@ -31,7 +31,7 @@ from container_rl.env.container import (  # noqa: E402
     LOCATION_OPEN_SEA,
     MAX_WAREHOUSES_PER_PLAYER,
     PRICE_SLOTS,
-    PRODUCE_PRICE_CHOICES,
+    PRODUCE_CHOICES,
     SHIP_CAPACITY,
     ActionEncoder,
     ContainerFunctional,
@@ -89,6 +89,9 @@ def _make_state(**overrides):
         shopping_active=jnp.array(0, dtype=jnp.int32),
         shopping_action_type=jnp.array(0, dtype=jnp.int32),
         shopping_target=jnp.array(0, dtype=jnp.int32),
+        produce_active=jnp.array(0, dtype=jnp.int32),
+        produce_pending=jnp.zeros((nc,), dtype=jnp.int32),
+        produce_was_produced=jnp.array(0, dtype=jnp.int32),
         step_count=jnp.array(0, dtype=jnp.int32),
     )
     defaults.update(overrides)
@@ -117,7 +120,7 @@ def _build_multihd(
 
     elif action_type == ACTION_PRODUCE:
         mh = mh.at[HEAD_COLOR].set(jnp.clip(params.get("color", 0), 0, nc - 1))
-        mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params.get("price_slot", 0), 0, PRODUCE_PRICE_CHOICES - 1))
+        mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params.get("price_slot", 0), 0, PRODUCE_CHOICES - 1))
 
     elif action_type in (ACTION_BUY_FROM_FACTORY_STORE, ACTION_MOVE_LOAD):
         opp_idx = params.get("opponent", 1) - 1  # 1-based to 0-based
