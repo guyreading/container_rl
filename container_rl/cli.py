@@ -226,10 +226,11 @@ def _supply_bar(state, nc: int) -> Text:
     return Text.from_markup(text)
 
 
-def _action_help(factory_cost: int = 0) -> Text:
+def _action_help(factory_cost: int = 0, warehouse_cost: int = 0) -> Text:
     fac_str = f"BuyFactory (${factory_cost})" if factory_cost > 0 else "BuyFactory"
+    wh_str = f"BuyWarehouse (${warehouse_cost})" if warehouse_cost > 0 else "BuyWarehouse"
     return Text.from_markup(
-        f" [1]{fac_str}  [2]BuyWarehouse  [3]Produce  [4]BuyFromFactory  [5]LoadShip\n"
+        f" [1]{fac_str}  [2]{wh_str}  [3]Produce  [4]BuyFromFactory  [5]LoadShip\n"
         " [6]MoveToSea   [7]Auction    [0/space]Pass   [8]TakeLoan   [9]RepayLoan\n"
         " [←→] history  [q]uit"
     )
@@ -282,7 +283,8 @@ def _render_frame(
     else:
         fc = sum(1 for c in range(nc) if int(state.factory_colors[turn, c]) > 0)
         fac_cost = (fc + 1) * 3 if fc < MAX_FACTORIES_PER_PLAYER else 0
-        elements.append(Panel(_action_help(fac_cost), title="Actions", border_style="cyan"))
+        wh_cost = int(state.warehouse_count[turn]) + 3
+        elements.append(Panel(_action_help(fac_cost, wh_cost), title="Actions", border_style="cyan"))
 
     # ── prompt ──
     if prompt:

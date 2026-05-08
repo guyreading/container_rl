@@ -388,9 +388,9 @@ class TestHelpers:
 
     def test_warehouse_cost(self):
         func_env = _make_func_env()
-        assert int(func_env._warehouse_cost(1)) == 2  # already have 1, buying 2nd
-        assert int(func_env._warehouse_cost(3)) == 4
-        assert int(func_env._warehouse_cost(9)) == 10
+        assert int(func_env._warehouse_cost(1)) == 4  # already have 1, buying 2nd
+        assert int(func_env._warehouse_cost(3)) == 6
+        assert int(func_env._warehouse_cost(9)) == 12
 
     def test_count_store_containers(self):
         state = _make_state()
@@ -659,8 +659,8 @@ class TestBuyWarehouse:
         mh = _build_multihd(ACTION_BUY_WAREHOUSE)
         new_state = func_env._action_buy_warehouse(state, mh)
         assert int(new_state.warehouse_count[0]) == 2
-        # Cost for 2nd warehouse: 1+1 = 2
-        assert int(new_state.cash[0]) == INITIAL_CASH - 2
+        # Cost for 2nd warehouse: 1+3 = 4
+        assert int(new_state.cash[0]) == INITIAL_CASH - 4
 
     def test_cannot_buy_past_max(self):
         func_env = _make_func_env()

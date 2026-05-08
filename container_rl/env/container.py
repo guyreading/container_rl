@@ -32,7 +32,7 @@ RenderStateType = tuple["pygame.Surface", str, int]  # noqa: F821
 MAX_PLAYERS = 4
 MAX_COLORS = 5
 MAX_FACTORIES_PER_PLAYER = 4
-MAX_WAREHOUSES_PER_PLAYER = 7
+MAX_WAREHOUSES_PER_PLAYER = 5
 SHIP_CAPACITY = 5
 PRICE_SLOTS = 10  # $1 through $10
 PRODUCE_PRICE_CHOICES = 4  # $1-$4 prices (slots 0-3)
@@ -992,7 +992,7 @@ class ContainerFunctional(
         return (num_factories_owned + 1) * 3
 
     def _warehouse_cost(self, num_warehouses_owned):
-        return num_warehouses_owned + 1
+        return num_warehouses_owned + 3
 
     def _count_store_containers(self, store, player):
         return jnp.sum(store[player])
