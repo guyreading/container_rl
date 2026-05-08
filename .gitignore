@@ -15,7 +15,7 @@ eggs/
 *.egg
 MANIFEST
 screenshots/
-*.db
+*.db*
 
 # Unit test / coverage reports
 htmlcov/

@@ -85,17 +85,15 @@ def _ch():
     return ""
 
 def _key(timeout: float | None = None) -> str:
-    """Read a keystroke. timeout=None means block.  Returns escape sequences
-    (e.g. ``'\\x1b[A'``) for arrow keys."""
+    """Read a keystroke. timeout=None blocks indefinitely.  Returns escape
+    sequences (e.g. ``'\\x1b[A'``) for arrow keys."""
     import os as _os
-    t = timeout if timeout is not None else 10.0
-    r, _, _ = select.select([sys.stdin], [], [], t)
-    if not r:
-        return ""
+    if timeout is not None:
+        r, _, _ = select.select([sys.stdin], [], [], timeout)
+        if not r:
+            return ""
     ch = sys.stdin.read(1)
     if ch == "\x1b":
-        # Give the terminal time to send the rest of the escape sequence.
-        # Some terminals send the full sequence as one burst.
         fd = sys.stdin.fileno()
         old_fl = fcntl.fcntl(fd, fcntl.F_GETFL)
         try:
@@ -639,7 +637,7 @@ def _join_screen():
 
 
 def _show_game_list(games: list[dict]) -> str | None:
-    """Rich Live display of selectable games.  Returns game code or None."""
+    """Highlighted game list with ↑↓ selection.  Returns game code or None."""
     if not games:
         console.print("[dim]No open games found.[/dim]")
         return _read_line("Enter game code manually:")
@@ -648,8 +646,7 @@ def _show_game_list(games: list[dict]) -> str | None:
     opts.append("Enter a game code manually …")
 
     selected = 0
-    ch = ""
-    while ch not in ("\r", "\n"):
+    while True:
         lines = []
         for i, o in enumerate(opts):
             prefix = "[bold yellow]>[/bold yellow]" if i == selected else " "
@@ -660,29 +657,29 @@ def _show_game_list(games: list[dict]) -> str | None:
                 lines.append(f"  {prefix} {o}")
         body = "\n".join(lines)
         frame = Text.from_markup(
-            f"[bold]Available games — select with ↑↓ or number, Enter to confirm, ESC to cancel:[/bold]\n\n{body}"
+            f"[bold]Available games — ↑↓ to select, Enter to confirm, ESC to cancel:[/bold]\n\n{body}"
         )
         console.clear()
         console.print(Panel(frame, border_style="yellow"))
         ch = _key(None)
-        if ch == "\x1b": return None
-        if ch in ("\x1b[A", "k", "w"):  # up
+        if ch == "\x1b":
+            return None
+        if ch in ("\x1b[A", "k", "w"):
             selected = max(0, selected - 1)
-        elif ch in ("\x1b[B", "j", "s"):  # down
+        elif ch in ("\x1b[B", "j", "s"):
             selected = min(len(opts) - 1, selected + 1)
         elif ch.isdigit():
             n = int(ch)
-            if 1 <= n <= len(opts):
-                selected = n - 1
             if 1 <= n <= len(games):
-                # single-digit select → confirm immediately
                 return games[n - 1]["code"]
+            elif n <= len(opts):
+                selected = n - 1
         elif ch in ("\r", "\n"):
             break
 
     if selected < len(games):
         return games[selected]["code"]
-    return _read_line("Game code:")
+    return _read_line("Enter game code:")
 
 def _lobby():
     global LOBBY, NUM_PLAYERS, GAME_CODE
