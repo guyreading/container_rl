@@ -37,8 +37,7 @@ class ClientHandler:
     def handle_readable(self) -> None:
         msg = recv_message(self.sock)
         if msg is None:
-            self._disconnect()
-            return
+            raise ConnectionResetError("Client disconnected")
         self._dispatch(msg)
 
     def send(self, msg_type: str, payload: Any = None) -> None:

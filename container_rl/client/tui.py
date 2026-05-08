@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import select
 import sys
@@ -84,16 +85,26 @@ def _ch():
     return ""
 
 def _key(timeout: float | None = None) -> str:
-    """Read a keystroke. timeout=None means block."""
+    """Read a keystroke. timeout=None means block.  Returns escape sequences
+    (e.g. ``'\\x1b[A'``) for arrow keys."""
+    import os as _os
     t = timeout if timeout is not None else 10.0
     r, _, _ = select.select([sys.stdin], [], [], t)
     if not r:
         return ""
     ch = sys.stdin.read(1)
     if ch == "\x1b":
-        r2, _, _ = select.select([sys.stdin], [], [], 0.01)
-        if r2:
-            ch += sys.stdin.read(2)
+        # Give the terminal time to send the rest of the escape sequence.
+        # Some terminals send the full sequence as one burst.
+        fd = sys.stdin.fileno()
+        old_fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        try:
+            fcntl.fcntl(fd, fcntl.F_SETFL, old_fl | os.O_NONBLOCK)
+            extra = sys.stdin.read(5)
+        finally:
+            fcntl.fcntl(fd, fcntl.F_SETFL, old_fl)
+        if extra:
+            return "\x1b" + extra
         return "\x1b"
     return ch
 
@@ -565,9 +576,37 @@ def _simple_choice(prompt, options):
         if ch.isdigit() and 1<=int(ch)<=len(options): return int(ch)
 
 def _main_menu():
-    console.clear()
-    console.print(Panel.fit("[bold blue]🚢 Container RL[/bold blue]", border_style="blue"))
-    return _simple_choice("Select:",["Create Game","Join Game"])
+    """Highlighted main menu with ↑↓ selection."""
+    opts = ["Create Game", "Join Game"]
+    selected = 0
+    while True:
+        lines = []
+        for i, o in enumerate(opts):
+            prefix = "[bold yellow]>[/bold yellow]" if i == selected else " "
+            style = "bold reverse" if i == selected else ""
+            if style:
+                lines.append(f"  {prefix} [{style}]{o}[/{style}]")
+            else:
+                lines.append(f"  {prefix} {o}")
+        body = "\n".join(lines)
+        frame = Text.from_markup(
+            f"[bold]🚢 Container RL — select with ↑↓ or number, Enter to confirm:[/bold]\n\n{body}"
+        )
+        console.clear()
+        console.print(Panel(frame, border_style="blue"))
+        ch = _key(None)
+        if ch == "\x1b":
+            return None
+        if ch in ("\x1b[A", "k", "w"):
+            selected = max(0, selected - 1)
+        elif ch in ("\x1b[B", "j", "s"):
+            selected = min(len(opts) - 1, selected + 1)
+        elif ch.isdigit():
+            n = int(ch)
+            if 1 <= n <= len(opts):
+                return n
+        elif ch in ("\r", "\n"):
+            return selected + 1
 
 def _create_screen():
     console.clear()
@@ -593,14 +632,57 @@ def _join_screen():
     games = []
     for m in _drain_server():
         if m.get("type")=="game_list": games=m.get("payload",{}).get("games",[]); break
-    if games:
-        console.print("[bold]Available games:[/bold]")
-        for i,g in enumerate(games):
-            console.print(f"  {i+1}. {g['code']}  [{g.get('slots_filled',0)}/{g.get('num_players','?')}]")
-        console.print()
-    code = _read_line("Game code:")
-    if code is None or not code.strip(): return None
-    return {"player_name":name,"password":pw,"code":code.strip().upper()}
+
+    code = _show_game_list(games)
+    if code is None: return None
+    return {"player_name":name,"password":pw,"code":code}
+
+
+def _show_game_list(games: list[dict]) -> str | None:
+    """Rich Live display of selectable games.  Returns game code or None."""
+    if not games:
+        console.print("[dim]No open games found.[/dim]")
+        return _read_line("Enter game code manually:")
+
+    opts = [f"{g['code']}  [{g.get('slots_filled',0)}/{g.get('num_players','?')} joined]" for g in games]
+    opts.append("Enter a game code manually …")
+
+    selected = 0
+    ch = ""
+    while ch not in ("\r", "\n"):
+        lines = []
+        for i, o in enumerate(opts):
+            prefix = "[bold yellow]>[/bold yellow]" if i == selected else " "
+            style = "bold reverse" if i == selected else ""
+            if style:
+                lines.append(f"  {prefix} [{style}]{o}[/{style}]")
+            else:
+                lines.append(f"  {prefix} {o}")
+        body = "\n".join(lines)
+        frame = Text.from_markup(
+            f"[bold]Available games — select with ↑↓ or number, Enter to confirm, ESC to cancel:[/bold]\n\n{body}"
+        )
+        console.clear()
+        console.print(Panel(frame, border_style="yellow"))
+        ch = _key(None)
+        if ch == "\x1b": return None
+        if ch in ("\x1b[A", "k", "w"):  # up
+            selected = max(0, selected - 1)
+        elif ch in ("\x1b[B", "j", "s"):  # down
+            selected = min(len(opts) - 1, selected + 1)
+        elif ch.isdigit():
+            n = int(ch)
+            if 1 <= n <= len(opts):
+                selected = n - 1
+            if 1 <= n <= len(games):
+                # single-digit select → confirm immediately
+                return games[n - 1]["code"]
+        elif ch in ("\r", "\n"):
+            break
+
+    if selected < len(games):
+        return games[selected]["code"]
+    return _read_line("Game code:")
 
 def _lobby():
     global LOBBY, NUM_PLAYERS, GAME_CODE
