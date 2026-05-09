@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import selectors
 import socket
 import sys
@@ -65,6 +66,10 @@ class ClientHandler:
             self._handle_get_state()
         elif msg_type == "heartbeat":
             self.send("heartbeat_ack", {})
+        elif msg_type == "maintainer_list":
+            self._handle_maintainer_list(payload)
+        elif msg_type == "maintainer_delete":
+            self._handle_maintainer_delete(payload)
         else:
             self.send("error", {"message": f"Unknown message type: {msg_type}"})
 
@@ -115,6 +120,7 @@ class ClientHandler:
                 "player_index": result["player_index"],
                 "num_players": result["num_players"],
                 "num_colors": result["num_colors"],
+                "status": result.get("status", "lobby"),
             })
             self._send_lobby()
 
@@ -197,6 +203,29 @@ class ClientHandler:
             return
         self.server.broadcast(self.game_id, msg_type, payload)
 
+    def _handle_maintainer_list(self, p: dict) -> None:
+        token = p.get("token", "").strip()
+        if token != self.server.maintainer_token:
+            self.send("error", {"message": "Invalid maintainer token."})
+            return
+        try:
+            games = self.server.db.list_all_games()
+            self.send("maintainer_list", {"games": games})
+        except Exception as e:
+            self.send("error", {"message": str(e)})
+
+    def _handle_maintainer_delete(self, p: dict) -> None:
+        token = p.get("token", "").strip()
+        if token != self.server.maintainer_token:
+            self.send("error", {"message": "Invalid maintainer token."})
+            return
+        try:
+            game_id = int(p.get("game_id", 0))
+            self.server.db.delete_game(game_id)
+            self.send("maintainer_result", {"deleted": game_id})
+        except Exception as e:
+            self.send("error", {"message": str(e)})
+
     def _disconnect(self) -> None:
         logger.info("Client disconnected: %s", self.addr)
         if self.game_id is not None:
@@ -212,11 +241,13 @@ class ClientHandler:
 # ---------------------------------------------------------------------------
 
 class GameServer:
-    def __init__(self, host: str = "0.0.0.0", port: int = 9876, db_path: str = "container_server.db"):
+    def __init__(self, host: str = "0.0.0.0", port: int = 9876, db_path: str = "container_server.db",
+                 maintainer_token: str = ""):
         self.host = host
         self.port = port
         self.db = Database(db_path)
         self.manager = GameManager(self.db, self.broadcast)
+        self.maintainer_token = maintainer_token or os.urandom(8).hex()
         self._game_clients: dict[int, list[ClientHandler]] = {}  # game_id -> clients
         self._lock = threading.Lock()
         self._running = False
@@ -257,6 +288,7 @@ class GameServer:
         self._running = True
         logger.info("Server listening on %s:%d", self.host, self.port)
         print(f"Container game server listening on {self.host}:{self.port}")
+        print(f"Maintainer token: {self.maintainer_token}")
         print("Press Ctrl+C to stop.")
 
         try:
@@ -292,10 +324,12 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0", help="Bind address")
     parser.add_argument("--port", type=int, default=9876, help="TCP port")
     parser.add_argument("--db", default="container_server.db", help="SQLite database path")
+    parser.add_argument("--maintainer-token", default="", help="Token for the maintainer client")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    server = GameServer(host=args.host, port=args.port, db_path=args.db)
+    server = GameServer(host=args.host, port=args.port, db_path=args.db,
+                        maintainer_token=args.maintainer_token)
     server.run()
 
 

@@ -67,20 +67,29 @@ class GameManager:
     def join_game(
         self, player_name: str, password: str | None, code: str,
     ) -> dict:
-        """Join an existing lobby game."""
+        """Join a lobby game or reconnect to an active game."""
         game = self.db.get_game_by_code(code)
         if not game:
             raise ValueError(f"Game '{code}' not found.")
-        if game["status"] != "lobby":
+        if game["status"] not in ("lobby", "active"):
             raise ValueError(f"Game '{code}' is not accepting players (status: {game['status']}).")
         player_id = self.db.upsert_player(player_name, password)
-        player_index = self.db.assign_player_slot(game_id=game["id"], player_id=player_id)
+
+        if game["status"] == "active":
+            # Reconnection — must already have a slot.
+            player_index = self.db.get_player_slot(game["id"], player_id)
+            if player_index is None:
+                raise ValueError(f"Player '{player_name}' is not in game '{code}'.")
+        else:
+            player_index = self.db.assign_player_slot(game_id=game["id"], player_id=player_id)
+
         return {
             "game_id": game["id"],
             "code": code,
             "player_index": player_index,
             "num_players": game["num_players"],
             "num_colors": game["num_colors"],
+            "status": game["status"],
         }
 
     def list_joinable(self) -> list[dict]:

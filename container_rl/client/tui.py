@@ -58,6 +58,7 @@ GAME_CODE: str = ""
 NUM_PLAYERS: int = 2
 NUM_COLORS: int = 5
 MY_NAME: str = ""
+GAME_STATUS: str = "lobby"
 PLAYER_NAMES: dict[int, str] = {}  # player_index -> name
 
 # ── game state (received from server) ─────────────────────────────────────
@@ -645,7 +646,11 @@ def _show_game_list(games: list[dict]) -> str | None:
         console.print("[dim]No open games found.[/dim]")
         return _read_line("Enter game code manually:")
 
-    opts = [f"{g['code']}  [{g.get('slots_filled',0)}/{g.get('num_players','?')} joined]" for g in games]
+    opts = [
+        f"{g['code']}  [{g.get('slots_filled',0)}/{g.get('num_players','?')} joined]"
+        f"{'  [yellow][in progress][/yellow]' if g.get('status') == 'active' else ''}"
+        for g in games
+    ]
     opts.append("Enter a game code manually …")
 
     selected = 0
@@ -721,7 +726,7 @@ def main():
     p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=9876)
     args = p.parse_args()
 
-    global CLIENT, GAME_ID, PLAYER_INDEX, GAME_CODE, NUM_PLAYERS, NUM_COLORS, MY_NAME
+    global CLIENT, GAME_ID, PLAYER_INDEX, GAME_CODE, NUM_PLAYERS, NUM_COLORS, MY_NAME, GAME_STATUS, PLAYER_NAMES
     CLIENT = GameClient(args.host, args.port)
     _enter_raw()
     try:
@@ -743,7 +748,12 @@ def main():
                 for m in msgs:
                     if m.get("type")=="game_created":
                         pp=m["payload"]; GAME_ID=pp["game_id"]; PLAYER_INDEX=pp["player_index"]; GAME_CODE=pp["code"]
-                        break
+                        NUM_PLAYERS = cfg["num_players"]
+                        NUM_COLORS = cfg["num_colors"]
+                    if m.get("type")=="lobby_update":
+                        pp=m["payload"]
+                        NUM_PLAYERS = pp.get("num_players_needed", NUM_PLAYERS)
+                        PLAYER_NAMES = {int(pl["player_index"]): pl["name"] for pl in pp.get("players", [])}
                 if GAME_ID: break
                 _time.sleep(0.1)
         else:
@@ -757,15 +767,21 @@ def main():
                     if m.get("type")=="game_joined":
                         pp=m["payload"]; GAME_ID=pp["game_id"]; PLAYER_INDEX=pp["player_index"]; GAME_CODE=pp["code"]
                         NUM_PLAYERS=pp.get("num_players",NUM_PLAYERS); NUM_COLORS=pp.get("num_colors",NUM_COLORS)
-                        break
+                        GAME_STATUS=pp.get("status","lobby")
+                    if m.get("type")=="lobby_update":
+                        pp=m["payload"]
+                        NUM_PLAYERS = pp.get("num_players_needed", NUM_PLAYERS)
+                        PLAYER_NAMES = {int(pl["player_index"]): pl["name"] for pl in pp.get("players", [])}
                 if GAME_ID: break
                 _time.sleep(0.1)
 
         if GAME_ID is None:
             console.print("[red]Failed to create/join game.[/red]"); _key(2); return
 
-        started = _lobby()
-        if not started: return
+        is_active = GAME_STATUS == "active"
+        if not is_active:
+            started = _lobby()
+            if not started: return
         _gameplay()
     finally:
         _exit_raw()
