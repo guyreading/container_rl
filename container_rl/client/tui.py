@@ -58,6 +58,7 @@ GAME_CODE: str = ""
 NUM_PLAYERS: int = 2
 NUM_COLORS: int = 5
 MY_NAME: str = ""
+PLAYER_NAMES: dict[int, str] = {}  # player_index -> name
 
 # ── game state (received from server) ─────────────────────────────────────
 STATE: EnvState | None = None
@@ -189,7 +190,8 @@ def _player_card(state, player, nc, is_current):
     facs = [f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}]" for c in range(nc) if int(state.factory_colors[player,c])]
     fstr = ", ".join(facs) if facs else "[dim]none[/dim]"
     badge = " [bold white on green]◄[/bold white on green]" if is_current else ""
-    out = Text.from_markup(f"[bold]P{player+1}{badge}[/bold]  ${nw}\n")
+    name = PLAYER_NAMES.get(player, f"P{player+1}")
+    out = Text.from_markup(f"[bold]{name}{badge}[/bold]  ${nw}\n")
     out.append("─"*28+"\n")
     out.append_text(Text.from_markup(f"  💵 ${cash}  🏦 {loans} loans  🏭 {wh} wh\n"))
     out.append_text(Text.from_markup(f"  🤫 [{_cs(sec)}]{_cn(sec,nc)}[/{_cs(sec)}]\n"))
@@ -215,7 +217,8 @@ def _render(state, nc, np_, feedback="", my_player=None):
     elems = []
     turn = int(state.current_player)
     acts = int(state.actions_taken)
-    hdr = f"🚢 CONTAINER  │  Player {turn+1}'s turn  │  Action {acts+1}/2"
+    name = PLAYER_NAMES.get(turn, f"Player {turn+1}")
+    hdr = f"🚢 CONTAINER  │  {name}'s turn  │  Action {acts+1}/2"
     if int(state.auction_active): hdr += "  │  [yellow]AUCTION[/yellow]"
     if int(state.produce_active): hdr += "  │  [yellow]PRODUCING[/yellow]"
     if int(state.shopping_active): hdr += "  │  [yellow]SHOPPING[/yellow]"
@@ -682,25 +685,28 @@ def _show_game_list(games: list[dict]) -> str | None:
     return _read_line("Enter game code:")
 
 def _lobby():
-    global LOBBY, NUM_PLAYERS, GAME_CODE
-    LOBBY=[]
+    global PLAYER_NAMES, NUM_PLAYERS, GAME_CODE
+    lobby_players = []
     while True:
         msgs = _drain_server()
         for m in msgs:
             t=m.get("type",""); p=m.get("payload",{})
-            if t=="lobby_update": LOBBY=p.get("players",[]); NUM_PLAYERS=p.get("num_players_needed",NUM_PLAYERS)
+            if t=="lobby_update":
+                lobby_players = p.get("players",[])
+                NUM_PLAYERS = p.get("num_players_needed", NUM_PLAYERS)
+                PLAYER_NAMES = {int(pl["player_index"]): pl["name"] for pl in lobby_players}
             elif t=="game_started": return True
             elif t=="error": console.print(f"[red]{p.get('message','')}[/red]"); _key(1)
             elif t=="disconnected": return False
         console.clear()
         console.print(Panel.fit(f"[bold]Lobby — {GAME_CODE}[/bold]", border_style="yellow"))
-        if LOBBY:
+        if lobby_players:
             console.print("[bold]Players:[/bold]")
-            for pl in LOBBY:
+            for pl in lobby_players:
                 idx=pl.get("player_index",0); nm=pl.get("name","?")
                 mrk=" [green](you)[/green]" if int(idx)==PLAYER_INDEX else ""
-                console.print(f"  P{int(idx)+1}: {nm}{mrk}")
-        n = NUM_PLAYERS-len(LOBBY)
+                console.print(f"  {nm}{mrk}")
+        n = NUM_PLAYERS - len(lobby_players)
         console.print(f"\n[dim]{n} more needed.  q to leave.[/dim]")
         if _ch() in ("q","Q"): return False
         _time.sleep(0.3)
