@@ -48,7 +48,7 @@ class GameManager:
         self._broadcast = broadcast
         self._envs: dict[int, ContainerJaxEnv] = {}
         self._encoders: dict[int, ActionEncoder] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # create / join

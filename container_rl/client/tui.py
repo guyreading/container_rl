@@ -109,18 +109,17 @@ def _key(timeout: float | None = None) -> str:
     return ch
 
 def _poll_server() -> dict | None:
+    """Check for a server message without blocking.  Returns the parsed
+    message, or None if nothing is available."""
     if CLIENT is None or CLIENT.sock is None:
         return None
-    CLIENT.sock.setblocking(False)
+    r, _, _ = select.select([CLIENT.sock], [], [], 0)
+    if not r:
+        return None
     try:
         return CLIENT.recv()
-    except BlockingIOError:
-        return None
     except (ConnectionError, OSError):
         return {"type": "disconnected", "payload": {}}
-    finally:
-        if CLIENT and CLIENT.sock:
-            CLIENT.sock.setblocking(True)
 
 def _drain_server() -> list[dict]:
     msgs = []
@@ -304,17 +303,14 @@ def _submenu_produce(live, state, nc, np_):
         arr = [ACTION_PRODUCE, 0, color, slot, 0]
         _send_multi_action(arr)
         first = False
-        # wait for state update
-        _time.sleep(0.1); _wait_for_state(live, nc, np_)
-        state = _update_state_from_server(live, nc, np_)
-        if state is None: return True
+        _wait_for_state(live, nc, np_)
+        if STATE is None: return True
     # flush pending if cancelled mid-batch
-    state = _update_state_from_server(live, nc, np_)
-    if state and int(state.produce_active)>0:
-        for c in range(nc):
-            if int(state.produce_pending[c])>0:
+    if STATE and int(STATE.produce_active)>0:
+        for c in range(NUM_COLORS):
+            if int(STATE.produce_pending[c])>0:
                 _send_multi_action([ACTION_PRODUCE, 0, c, LEAVE_IDLE, 0])
-                _time.sleep(0.1); _wait_for_state(live, nc, np_)
+                _wait_for_state(live, nc, np_)
     return False
 
 def _submenu_buy_from_factory(live, state, nc, np_):
@@ -324,17 +320,16 @@ def _submenu_buy_from_factory(live, state, nc, np_):
     opp_idx = _opps(player, np_).index(target)
     first = True
     while True:
-        state = _update_state_from_server(live, nc, np_)
-        if state is None: return True
+        if STATE is None: return True
         cheapest = {}
         for c in range(nc):
             for s in range(PRICE_SLOTS):
-                if int(state.factory_store[target,c,s])>0:
+                if int(STATE.factory_store[target,c,s])>0:
                     if c not in cheapest or s<cheapest[c]: cheapest[c]=s
         if not cheapest: break
         clist = sorted(cheapest)
         opts = [f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}] at [yellow]${cheapest[c]+1}[/yellow]" for c in clist]+["[bold]Done[/bold]"]
-        ch = _input_choice(live, state, nc, np_, opts, f"[bold]Buy from P{target+1}'s factory:[/bold]")
+        ch = _input_choice(live, STATE, nc, np_, opts, f"[bold]Buy from P{target+1}'s factory:[/bold]")
         if ch is None:
             if first: return True
             break
@@ -342,20 +337,19 @@ def _submenu_buy_from_factory(live, state, nc, np_):
         color = clist[ch-1]; src_slot = cheapest[color]
         # harbour price
         hopts = [f"${s+1}" for s in range(HARBOUR_PRICE_MIN, HARBOUR_PRICE_MIN+HARBOUR_PRICE_CHOICES)]
-        hch = _input_choice(live, state, nc, np_, hopts, f"[bold]Set harbour price for [{_cs(color)}]{_cn(color,nc)}[/{_cs(color)}]:[/bold]")
+        hch = _input_choice(live, STATE, nc, np_, hopts, f"[bold]Set harbour price for [{_cs(color)}]{_cn(color,nc)}[/{_cs(color)}]:[/bold]")
         if hch is None:
             if first: return True
             continue
         h_slot = HARBOUR_PRICE_MIN+hch-1
         arr = [ACTION_BUY_FROM_FACTORY_STORE, opp_idx, 0, h_slot, color*PRICE_SLOTS+src_slot]
         _send_multi_action(arr); first=False
-        _time.sleep(0.1); _wait_for_state(live, nc, np_)
-        if state and not int(state.shopping_active): return False
+        _wait_for_state(live, nc, np_)
+        if STATE and not int(STATE.shopping_active): return False
     # STOP
-    state = _update_state_from_server(live, nc, np_)
-    if state and int(state.shopping_active)>0:
+    if STATE and int(STATE.shopping_active)>0:
         _send_multi_action([ACTION_BUY_FROM_FACTORY_STORE, 0, 0, 0, nc*PRICE_SLOTS])
-        _time.sleep(0.1); _wait_for_state(live, nc, np_)
+        _wait_for_state(live, nc, np_)
     return False
 
 def _submenu_move_load(live, state, nc, np_):
@@ -365,17 +359,16 @@ def _submenu_move_load(live, state, nc, np_):
     opp_idx = _opps(player, np_).index(target)
     first = True
     while True:
-        state = _update_state_from_server(live, nc, np_)
-        if state is None: return True
+        if STATE is None: return True
         cheapest = {}
         for c in range(nc):
             for s in range(PRICE_SLOTS):
-                if int(state.harbour_store[target,c,s])>0:
+                if int(STATE.harbour_store[target,c,s])>0:
                     if c not in cheapest or s<cheapest[c]: cheapest[c]=s
         if not cheapest: break
         clist = sorted(cheapest)
         opts = [f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}] at [yellow]${cheapest[c]+1}[/yellow]" for c in clist]+["[bold]Done[/bold]"]
-        ch = _input_choice(live, state, nc, np_, opts, f"[bold]Load from P{target+1}'s harbour:[/bold]")
+        ch = _input_choice(live, STATE, nc, np_, opts, f"[bold]Load from P{target+1}'s harbour:[/bold]")
         if ch is None:
             if first: return True
             break
@@ -383,13 +376,12 @@ def _submenu_move_load(live, state, nc, np_):
         color = clist[ch-1]; slot = cheapest[color]
         _send_multi_action([ACTION_MOVE_LOAD, opp_idx, 0, 0, color*PRICE_SLOTS+slot])
         first=False
-        _time.sleep(0.1); _wait_for_state(live, nc, np_)
-        if state and not int(state.shopping_active): return False
+        _wait_for_state(live, nc, np_)
+        if STATE and not int(STATE.shopping_active): return False
     # STOP
-    state = _update_state_from_server(live, nc, np_)
-    if state and int(state.shopping_active)>0:
+    if STATE and int(STATE.shopping_active)>0:
         _send_multi_action([ACTION_MOVE_LOAD, 0, 0, 0, nc*PRICE_SLOTS])
-        _time.sleep(0.1); _wait_for_state(live, nc, np_)
+        _wait_for_state(live, nc, np_)
     return False
 
 def _submenu_buy_factory(live, state, nc, np_):
@@ -408,16 +400,29 @@ def _submenu_buy_factory(live, state, nc, np_):
 # ── state polling ────────────────────────────────────────────────────────
 
 def _wait_for_state(live, nc, np_, timeout=5.0):
+    global STATE, STATE_META, FEEDBACK
     deadline = _time.time()+timeout
     while _time.time()<deadline:
-        msgs = _drain_server()
-        for m in msgs:
-            if m.get("type")=="state_update":
-                return True
-        live.update(_render(STATE, nc, np_, "Waiting for server...", PLAYER_INDEX))
+        for m in _drain_server():
+            t = m.get("type", ""); p = m.get("payload", {})
+            if t == "state_update":
+                STATE_META = p
+                if p.get("state"):
+                    STATE = deserialize_state(bytes.fromhex(p["state"]))
+                return STATE
+            elif t == "action_result":
+                FEEDBACK = f"[bold]{p.get('desc','')}[/bold]"
+                if p.get("game_over"):
+                    FEEDBACK += "  [bold red]GAME OVER[/bold red]"
+            elif t == "error":
+                FEEDBACK = f"[red]{p.get('message','')}[/red]"
+            elif t == "disconnected":
+                STATE = None
+                return STATE
+        live.update(_render(STATE, nc, np_, "Waiting for server…", PLAYER_INDEX))
         live.refresh()
         _time.sleep(0.05)
-    return False
+    return STATE
 
 def _update_state_from_server(live, nc, np_):
     global STATE, STATE_META, FEEDBACK
@@ -465,8 +470,7 @@ def _gameplay():
             go = STATE_META.get("game_over",0)
             ac = int(st.auction_active)
 
-            live.update(_render(st, NUM_COLORS, NUM_PLAYERS, FEEDBACK, PLAYER_INDEX))
-            live.refresh()
+            feedback_now = FEEDBACK
             FEEDBACK = ""
 
             if go:
@@ -482,7 +486,7 @@ def _gameplay():
                             f"[bold]Auction![/bold] Cargo: {cargo}\nP{cur+1}: bid (0=pass, max ${int(st.cash[cur])}):")
                         bid = bid if bid is not None else 0
                         _send_multi_action([ACTION_MOVE_AUCTION,0,0,0,bid])
-                        _time.sleep(0.15); _update_state_from_server(live,NUM_COLORS,NUM_PLAYERS)
+                        _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
                     elif rnd==1 and cur==seller:
                         mx = int(jnp.max(st.auction_bids))
                         ch = _input_choice(live,st,NUM_COLORS,NUM_PLAYERS,
@@ -490,7 +494,7 @@ def _gameplay():
                             f"[bold]Highest bid: ${mx}[/bold]")
                         acc = 1 if (ch==1 if ch else True) else 0
                         _send_multi_action([ACTION_MOVE_AUCTION,0,0,0,acc])
-                        _time.sleep(0.15); _update_state_from_server(live,NUM_COLORS,NUM_PLAYERS)
+                        _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
                 else:
                     _time.sleep(0.3)
                 continue
@@ -498,23 +502,33 @@ def _gameplay():
             # ── produce/shopping modes — wait ──
             if int(st.produce_active) or int(st.shopping_active):
                 if cur==PLAYER_INDEX:
-                    # stuck in produce/shopping — try to flush
                     if int(st.produce_active):
                         for c in range(NUM_COLORS):
                             if int(st.produce_pending[c])>0:
                                 _send_multi_action([ACTION_PRODUCE,0,c,LEAVE_IDLE,0])
-                                _time.sleep(0.1); break
+                                _wait_for_state(live,NUM_COLORS,NUM_PLAYERS); break
                     if int(st.shopping_active):
                         _send_multi_action([ACTION_BUY_FROM_FACTORY_STORE,0,0,0,NUM_COLORS*PRICE_SLOTS])
-                        _time.sleep(0.1)
-                    _update_state_from_server(live,NUM_COLORS,NUM_PLAYERS)
+                        _wait_for_state(live,NUM_COLORS,NUM_PLAYERS)
                 _time.sleep(0.3)
                 continue
 
             # ── not our turn ──
             if cur!=PLAYER_INDEX:
-                _time.sleep(0.5)
+                name = PLAYER_NAMES.get(cur, f"P{cur+1}")
+                live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                                    f"[dim]Waiting for {name} to play…[/dim]", PLAYER_INDEX))
+                live.refresh()
+                deadline = _time.time() + 0.5
+                while _time.time() < deadline:
+                    _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
+                    if STATE is None or int(STATE.current_player) == PLAYER_INDEX:
+                        break
+                    _time.sleep(0.05)
                 continue
+
+            live.update(_render(st, NUM_COLORS, NUM_PLAYERS, feedback_now, PLAYER_INDEX))
+            live.refresh()
 
             # ── our turn: read action ──
             ch = _key(0.1)
@@ -544,7 +558,7 @@ def _gameplay():
             if cancelled: continue
             if aidx is not None:
                 _send_action(aidx)
-            _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
+                _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
 
 
 # ── main menu ────────────────────────────────────────────────────────────
@@ -730,11 +744,11 @@ def main():
     CLIENT = GameClient(args.host, args.port)
     _enter_raw()
     try:
-        CLIENT.connect()
-    except Exception as e:
-        console.print(f"[red]Cannot connect: {e}[/red]"); return
+        try:
+            CLIENT.connect()
+        except Exception as e:
+            console.print(f"[red]Cannot connect: {e}[/red]"); return
 
-    try:
         ch = _main_menu()
         if ch is None: return
 
