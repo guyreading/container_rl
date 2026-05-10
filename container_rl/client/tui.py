@@ -162,7 +162,9 @@ def _ship(state, player):
     cargo = [int(state.ship_contents[player,i]) for i in range(SHIP_CAPACITY)]
     loc = int(state.ship_location[player])
     if loc == LOCATION_OPEN_SEA: ls = "[cyan]Open Sea[/cyan]"
-    elif loc >= LOCATION_HARBOUR_OFFSET: ls = f"P{loc-LOCATION_HARBOUR_OFFSET+1}'s Harbour"
+    elif loc >= LOCATION_HARBOUR_OFFSET:
+        hp = loc - LOCATION_HARBOUR_OFFSET
+        ls = f"{PLAYER_NAMES.get(hp, f'P{hp+1}')}'s Harbour"
     elif loc == LOCATION_AUCTION_ISLAND: ls = "[yellow]Auction Isl.[/yellow]"
     else: ls = f"Loc {loc}"
     parts = ["·" if c==0 else f"[{_cs(c-1)}]■[/{_cs(c-1)}]" for c in cargo]
@@ -278,7 +280,7 @@ def _input_choice(live, state, nc, np_, options, header=""):
 def _pick_opponent(live, state, nc, np_):
     cand = _opps(int(state.current_player), np_)
     if len(cand)==1: return cand[0]
-    ch = _input_choice(live, state, nc, np_, [f"Player {p+1}" for p in cand])
+    ch = _input_choice(live, state, nc, np_, [PLAYER_NAMES.get(p, f"Player {p+1}") for p in cand])
     return cand[ch-1] if ch else None
 
 # ── submenus ─────────────────────────────────────────────────────────────
@@ -314,6 +316,7 @@ def _submenu_produce(live, state, nc, np_):
     return False
 
 def _submenu_buy_from_factory(live, state, nc, np_):
+    global FEEDBACK
     player = int(state.current_player)
     target = _pick_opponent(live, state, nc, np_)
     if target is None: return True
@@ -329,7 +332,7 @@ def _submenu_buy_from_factory(live, state, nc, np_):
         if not cheapest: break
         clist = sorted(cheapest)
         opts = [f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}] at [yellow]${cheapest[c]+1}[/yellow]" for c in clist]+["[bold]Done[/bold]"]
-        ch = _input_choice(live, STATE, nc, np_, opts, f"[bold]Buy from P{target+1}'s factory:[/bold]")
+        ch = _input_choice(live, STATE, nc, np_, opts, f"[bold]Buy from {PLAYER_NAMES.get(target, f'P{target+1}')}'s factory:[/bold]")
         if ch is None:
             if first: return True
             break
@@ -345,7 +348,14 @@ def _submenu_buy_from_factory(live, state, nc, np_):
         arr = [ACTION_BUY_FROM_FACTORY_STORE, opp_idx, 0, h_slot, color*PRICE_SLOTS+src_slot]
         _send_multi_action(arr); first=False
         _wait_for_state(live, nc, np_)
-        if STATE and not int(STATE.shopping_active): return False
+        if STATE and not int(STATE.shopping_active):
+            hs = sum(int(STATE.harbour_store[PLAYER_INDEX,c,s]) for c in range(nc) for s in range(PRICE_SLOTS))
+            wh = int(STATE.warehouse_count[PLAYER_INDEX])
+            if hs >= wh:
+                FEEDBACK = "[yellow]Harbour store full[/yellow]"
+            else:
+                FEEDBACK = "[dim]No more containers available[/dim]"
+            return False
     # STOP
     if STATE and int(STATE.shopping_active)>0:
         _send_multi_action([ACTION_BUY_FROM_FACTORY_STORE, 0, 0, 0, nc*PRICE_SLOTS])
@@ -353,6 +363,7 @@ def _submenu_buy_from_factory(live, state, nc, np_):
     return False
 
 def _submenu_move_load(live, state, nc, np_):
+    global FEEDBACK
     player = int(state.current_player)
     target = _pick_opponent(live, state, nc, np_)
     if target is None: return True
@@ -368,7 +379,7 @@ def _submenu_move_load(live, state, nc, np_):
         if not cheapest: break
         clist = sorted(cheapest)
         opts = [f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}] at [yellow]${cheapest[c]+1}[/yellow]" for c in clist]+["[bold]Done[/bold]"]
-        ch = _input_choice(live, STATE, nc, np_, opts, f"[bold]Load from P{target+1}'s harbour:[/bold]")
+        ch = _input_choice(live, STATE, nc, np_, opts, f"[bold]Load from {PLAYER_NAMES.get(target, f'P{target+1}')}'s harbour:[/bold]")
         if ch is None:
             if first: return True
             break
@@ -377,7 +388,13 @@ def _submenu_move_load(live, state, nc, np_):
         _send_multi_action([ACTION_MOVE_LOAD, opp_idx, 0, 0, color*PRICE_SLOTS+slot])
         first=False
         _wait_for_state(live, nc, np_)
-        if STATE and not int(STATE.shopping_active): return False
+        if STATE and not int(STATE.shopping_active):
+            cargo = sum(1 for i in range(SHIP_CAPACITY) if int(STATE.ship_contents[PLAYER_INDEX,i])>0)
+            if cargo >= SHIP_CAPACITY:
+                FEEDBACK = "[yellow]Ship cargo full[/yellow]"
+            else:
+                FEEDBACK = "[dim]No more containers available[/dim]"
+            return False
     # STOP
     if STATE and int(STATE.shopping_active)>0:
         _send_multi_action([ACTION_MOVE_LOAD, 0, 0, 0, nc*PRICE_SLOTS])
@@ -496,7 +513,12 @@ def _gameplay():
                         _send_multi_action([ACTION_MOVE_AUCTION,0,0,0,acc])
                         _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
                 else:
-                    _time.sleep(0.3)
+                    _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
+                    if STATE:
+                        live.update(_render(STATE, NUM_COLORS, NUM_PLAYERS,
+                                            "[dim]Auction in progress…[/dim]", PLAYER_INDEX))
+                        live.refresh()
+                    _time.sleep(0.1)
                 continue
 
             # ── produce/shopping modes — wait ──
@@ -510,21 +532,33 @@ def _gameplay():
                     if int(st.shopping_active):
                         _send_multi_action([ACTION_BUY_FROM_FACTORY_STORE,0,0,0,NUM_COLORS*PRICE_SLOTS])
                         _wait_for_state(live,NUM_COLORS,NUM_PLAYERS)
-                _time.sleep(0.3)
+                else:
+                    _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
+                    if STATE:
+                        live.update(_render(STATE, NUM_COLORS, NUM_PLAYERS,
+                                            "[dim]Waiting for other player…[/dim]", PLAYER_INDEX))
+                        live.refresh()
+                    _time.sleep(0.1)
                 continue
 
             # ── not our turn ──
             if cur!=PLAYER_INDEX:
                 name = PLAYER_NAMES.get(cur, f"P{cur+1}")
-                live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
-                                    f"[dim]Waiting for {name} to play…[/dim]", PLAYER_INDEX))
-                live.refresh()
-                deadline = _time.time() + 0.5
-                while _time.time() < deadline:
+                while True:
                     _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
-                    if STATE is None or int(STATE.current_player) == PLAYER_INDEX:
+                    if STATE is None:
+                        return
+                    st = STATE
+                    new_cur = int(st.current_player)
+                    if new_cur == PLAYER_INDEX:
                         break
-                    _time.sleep(0.05)
+                    if new_cur != cur:
+                        name = PLAYER_NAMES.get(new_cur, f"P{new_cur+1}")
+                        cur = new_cur
+                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                                        f"[dim]Waiting for {name} to play…[/dim]", PLAYER_INDEX))
+                    live.refresh()
+                    _time.sleep(0.1)
                 continue
 
             live.update(_render(st, NUM_COLORS, NUM_PLAYERS, feedback_now, PLAYER_INDEX))
