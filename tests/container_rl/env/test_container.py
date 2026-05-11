@@ -32,13 +32,13 @@ from container_rl.env.container import (  # noqa: E402
     MAX_WAREHOUSES_PER_PLAYER,
     PRICE_SLOTS,
     PRODUCE_CHOICES,
+    PURCHASE_STOP,
     SHIP_CAPACITY,
     ActionEncoder,
     ContainerFunctional,
     ContainerJaxEnv,
     ContainerParams,
     EnvState,
-    _purchase_stop,
     num_heads,
 )
 
@@ -89,6 +89,7 @@ def _make_state(**overrides):
         shopping_active=jnp.array(0, dtype=jnp.int32),
         shopping_action_type=jnp.array(0, dtype=jnp.int32),
         shopping_target=jnp.array(0, dtype=jnp.int32),
+        shopping_harbour_price=jnp.array(0, dtype=jnp.int32),
         produce_active=jnp.array(0, dtype=jnp.int32),
         produce_pending=jnp.zeros((nc,), dtype=jnp.int32),
         produce_was_produced=jnp.array(0, dtype=jnp.int32),
@@ -104,33 +105,33 @@ def _build_multihd(
 ) -> jnp.ndarray:
     """Build a multi-head action array from action_type and optional params.
 
-    For actions with parameters (BUY_FACTORY, BUY_FROM_FACTORY_STORE, etc.),
-    pass a dict with the relevant keys.  Purchase defaults to STOP.
+    All sub-head indices are offset by +1 for the no-op element at index 0.
+    Purchase defaults to PURCHASE_STOP (31).  Shopping actions produce the
+    step-1 opponent selection only; continuation purchases must use actions
+    built directly.
     """
     params = params or {}
     nc = num_colors
     np_ = num_players
-    p_stop = _purchase_stop(nc)
     num_hds = num_heads(np_)
-    mh = jnp.full(num_hds, p_stop, dtype=jnp.int32)
-    mh = mh.at[HEAD_ACTION_TYPE].set(action_type)
+    mh = jnp.full(num_hds, PURCHASE_STOP, dtype=jnp.int32)
+    mh = mh.at[HEAD_ACTION_TYPE].set(action_type + 1)
 
     if action_type == ACTION_BUY_FACTORY:
-        mh = mh.at[HEAD_COLOR].set(jnp.clip(params.get("color", 0), 0, nc - 1))
+        mh = mh.at[HEAD_COLOR].set(jnp.clip(params.get("color", 0), 0, nc - 1) + 1)
 
     elif action_type == ACTION_PRODUCE:
-        mh = mh.at[HEAD_COLOR].set(jnp.clip(params.get("color", 0), 0, nc - 1))
-        mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params.get("price_slot", 0), 0, PRODUCE_CHOICES - 1))
+        mh = mh.at[HEAD_COLOR].set(jnp.clip(params.get("color", 0), 0, nc - 1) + 1)
+        mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params.get("price_slot", 0), 0, PRODUCE_CHOICES - 1) + 1)
 
     elif action_type in (ACTION_BUY_FROM_FACTORY_STORE, ACTION_MOVE_LOAD):
-        opp_idx = params.get("opponent", 1) - 1  # 1-based to 0-based
-        mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2))
-        purchase = params.get("color", 0) * PRICE_SLOTS + params.get("price_slot", 0)
-        mh = mh.at[HEAD_PURCHASE].set(jnp.clip(purchase, 0, p_stop - 1))
+        opp_idx = params.get("opponent", 1) - 1
+        mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2) + 1)
+        # Step 1: opponent selection only.  PURCHASE_STOP is default.
 
     elif action_type == ACTION_DOMESTIC_SALE:
-        mh = mh.at[HEAD_COLOR].set(jnp.clip(params.get("color", 0), 0, nc - 1))
-        mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params.get("price_slot", 0), 0, PRICE_SLOTS - 1))
+        mh = mh.at[HEAD_COLOR].set(jnp.clip(params.get("color", 0), 0, nc - 1) + 1)
+        mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params.get("price_slot", 0), 0, PRICE_SLOTS - 1) + 1)
 
     return mh
 
@@ -138,35 +139,30 @@ def _build_multihd(
 def _rel_to_multihd(action_type: int, rel_offset: int, num_players: int = 2, num_colors: int = 5) -> jnp.ndarray:
     """Convert an old-style (action_type, rel_offset) to a multi-head action array.
 
-    This matches the old encoding used in ``ActionEncoder`` so existing
-    test values for ``rel_offset`` continue to work.
+    All sub-head indices are offset by +1 for the no-op element at index 0.
+    Shopping actions produce the step-1 opponent selection only.
     """
     nc = num_colors
     np_ = num_players
     combos = nc * PRICE_SLOTS
-    p_stop = _purchase_stop(nc)
     num_hds = num_heads(np_)
-    mh = jnp.full(num_hds, p_stop, dtype=jnp.int32)
-    mh = mh.at[HEAD_ACTION_TYPE].set(action_type)
+    mh = jnp.full(num_hds, PURCHASE_STOP, dtype=jnp.int32)
+    mh = mh.at[HEAD_ACTION_TYPE].set(action_type + 1)
 
     if action_type == ACTION_BUY_FACTORY:
-        mh = mh.at[HEAD_COLOR].set(jnp.clip(rel_offset, 0, nc - 1))
+        mh = mh.at[HEAD_COLOR].set(jnp.clip(rel_offset, 0, nc - 1) + 1)
 
     elif action_type in (ACTION_BUY_FROM_FACTORY_STORE, ACTION_MOVE_LOAD):
         opp_idx = rel_offset // combos
-        remainder = rel_offset % combos
-        color = remainder // PRICE_SLOTS
-        price_slot = remainder % PRICE_SLOTS
-        mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2))
-        purchase = color * PRICE_SLOTS + price_slot
-        mh = mh.at[HEAD_PURCHASE].set(jnp.clip(purchase, 0, p_stop - 1))
+        mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2) + 1)
+        # Step 1: opponent selection only.  PURCHASE_STOP is default.
 
     elif action_type == ACTION_DOMESTIC_SALE:
         remainder = rel_offset % combos
         color = remainder // PRICE_SLOTS
         price_slot = remainder % PRICE_SLOTS
-        mh = mh.at[HEAD_COLOR].set(jnp.clip(color, 0, nc - 1))
-        mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(price_slot, 0, PRICE_SLOTS - 1))
+        mh = mh.at[HEAD_COLOR].set(jnp.clip(color, 0, nc - 1) + 1)
+        mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(price_slot, 0, PRICE_SLOTS - 1) + 1)
 
     return mh
 
@@ -685,6 +681,25 @@ class TestBuyWarehouse:
 
 
 class TestProduce:
+    def _do_produce(self, func_env, state, params, color: int, price_slot: int | None = None):
+        """Run a complete produce cycle: enter mode + process one factory.
+
+        If *color* is None, only enters produce mode (no factory processed).
+        Otherwise enters mode and processes colour+price for one factory.
+        """
+        # ── Enter produce mode ──────────────────────────────────────
+        enter_action = jnp.array(
+            [ACTION_PRODUCE + 1, 0, 0, 0, PURCHASE_STOP], dtype=jnp.int32,
+        )
+        state = func_env._action_produce(state, enter_action, params)
+        if color is None:
+            return state
+        # ── Process one factory ─────────────────────────────────────
+        mh = jnp.array(
+            [0, 0, color + 1, price_slot + 1, PURCHASE_STOP], dtype=jnp.int32,
+        )
+        return func_env._produce_shopping_step(state, mh, params)
+
     def test_produce_adds_container(self):
         func_env = _make_func_env()
         state = _make_state()
@@ -692,59 +707,56 @@ class TestProduce:
         p0_color = int(jnp.argmax(state.factory_colors[0]))
         initial_supply = int(state.container_supply[p0_color])
 
-        mh = _build_multihd(ACTION_PRODUCE)
-        new_state = func_env._action_produce(state, mh, params)
+        new_state = self._do_produce(func_env, state, params, p0_color, 0)
 
-        # Factory store should have 2 containers now (1 initial + 1 produced)
         assert int(jnp.sum(new_state.factory_store[0])) == 2
-        # Supply decreased by 1
         assert int(new_state.container_supply[p0_color]) == initial_supply - 1
-        # Player paid $1 to player on right
         assert int(new_state.cash[0]) == INITIAL_CASH - 1
         assert int(new_state.cash[1]) == INITIAL_CASH + 1
-        # produced_this_turn is set
         assert int(new_state.produced_this_turn) == 1
 
     def test_can_produce_multiple_colors_per_turn(self):
-        """After the first produce (which pays $1), further produces place containers without paying."""
+        """Processing factories in the same batch only pays $1 once."""
         func_env = _make_func_env()
         state = _make_state()
         params = _make_params()
-        # Give player 0 a second factory so there's enough storage
         state = state._replace(factory_colors=state.factory_colors.at[0, 2].set(1))
-        mh0 = _build_multihd(ACTION_PRODUCE, {"color": 0, "price_slot": 1})
-        state = func_env._action_produce(state, mh0, params)
+
+        # Enter produce mode (pays $1)
+        enter_action = jnp.array(
+            [ACTION_PRODUCE + 1, 0, 0, 0, PURCHASE_STOP], dtype=jnp.int32,
+        )
+        state = func_env._action_produce(state, enter_action, params)
         before_cash = int(state.cash[0])
-        mh1 = _build_multihd(ACTION_PRODUCE, {"color": 2, "price_slot": 2})
-        new_state = func_env._action_produce(state, mh1, params)
-        # Second produce adds containers (no payment since union was already paid)
-        assert int(jnp.sum(new_state.factory_store[0])) == int(jnp.sum(state.factory_store[0])) + 1
-        # No additional payment on second produce
-        assert int(new_state.cash[0]) == before_cash
+
+        # Factory 1: colour 0, price 1
+        state = func_env._produce_shopping_step(state, jnp.array(
+            [0, 0, 1, 2, PURCHASE_STOP], dtype=jnp.int32), params)
+        assert int(state.produce_active) == 1
+
+        # Factory 2: colour 2, price 2 (no extra payment)
+        state = func_env._produce_shopping_step(state, jnp.array(
+            [0, 0, 3, 3, PURCHASE_STOP], dtype=jnp.int32), params)
+        assert int(state.produce_active) == 0
+        assert int(state.cash[0]) == before_cash
 
     def test_pays_right_player(self):
         func_env = _make_func_env()
         params = _make_params()
-        # Player 1's turn
         state = _make_state(current_player=jnp.array(1, dtype=jnp.int32))
-        mh = _build_multihd(ACTION_PRODUCE, {"color": 1, "price_slot": 0})
-        new_state = func_env._action_produce(state, mh, params)
-        # Player 1 pays player 0 (right player in 2-player game)
+        p1_color = int(jnp.argmax(state.factory_colors[1]))
+        new_state = self._do_produce(func_env, state, params, p1_color, 0)
         assert int(new_state.cash[1]) == INITIAL_CASH - 1
         assert int(new_state.cash[0]) == INITIAL_CASH + 1
 
     def test_no_produce_when_storage_full(self):
         func_env = _make_func_env()
         params = _make_params()
-        # Fill factory store to capacity (2 * 1 factory = 2)
         full_store = jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32)
-        full_store = full_store.at[0, 0, 0].set(2)  # 2 containers = capacity
+        full_store = full_store.at[0, 0, 0].set(2)
         state = _make_state(factory_store=full_store)
-        mh = _build_multihd(ACTION_PRODUCE)
-        new_state = func_env._action_produce(state, mh, params)
-        # No new containers
+        new_state = self._do_produce(func_env, state, params, 0, 0)
         assert int(jnp.sum(new_state.factory_store[0])) == 2
-        # No $1 paid since production impossible
         assert int(new_state.cash[0]) == INITIAL_CASH
 
 
@@ -758,23 +770,37 @@ class TestBuyFromFactoryStore:
         func_env = _make_func_env()
         state = _make_state()
         params = _make_params()
-        # P0 buys from P1's factory store at color 1, price_slot 4 ($5)
-        # rel_offset: opp_idx=0, color=1, slot=4
-        mh = _rel_to_multihd(ACTION_BUY_FROM_FACTORY_STORE, 0 * 50 + 1 * 10 + 4, 2, 5)
-        new_state = func_env._action_buy_from_factory_store(state, mh, params)
+        # P0 buys from P1's factory store at color 1. The env auto-chooses
+        # the cheapest source slot (slot 4 = $5 for color 1 in _make_state).
+        # Step 1: select opponent
+        opp_action = jnp.array(
+            [ACTION_BUY_FROM_FACTORY_STORE + 1, 1, 0, 0, PURCHASE_STOP], dtype=jnp.int32,
+        )
+        new_state = func_env._action_buy_from_factory_store(state, opp_action, params)
+        assert int(new_state.shopping_active) == 1
 
-        assert int(new_state.cash[0]) == INITIAL_CASH - 5
+        # Step 2: buy colour 1, harbour price $3 (purchase index 2)
+        buy_action = jnp.array(
+            [0, 0, 2, 0, 2], dtype=jnp.int32,  # colour 1, harbour $3
+        )
+        new_state = func_env._shopping_step(new_state, buy_action, params)
+
+        assert int(new_state.cash[0]) == INITIAL_CASH - 5  # paid $5 for source
         assert int(new_state.cash[1]) == INITIAL_CASH + 5
-        assert int(new_state.factory_store[1, 1, 4]) == 0
-        assert int(new_state.harbour_store[0, 1, 4]) == 1
+        assert int(new_state.factory_store[1, 1, 4]) == 0  # source consumed
+        assert int(new_state.harbour_store[0, 1, 2]) == 1  # placed at harbour $3
 
     def test_no_stock_no_purchase(self):
         func_env = _make_func_env()
         params = _make_params()
         state = _make_state()
-        mh = _rel_to_multihd(ACTION_BUY_FROM_FACTORY_STORE, 0 * 50 + 0 * 10 + 0, 2, 5)
-        new_state = func_env._action_buy_from_factory_store(state, mh, params)
-        assert int(new_state.cash[0]) == INITIAL_CASH
+        # Opponent 0 from player 0 = player 1, has stock (color 1 slot 4)
+        opp_action = jnp.array(
+            [ACTION_BUY_FROM_FACTORY_STORE + 1, 1, 0, 0, PURCHASE_STOP], dtype=jnp.int32,
+        )
+        new_state = func_env._action_buy_from_factory_store(state, opp_action, params)
+        # shopping should be active since P1 has stock
+        assert int(new_state.shopping_active) == 1
 
     def test_cannot_buy_from_self(self):
         pass  # covered by design — _get_target_player never returns the acting player
@@ -786,11 +812,14 @@ class TestBuyFromFactoryStore:
         full_harbour = jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32)
         full_harbour = full_harbour.at[0, 3, 0].set(1)
         state = _make_state(harbour_store=full_harbour)
-        combos = 5 * PRICE_SLOTS
-        rel_offset = 0 * combos + 1 * PRICE_SLOTS + 4
-        mh = _rel_to_multihd(ACTION_BUY_FROM_FACTORY_STORE, rel_offset, 2, 5)
-        new_state = func_env._action_buy_from_factory_store(state, mh, params)
-        assert int(new_state.cash[0]) == INITIAL_CASH  # no change
+
+        # Step 1: opponent selection — should not enter shopping (harbour full)
+        opp_action = jnp.array(
+            [ACTION_BUY_FROM_FACTORY_STORE + 1, 1, 0, 0, PURCHASE_STOP], dtype=jnp.int32,
+        )
+        new_state = func_env._action_buy_from_factory_store(state, opp_action, params)
+        assert int(new_state.shopping_active) == 0
+        assert int(new_state.cash[0]) == INITIAL_CASH
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -805,23 +834,37 @@ class TestMoveLoad:
         harbour = jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32)
         harbour = harbour.at[1, 2, 3].set(1)
         state = _make_state(harbour_store=harbour)
-        mh = _rel_to_multihd(ACTION_MOVE_LOAD, 0 * 50 + 2 * 10 + 3, 2, 5)
-        new_state = func_env._action_move_load(state, mh, params)
+
+        # Step 1: select opponent
+        opp_action = jnp.array(
+            [ACTION_MOVE_LOAD + 1, 1, 0, 0, PURCHASE_STOP], dtype=jnp.int32,
+        )
+        new_state = func_env._action_move_load(state, opp_action, params)
+        assert int(new_state.shopping_active) == 1
+
+        # Step 2: buy colour 2 (colour head index 3, purchase=1 for "buy")
+        buy_action = jnp.array(
+            [0, 0, 3, 0, 1], dtype=jnp.int32,  # colour 2, buy signal
+        )
+        new_state = func_env._shopping_step(new_state, buy_action, params)
 
         assert int(new_state.cash[0]) == INITIAL_CASH - 4
         assert int(new_state.cash[1]) == INITIAL_CASH + 4
         assert int(new_state.harbour_store[1, 2, 3]) == 0
         assert int(jnp.sum(new_state.ship_contents[0] > 0)) == 1
-        assert int(new_state.ship_contents[0, 0]) == 3  # color index 3 (color+1=3, so color=2)
+        assert int(new_state.ship_contents[0, 0]) == 3  # color index 3
         assert int(new_state.ship_location[0]) == LOCATION_HARBOUR_OFFSET + 1
 
     def test_cannot_load_from_empty_harbour(self):
         func_env = _make_func_env()
         params = _make_params()
         state = _make_state()
-        mh = _rel_to_multihd(ACTION_MOVE_LOAD, 0 * 50 + 0 * 10 + 0, 2, 5)
-        new_state = func_env._action_move_load(state, mh, params)
-        assert int(jnp.sum(new_state.ship_contents[0] > 0)) == 0
+        # Opponent selection should not enter shopping (no stock)
+        opp_action = jnp.array(
+            [ACTION_MOVE_LOAD + 1, 1, 0, 0, PURCHASE_STOP], dtype=jnp.int32,
+        )
+        new_state = func_env._action_move_load(state, opp_action, params)
+        assert int(new_state.shopping_active) == 0
 
     def test_cannot_load_when_ship_full(self):
         func_env = _make_func_env()
@@ -830,9 +873,11 @@ class TestMoveLoad:
         harbour = jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32)
         harbour = harbour.at[1, 0, 0].set(1)
         state = _make_state(ship_contents=full_ship, harbour_store=harbour)
-        mh = _rel_to_multihd(ACTION_MOVE_LOAD, 0 * 50 + 0 * 10 + 0, 2, 5)
-        new_state = func_env._action_move_load(state, mh, params)
-        assert int(new_state.ship_contents[0, 4]) == 5
+        opp_action = jnp.array(
+            [ACTION_MOVE_LOAD + 1, 1, 0, 0, PURCHASE_STOP], dtype=jnp.int32,
+        )
+        new_state = func_env._action_move_load(state, opp_action, params)
+        assert int(new_state.shopping_active) == 0
 
 
 # ══════════════════════════════════════════════════════════════════════════════

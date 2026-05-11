@@ -69,12 +69,13 @@ HEAD_PRICE_SLOT = 3
 HEAD_PURCHASE = 4
 NUM_HEADS_FIXED = 5
 
-# Purchase head constants (base values for 5 colors; scaled at runtime)
-def _purchase_stop(num_colors: int) -> int:
-    return num_colors * PRICE_SLOTS
+# No-op constant — index 0 on every head
+NO_OP = 0
 
-def _purchase_with_stop(num_colors: int) -> int:
-    return num_colors * PRICE_SLOTS + 1
+# Purchase head constants (30 value slots + no-op + STOP = 32)
+PURCHASE_VALUES = 30
+PURCHASE_STOP = PURCHASE_VALUES + 1   # 31
+PURCHASE_SIZE = PURCHASE_VALUES + 2   # 32
 
 
 def num_heads(num_players: int) -> int:
@@ -83,24 +84,32 @@ def num_heads(num_players: int) -> int:
 
 
 def head_sizes(num_players: int, num_colors: int) -> list[int]:
-    """Per-head category counts for MultiDiscrete action space."""
+    """Per-head category counts for MultiDiscrete action space.
+
+    Each head includes a no-op element at index 0.  During parallel
+    (initial action) mode no-op is masked out on every head; during
+    sequential (continuation) mode irrelevant heads are forced to no-op.
+
+    Purchase head (always 32): index 0=no-op, 1-5=harbour $2-$6,
+    6-30=auction bids, 31=STOP.  No longer depends on num_colors.
+    """
     return [
-        NUM_ACTION_TYPES,           # action_type
-        num_players - 1,             # opponent
-        num_colors,                  # color
-        PRICE_SLOTS,                 # price_slot
-        num_colors * PRICE_SLOTS + 1,  # purchase (STOP at index n_colors*PRICE_SLOTS)
+        NUM_ACTION_TYPES + 1,           # action_type + no-op
+        num_players,                     # opponent + no-op (0=no-op, 1..np-1=opponents)
+        num_colors + 1,                  # color + no-op
+        PRICE_SLOTS + 1,                 # price_slot + no-op
+        PURCHASE_SIZE,                   # 32: no-op + 30 values + STOP
     ]
 
 
 def mask_size(num_players: int, num_colors: int) -> int:
     """Total size of action mask vector appended to observation."""
     return (
-        NUM_ACTION_TYPES
-        + (num_players - 1)
-        + num_colors
-        + PRICE_SLOTS
-        + num_colors * PRICE_SLOTS + 1
+        (NUM_ACTION_TYPES + 1)
+        + num_players
+        + (num_colors + 1)
+        + (PRICE_SLOTS + 1)
+        + PURCHASE_SIZE
     )
 
 # Ship location encoding
@@ -158,6 +167,7 @@ class EnvState(NamedTuple):
     shopping_active: jax.Array  # 0/1 — are we mid-shopping?
     shopping_action_type: jax.Array  # which action type (3 or 4)
     shopping_target: jax.Array  # opponent player index
+    shopping_harbour_price: jax.Array  # harbour price slot from initial action
 
     # Produce continuation state (for recurrent produce)
     produce_active: jax.Array  # 0/1 — are we mid-produce batch?
@@ -353,6 +363,10 @@ class ActionEncoder:
         This provides backward compatibility: old flat actions can be
         converted to the new multi-head representation for use with the
         updated environment.
+
+        For shopping actions (3, 4) this produces the step-1 opponent
+        selection action; continuation purchases must use multi-head
+        actions directly.
         """
         import jax.numpy as jnp
 
@@ -360,30 +374,25 @@ class ActionEncoder:
         np_ = self.num_players
 
         action_type, params = self.decode(action_idx)
-        mh = jnp.array([action_type, 0, 0, 0, _purchase_stop(nc)], dtype=jnp.int32)
+        # action_type shifted +1 for no-op; other heads default to no-op (0)
+        mh = jnp.array([action_type + 1, NO_OP, NO_OP, NO_OP, PURCHASE_STOP], dtype=jnp.int32)
 
         if action_type == ACTION_BUY_FACTORY:
-            mh = mh.at[HEAD_COLOR].set(jnp.clip(params["color"], 0, nc - 1))
+            mh = mh.at[HEAD_COLOR].set(jnp.clip(params["color"], 0, nc - 1) + 1)
 
         elif action_type == ACTION_PRODUCE:
-            mh = mh.at[HEAD_COLOR].set(jnp.clip(params["color"], 0, nc - 1))
-            mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params["price_slot"], 0, PRODUCE_CHOICES - 1))
+            mh = mh.at[HEAD_COLOR].set(jnp.clip(params["color"], 0, nc - 1) + 1)
+            mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params["price_slot"], 0, PRODUCE_CHOICES - 1) + 1)
 
-        elif action_type == ACTION_BUY_FROM_FACTORY_STORE:
+        elif action_type in (ACTION_BUY_FROM_FACTORY_STORE, ACTION_MOVE_LOAD):
             opp_idx = params["opponent"] - 1
-            mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2))
-            purchase = params["color"] * PRICE_SLOTS + params["price_slot"]
-            mh = mh.at[HEAD_PURCHASE].set(jnp.clip(purchase, 0, _purchase_stop(nc) - 1))
-
-        elif action_type == ACTION_MOVE_LOAD:
-            opp_idx = params["opponent"] - 1
-            mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2))
-            purchase = params["color"] * PRICE_SLOTS + params["price_slot"]
-            mh = mh.at[HEAD_PURCHASE].set(jnp.clip(purchase, 0, _purchase_stop(nc) - 1))
+            mh = mh.at[HEAD_OPPONENT].set(jnp.clip(opp_idx, 0, np_ - 2) + 1)
+            # Step 1 is opponent selection only; purchase is STOP.
+            # Continuation purchases use multi-head directly (_shopping_step).
 
         elif action_type == ACTION_DOMESTIC_SALE:
-            mh = mh.at[HEAD_COLOR].set(jnp.clip(params["color"], 0, nc - 1))
-            mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params["price_slot"], 0, PRICE_SLOTS - 1))
+            mh = mh.at[HEAD_COLOR].set(jnp.clip(params["color"], 0, nc - 1) + 1)
+            mh = mh.at[HEAD_PRICE_SLOT].set(jnp.clip(params["price_slot"], 0, PRICE_SLOTS - 1) + 1)
 
         return mh
 
@@ -429,17 +438,17 @@ class ContainerFunctional(
         _np = self.params.num_players
         _nc = self.params.num_colors
         obs_size = (
-            _np * 4
-            + _np * _nc * 2
-            + _np * _nc * PRICE_SLOTS * 2
-            + _np * SHIP_CAPACITY
-            + _nc
-            + 4
-            + _np
-            + 5
-            + 3  # shopping_active, shopping_action_type, shopping_target
-            + 1 + _nc  # produce_active + produce_pending (nc colours)
-            + mask_size(_np, _nc)
+            _np * 4                    # cash, loans, warehouse_count, ship_location per player
+            + _np * _nc * 2           # factory_colors, island_store
+            + _np * _nc * PRICE_SLOTS * 2  # factory_store, harbour_store
+            + _np * SHIP_CAPACITY      # ship_contents
+            + _nc                      # container_supply
+            + 4                        # turn_phase, current_player, game_over, actions_taken
+            + _np                      # secret_value_color per player
+            + 5                        # auction_active, auction_seller, auction_cargo_count
+            + 4                        # shopping_active, shopping_action_type, shopping_target, shopping_harbour_price
+            + 1 + _nc                  # produce_active + produce_pending (nc colours)
+            + mask_size(_np, _nc)     # action masks
         )
         self.observation_space = spaces.Box(
             low=0, high=100, shape=(obs_size,), dtype=np.float32
@@ -478,7 +487,7 @@ class ContainerFunctional(
 
         def _do_normal(s):
             s = self._pay_interest(s, np_)
-            atype = jnp.clip(action[HEAD_ACTION_TYPE], 0, NUM_ACTION_TYPES - 1)
+            atype = jnp.clip(action[HEAD_ACTION_TYPE] - 1, 0, NUM_ACTION_TYPES - 1)
             # Capture whether produce already happened BEFORE dispatching,
             # so _advance_turn knows whether to count this as an action.
             was_produced = s.produced_this_turn > 0
@@ -523,7 +532,12 @@ class ContainerFunctional(
         return state
 
     def _flat_to_multihd(self, action_idx: jax.Array, params: ContainerParams) -> jax.Array:
-        """Convert a legacy flat action index to a multi-head action array."""
+        """Convert a legacy flat action index to a multi-head action array.
+
+        For shopping actions (3, 4) this produces the step-1 opponent
+        selection action; continuation purchases must use multi-head
+        actions directly.
+        """
         np_ = params.num_players
         nc = params.num_colors
         action_idx = jnp.clip(action_idx, 0, self.encoder.total_actions - 1)
@@ -533,56 +547,47 @@ class ContainerFunctional(
 
         num_hds = num_heads(np_)
         mh = jnp.zeros(num_hds, dtype=jnp.int32)
-        mh = mh.at[HEAD_ACTION_TYPE].set(action_type)
-        mh = mh.at[HEAD_PURCHASE].set(_purchase_stop(nc))  # default purchase to STOP
+        mh = mh.at[HEAD_ACTION_TYPE].set(action_type + 1)
+        mh = mh.at[HEAD_PURCHASE].set(PURCHASE_STOP)
 
         combos = nc * PRICE_SLOTS
 
         # BUY_FACTORY
         color = jnp.clip(rel_offset, 0, nc - 1)
         mh = mh.at[HEAD_COLOR].set(
-            jnp.where(action_type == ACTION_BUY_FACTORY, color, mh[HEAD_COLOR]))
+            jnp.where(action_type == ACTION_BUY_FACTORY, color + 1, mh[HEAD_COLOR]))
 
-        # BUY_FROM_FACTORY_STORE: opp_idx, color, price_slot → purchase head
+        # BUY_FROM_FACTORY_STORE: opponent selection only (step 1)
         opp_idx = rel_offset // combos
-        remainder = rel_offset % combos
-        col = remainder // PRICE_SLOTS
-        slot = remainder % PRICE_SLOTS
         mh = mh.at[HEAD_OPPONENT].set(
             jnp.where(action_type == ACTION_BUY_FROM_FACTORY_STORE,
-                      jnp.clip(opp_idx, 0, np_ - 2), mh[HEAD_OPPONENT]))
-        purchase0 = col * PRICE_SLOTS + slot
-        mh = mh.at[HEAD_PURCHASE].set(
-            jnp.where(action_type == ACTION_BUY_FROM_FACTORY_STORE,
-                      jnp.clip(purchase0, 0, _purchase_stop(nc) - 1), mh[HEAD_PURCHASE]))
+                      jnp.clip(opp_idx, 0, np_ - 2) + 1, mh[HEAD_OPPONENT]))
 
-        # MOVE_LOAD: same encoding
+        # MOVE_LOAD: opponent selection only (step 1)
         mh = mh.at[HEAD_OPPONENT].set(
             jnp.where(action_type == ACTION_MOVE_LOAD,
-                      jnp.clip(opp_idx, 0, np_ - 2), mh[HEAD_OPPONENT]))
-        mh = mh.at[HEAD_PURCHASE].set(
-            jnp.where(action_type == ACTION_MOVE_LOAD,
-                      jnp.clip(purchase0, 0, _purchase_stop(nc) - 1), mh[HEAD_PURCHASE]))
+                      jnp.clip(opp_idx, 0, np_ - 2) + 1, mh[HEAD_OPPONENT]))
 
-        # PRODUCE: color, price_slot (0-3=price, 4=leave idle)
+        # PRODUCE: colour and price_slot for the first factory (recurrent step)
         produce_color = rel_offset // PRODUCE_CHOICES
         produce_slot = rel_offset % PRODUCE_CHOICES
         mh = mh.at[HEAD_COLOR].set(
             jnp.where(action_type == ACTION_PRODUCE,
-                      jnp.clip(produce_color, 0, nc - 1), mh[HEAD_COLOR]))
+                      jnp.clip(produce_color, 0, nc - 1) + 1, mh[HEAD_COLOR]))
         mh = mh.at[HEAD_PRICE_SLOT].set(
             jnp.where(action_type == ACTION_PRODUCE,
-                      jnp.clip(produce_slot, 0, PRODUCE_CHOICES - 1), mh[HEAD_PRICE_SLOT]))
+                      jnp.clip(produce_slot, 0, PRODUCE_CHOICES - 1) + 1, mh[HEAD_PRICE_SLOT]))
 
-        # DOMESTIC_SALE: color, price_slot
+        # DOMESTIC_SALE
+        remainder = rel_offset % combos
         dom_color = remainder // PRICE_SLOTS
         dom_slot = remainder % PRICE_SLOTS
         mh = mh.at[HEAD_COLOR].set(
             jnp.where(action_type == ACTION_DOMESTIC_SALE,
-                      jnp.clip(dom_color, 0, nc - 1), mh[HEAD_COLOR]))
+                      jnp.clip(dom_color, 0, nc - 1) + 1, mh[HEAD_COLOR]))
         mh = mh.at[HEAD_PRICE_SLOT].set(
             jnp.where(action_type == ACTION_DOMESTIC_SALE,
-                      jnp.clip(dom_slot, 0, PRICE_SLOTS - 1), mh[HEAD_PRICE_SLOT]))
+                      jnp.clip(dom_slot, 0, PRICE_SLOTS - 1) + 1, mh[HEAD_PRICE_SLOT]))
 
         return mh
 
@@ -596,32 +601,36 @@ class ContainerFunctional(
             shopping_active=jnp.array(0, dtype=jnp.int32),
             shopping_action_type=jnp.array(0, dtype=jnp.int32),
             shopping_target=jnp.array(0, dtype=jnp.int32),
+            shopping_harbour_price=jnp.array(0, dtype=jnp.int32),
         )
         return self._advance_turn(state, action_type, num_players, False)
 
     def _do_one_purchase(self, state: EnvState, action_type: jax.Array, target: jax.Array,
-                         action: jax.Array, params: ContainerParams) -> EnvState:
-        """Execute one container purchase.  *action_type* is 3 (factory) or 4 (ship).
+                         colour: jax.Array, source_slot: jax.Array,
+                         harbour_price: jax.Array = jnp.array(0, dtype=jnp.int32),
+                         ) -> EnvState:
+        """Execute one container purchase.
+
+        *colour* is the container colour (0..nc-1), *source_slot* is the
+        source price slot at the opponent, and *harbour_price* is the
+        destination harbour price in dollars (for factory buys only;
+        ignored for ship loads).
 
         Returns the state with cash, stores, and ship updated if the purchase
-        was valid.  The caller is responsible for setting ``shopping_active``
-        afterwards.
+        was valid.
         """
         player = state.current_player
-        nc = params.num_colors
+        nc = state.factory_colors.shape[1]
         is_factory = action_type == ACTION_BUY_FROM_FACTORY_STORE
 
-        purchase = action[HEAD_PURCHASE]
-        color = jnp.clip(purchase // PRICE_SLOTS, 0, nc - 1)
-        price_slot = jnp.clip(purchase % PRICE_SLOTS, 0, PRICE_SLOTS - 1)
+        color = jnp.clip(colour, 0, nc - 1)
+        price_slot = jnp.clip(source_slot, 0, PRICE_SLOTS - 1)
         cost = price_slot + 1
 
-        # Source stock
         fs_avail = state.factory_store[target, color, price_slot]
         hs_avail = state.harbour_store[target, color, price_slot]
         available = jnp.where(is_factory, fs_avail, hs_avail)
 
-        # Space check
         hs_stored = self._count_store_containers(state.harbour_store, player)
         ship_stored = self._count_ship_cargo(state.ship_contents, player)
         has_space = jnp.where(
@@ -632,12 +641,10 @@ class ContainerFunctional(
         can_afford = state.cash[player] >= cost
         do_buy = (available > 0) & has_space & can_afford
 
-        # Cash
         new_cash = state.cash.at[player].add(jnp.where(do_buy, -cost, 0))
         new_cash = new_cash.at[target].add(jnp.where(do_buy, cost, 0))
         state = state._replace(cash=new_cash)
 
-        # Source store
         state = state._replace(
             factory_store=state.factory_store.at[target, color, price_slot].set(
                 jnp.where(do_buy & is_factory, fs_avail - 1,
@@ -649,17 +656,8 @@ class ContainerFunctional(
             ),
         )
 
-        # Destination harbour price (for factory buys): use HEAD_PRICE_SLOT
-        # if in the valid harbour price range, otherwise fall back to the
-        # source price_slot (backward-compatible with old flat actions).
-        harbour_slot_raw = action[HEAD_PRICE_SLOT]
-        dest_slot = jnp.where(
-            (harbour_slot_raw >= HARBOUR_PRICE_MIN) & (harbour_slot_raw <= HARBOUR_PRICE_MAX),
-            harbour_slot_raw,
-            price_slot,
-        )
+        dest_slot = jnp.clip(harbour_price - 1, 0, PRICE_SLOTS - 1)
 
-        # Destination
         state = state._replace(
             harbour_store=state.harbour_store.at[player, color, dest_slot].set(
                 jnp.where(do_buy & is_factory,
@@ -672,7 +670,6 @@ class ContainerFunctional(
             ),
         )
 
-        # Ship location on first load
         state = state._replace(
             ship_location=state.ship_location.at[player].set(
                 jnp.where(do_buy & (~is_factory) & (ship_stored == 0),
@@ -709,26 +706,45 @@ class ContainerFunctional(
 
     def _shopping_step(self, state: EnvState, action: jax.Array,
                        params: ContainerParams) -> EnvState:
-        """Process one purchase step while shopping is active.
+        """Process one purchase during shopping continuation.
 
-        If the purchase head is STOP or no more purchases are possible,
-        the shopping state is cleared and the turn advances.
+        Reads ``HEAD_COLOR`` (which colour to buy) and ``HEAD_PURCHASE``
+        (harbour price index 1-5 for factory, or 1=buy for ship; STOP at 31).
+        The environment auto-selects the cheapest available source slot for
+        the chosen colour from the target opponent.
         """
         shop_type = state.shopping_action_type
         target = state.shopping_target
         np_ = params.num_players
         nc = params.num_colors
 
-        is_stop = action[HEAD_PURCHASE] >= nc * PRICE_SLOTS
+        purchase = action[HEAD_PURCHASE]
+        is_stop = purchase >= PURCHASE_STOP
 
-        def _try_purchase(s):
-            s = self._do_one_purchase(s, shop_type, target, action, params)
+        colour = jnp.clip(action[HEAD_COLOR] - 1, 0, nc - 1)
+
+        def _do_buy(s):
+            is_factory = shop_type == ACTION_BUY_FROM_FACTORY_STORE
+            source_store = jnp.where(is_factory, s.factory_store[target],
+                                     s.harbour_store[target])
+            colour_row = source_store[colour]
+            has_stock = colour_row > 0
+            cheapest_slot = jnp.argmin(jnp.where(has_stock, jnp.arange(PRICE_SLOTS), PRICE_SLOTS * 10))
+            cheapest_slot = jnp.clip(cheapest_slot, 0, PRICE_SLOTS - 1)
+
+            harbour_price = jnp.where(
+                is_factory,
+                jnp.clip(purchase + 1, 2, 6),
+                jnp.array(0, dtype=jnp.int32),
+            )
+
+            s = self._do_one_purchase(
+                s, shop_type, target, colour, cheapest_slot, harbour_price,
+            )
             can = self._can_continue_shopping(s, shop_type, target, params)
             s = jax.lax.cond(
                 can,
-                lambda x: x._replace(  # still shopping
-                    shopping_active=jnp.array(1, dtype=jnp.int32),
-                ),
+                lambda x: x._replace(shopping_active=jnp.array(1, dtype=jnp.int32)),
                 lambda x: self._finish_shopping(x, shop_type, np_),
                 s,
             )
@@ -737,7 +753,7 @@ class ContainerFunctional(
         return jax.lax.cond(
             is_stop,
             lambda s: self._finish_shopping(s, shop_type, np_),
-            _try_purchase,
+            _do_buy,
             state,
         )
 
@@ -821,6 +837,18 @@ class ContainerFunctional(
         All loops are over compile-time constants (np_, nc, PRICE_SLOTS) so
         they unroll correctly under jit.  No Python ``if`` depends on traced
         values — every conditional uses :func:`jnp.where`.
+
+        Each head has a no-op element at index 0.  The masking depends on
+        the current mode:
+
+        * **Parallel mode** (new turn): no-op masked out on every head;
+          all legal non-no-op values are shown.
+        * **Shopping continuation**: colour + purchase active;
+          all other heads forced no-op.
+        * **Produce continuation**: colour + price_slot active
+          (pending factories, $1-$4 + leave idle); others forced no-op.
+        * **Auction**: only action_type (forced AUCTION) and purchase
+          (bid amounts) are active.
         """
         player = state.current_player
         np_ = params.num_players
@@ -837,37 +865,45 @@ class ContainerFunctional(
         ship_space = ship_cargo < SHIP_CAPACITY
         loans = state.loans[player]
 
+        is_parallel = (state.shopping_active == 0) & (state.produce_active == 0) & (state.auction_active == 0)
+        is_shopping = state.shopping_active > 0
+        is_produce = state.produce_active > 0
+        is_auction = state.auction_active > 0
+
+        at_size = NUM_ACTION_TYPES + 1
+        opp_size = np_
+        col_size = nc + 1
+        slot_size = PRICE_SLOTS + 1
+        pur_size = PURCHASE_SIZE
+
+        def _noop_only(size):
+            m = jnp.zeros(size, dtype=jnp.int32)
+            return m.at[NO_OP].set(1)
+
         # ---- action_type mask -------------------------------------------------
-        at_mask = jnp.zeros(NUM_ACTION_TYPES, dtype=jnp.int32)
+        at_mask = jnp.zeros(at_size, dtype=jnp.int32)
 
         own_all = fc >= MAX_FACTORIES_PER_PLAYER
         any_color_open = jnp.any(state.factory_colors[player] == 0)
         factory_cost = self._factory_cost(fc)
-        at_mask = at_mask.at[ACTION_BUY_FACTORY].set(
+        at_mask = at_mask.at[ACTION_BUY_FACTORY + 1].set(
             jnp.where((~own_all) & any_color_open & (cash >= factory_cost), 1, 0))
-
-        at_mask = at_mask.at[ACTION_BUY_WAREHOUSE].set(
+        at_mask = at_mask.at[ACTION_BUY_WAREHOUSE + 1].set(
             jnp.where((wc < MAX_WAREHOUSES_PER_PLAYER) & (cash >= self._warehouse_cost(wc)), 1, 0))
-
         supply_ok = jnp.any((state.container_supply > 0) & (state.factory_colors[player] > 0))
-        at_mask = at_mask.at[ACTION_PRODUCE].set(
-            jnp.where(
-                (state.produce_active > 0) | ((~produced) & has_space_f & supply_ok), 1, 0,
-            ))
+        at_mask = at_mask.at[ACTION_PRODUCE + 1].set(
+            jnp.where((~produced) & has_space_f & supply_ok, 1, 0))
 
-        # buy-from-factory: valid if any opponent has affordable factory stock
         can_buy = jnp.zeros((), dtype=jnp.int32)
         for p in range(np_):
             is_self = p == player
-            # any container at any price slot affordable
             affordable_slots = jnp.arange(PRICE_SLOTS) < cash
-            has_stock = jnp.any(state.factory_store[p] > 0, axis=0)  # (PRICE_SLOTS,)
+            has_stock = jnp.any(state.factory_store[p] > 0, axis=0)
             valid = jnp.any(has_stock & affordable_slots)
             can_buy = can_buy | jnp.where(is_self, 0, valid)
-        at_mask = at_mask.at[ACTION_BUY_FROM_FACTORY_STORE].set(
+        at_mask = at_mask.at[ACTION_BUY_FROM_FACTORY_STORE + 1].set(
             jnp.where(has_space_h & can_buy, 1, 0))
 
-        # move-load: valid if any opponent has affordable harbour stock
         can_load = jnp.zeros((), dtype=jnp.int32)
         for p in range(np_):
             is_self = p == player
@@ -875,95 +911,150 @@ class ContainerFunctional(
             has_stock = jnp.any(state.harbour_store[p] > 0, axis=0)
             valid = jnp.any(has_stock & affordable_slots)
             can_load = can_load | jnp.where(is_self, 0, valid)
-        at_mask = at_mask.at[ACTION_MOVE_LOAD].set(
+        at_mask = at_mask.at[ACTION_MOVE_LOAD + 1].set(
             jnp.where(ship_space & can_load, 1, 0))
 
         in_harbour = state.ship_location[player] >= LOCATION_HARBOUR_OFFSET
-        at_mask = at_mask.at[ACTION_MOVE_SEA].set(in_harbour.astype(jnp.int32))
-
-        at_mask = at_mask.at[ACTION_MOVE_AUCTION].set(
-            jnp.where(
-                state.auction_active > 0,
-                1,  # always valid during auction
-                jnp.where(at_sea & (ship_cargo > 0), 1, 0),
-            ))
-
-        at_mask = at_mask.at[ACTION_PASS].set(1)
-
-        at_mask = at_mask.at[ACTION_TAKE_LOAN].set(jnp.where(loans < 2, 1, 0))
-        at_mask = at_mask.at[ACTION_REPAY_LOAN].set(
+        at_mask = at_mask.at[ACTION_MOVE_SEA + 1].set(in_harbour.astype(jnp.int32))
+        at_mask = at_mask.at[ACTION_MOVE_AUCTION + 1].set(
+            jnp.where(state.auction_active > 0, 1,
+                      jnp.where(at_sea & (ship_cargo > 0), 1, 0)))
+        at_mask = at_mask.at[ACTION_PASS + 1].set(1)
+        at_mask = at_mask.at[ACTION_TAKE_LOAN + 1].set(jnp.where(loans < 2, 1, 0))
+        at_mask = at_mask.at[ACTION_REPAY_LOAN + 1].set(
             jnp.where((loans > 0) & (cash >= LOAN_AMOUNT), 1, 0))
-
         if params.use_domestic_sale:
             has_any = (jnp.sum(state.factory_store[player]) + jnp.sum(state.harbour_store[player])) > 0
-            at_mask = at_mask.at[ACTION_DOMESTIC_SALE].set(has_any.astype(jnp.int32))
+            at_mask = at_mask.at[ACTION_DOMESTIC_SALE + 1].set(has_any.astype(jnp.int32))
 
-        # ---- opponent mask (relative to player, clockwise) --------------------
-        opp_mask = jnp.zeros(np_ - 1, dtype=jnp.int32)
+        # ---- opponent mask ----------------------------------------------------
+        opp_mask = jnp.zeros(opp_size, dtype=jnp.int32)
         for i in range(np_ - 1):
-            opp = (player + 1 + i) % np_  # traced, but dynamic gather is fine
+            opp = (player + 1 + i) % np_
             affordable_slots = jnp.arange(PRICE_SLOTS) < cash
             fs_ok = jnp.any(jnp.any(state.factory_store[opp] > 0, axis=0) & affordable_slots)
             hs_ok = jnp.any(jnp.any(state.harbour_store[opp] > 0, axis=0) & affordable_slots)
-            opp_mask = opp_mask.at[i].set(jnp.where(fs_ok | hs_ok, 1, 0))
+            opp_mask = opp_mask.at[i + 1].set(jnp.where(fs_ok | hs_ok, 1, 0))
 
         # ---- color mask -------------------------------------------------------
-        color_mask = jnp.zeros(nc, dtype=jnp.int32)
-        # During produce batch: show pending factory colours.
-        color_mask = jnp.where(state.produce_active > 0, state.produce_pending, color_mask)
+        color_mask = jnp.zeros(col_size, dtype=jnp.int32)
+        # Produce continuation: show pending factory colours
+        color_mask = jnp.where(is_produce,
+                               jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), state.produce_pending]),
+                               color_mask)
+        # Shopping continuation: show colours available from target opponent
+        shopping_target = state.shopping_target
+        color_mask = jnp.where(is_shopping,
+                               jnp.concatenate([
+                                   jnp.zeros(1, dtype=jnp.int32),
+                                   jnp.where(state.factory_store[shopping_target].sum(axis=1) > 0, 1, 0)
+                                   | jnp.where(state.harbour_store[shopping_target].sum(axis=1) > 0, 1, 0),
+                               ]),
+                               color_mask)
+        # Parallel: buy-factory-eligible and domestic-sale-eligible
         not_owned = state.factory_colors[player] == 0
-        color_mask = jnp.where(
-            state.produce_active > 0,
-            color_mask,  # already set from produce_pending
-            jnp.where((~own_all) & not_owned & (cash >= factory_cost), 1, color_mask),
-        )
+        color_mask = jnp.where(is_produce | is_shopping,
+                               color_mask,
+                               jnp.where((~own_all) & not_owned & (cash >= factory_cost),
+                                         jnp.ones((), dtype=jnp.int32), color_mask))
         if params.use_domestic_sale:
-            has_color = (
-                jnp.sum(state.factory_store[player], axis=1)
-                + jnp.sum(state.harbour_store[player], axis=1)
-            ) > 0
-            color_mask = jnp.where(
-                state.produce_active > 0,
-                color_mask,
-                jnp.where(has_color, 1, color_mask),
-            )
+            has_color = (jnp.sum(state.factory_store[player], axis=1)
+                         + jnp.sum(state.harbour_store[player], axis=1)) > 0
+            color_mask = jnp.where(is_produce | is_shopping,
+                                   color_mask,
+                                   jnp.where(has_color, jnp.ones((), dtype=jnp.int32), color_mask))
+        # Shift to indices 1..nc
+        color_mask = jnp.where(is_produce | is_shopping,
+                               color_mask,
+                               jnp.concatenate([jnp.zeros(1, dtype=jnp.int32), color_mask[1:]]))
 
         # ---- price_slot mask --------------------------------------------------
-        slot_mask = jnp.zeros(PRICE_SLOTS, dtype=jnp.int32)
-        # During produce batch: valid slots are 0..3 (prices) + 4 (leave idle).
-        slot_mask = jnp.where(
-            state.produce_active > 0,
-            jnp.where(jnp.arange(PRICE_SLOTS) < PRODUCE_CHOICES, 1, 0),
-            slot_mask,
-        )
+        slot_mask = jnp.zeros(slot_size, dtype=jnp.int32)
+        # Produce: $1-$4 + leave idle
+        slot_mask = jnp.where(is_produce,
+                              jnp.where((jnp.arange(slot_size) >= 1) & (jnp.arange(slot_size) <= PRODUCE_CHOICES), 1, 0),
+                              slot_mask)
         if params.use_domestic_sale:
             for c in range(nc):
-                slot_mask = jnp.where(
-                    state.produce_active > 0,
-                    slot_mask,
-                    jnp.where(state.factory_store[player, c] > 0, 1, slot_mask),
-                )
-                slot_mask = jnp.where(
-                    state.produce_active > 0,
-                    slot_mask,
-                    jnp.where(state.harbour_store[player, c] > 0, 1, slot_mask),
-                )
+                slot_mask = jnp.where(is_produce, slot_mask,
+                                      jnp.where(state.factory_store[player, c] > 0,
+                                                jnp.ones(slot_size, dtype=jnp.int32), slot_mask))
+                slot_mask = jnp.where(is_produce, slot_mask,
+                                      jnp.where(state.harbour_store[player, c] > 0,
+                                                jnp.ones(slot_size, dtype=jnp.int32), slot_mask))
+        slot_mask = jnp.where(is_produce, slot_mask,
+                              jnp.concatenate([jnp.zeros(1, dtype=jnp.int32),
+                                               (slot_mask[1:] > 0).astype(jnp.int32)]))
 
-        # ---- purchase mask (union across all opponents) -----------------------
-        p_stop = _purchase_stop(nc)
-        pur_mask = jnp.zeros(_purchase_with_stop(nc), dtype=jnp.int32)
-        pur_mask = pur_mask.at[p_stop].set(1)
-        for i in range(np_ - 1):
-            opp = (player + 1 + i) % np_
-            for c in range(nc):
-                for s in range(PRICE_SLOTS):
-                    idx = c * PRICE_SLOTS + s
-                    cost = s + 1
-                    has_fs = state.factory_store[opp, c, s] > 0
-                    has_hs = state.harbour_store[opp, c, s] > 0
-                    affordable = cash >= cost
-                    valid = (has_fs & affordable & has_space_h) | (has_hs & affordable & ship_space)
-                    pur_mask = pur_mask.at[idx].set(jnp.where(valid, 1, pur_mask[idx]))
+        # ---- purchase mask ----------------------------------------------------
+        is_factory_shop = is_shopping & (state.shopping_action_type == ACTION_BUY_FROM_FACTORY_STORE)
+        is_ship_shop = is_shopping & (state.shopping_action_type == ACTION_MOVE_LOAD)
+
+        # Base: all value slots 1..30 and STOP (31) are valid for purchase head.
+        # The actual meaning depends on mode.
+        pur_mask = jnp.ones(pur_size, dtype=jnp.int32)
+
+        # During factory shopping: harbour prices $2-$6 (indices 1-5) + STOP (31)
+        pur_factory_shop = jnp.zeros(pur_size, dtype=jnp.int32)
+        pur_factory_shop = pur_factory_shop.at[1].set(1)   # $2
+        pur_factory_shop = pur_factory_shop.at[2].set(1)   # $3
+        pur_factory_shop = pur_factory_shop.at[3].set(1)   # $4
+        pur_factory_shop = pur_factory_shop.at[4].set(1)   # $5
+        pur_factory_shop = pur_factory_shop.at[5].set(1)   # $6
+        pur_factory_shop = pur_factory_shop.at[PURCHASE_STOP].set(1)
+        pur_mask = jnp.where(is_factory_shop, pur_factory_shop, pur_mask)
+
+        # During ship shopping: only 1 (buy signal) + STOP (31)
+        pur_ship_shop = jnp.zeros(pur_size, dtype=jnp.int32)
+        pur_ship_shop = pur_ship_shop.at[1].set(1)
+        pur_ship_shop = pur_ship_shop.at[PURCHASE_STOP].set(1)
+        pur_mask = jnp.where(is_ship_shop, pur_ship_shop, pur_mask)
+
+        # Auction: indices 0..cash = valid bids, index 1 = accept, STOP masked
+        pur_auction_bid = jnp.zeros(pur_size, dtype=jnp.int32)
+        pur_auction_bid = pur_auction_bid.at[NO_OP].set(1)
+        pur_auction_bid = jnp.where(
+            (jnp.arange(pur_size) >= 1) & (jnp.arange(pur_size) <= cash),
+            jnp.ones((), dtype=jnp.int32), pur_auction_bid)
+        pur_auction_bid = pur_auction_bid.at[PURCHASE_STOP].set(0)
+        seller = state.auction_seller
+        is_seller = is_auction & (player == seller)
+        pur_seller_dec = jnp.zeros(pur_size, dtype=jnp.int32)
+        pur_seller_dec = pur_seller_dec.at[NO_OP].set(1)  # reject
+        pur_seller_dec = pur_seller_dec.at[1].set(1)       # accept
+        pur_mask = jnp.where(is_auction,
+                             jnp.where(is_seller, pur_seller_dec, pur_auction_bid),
+                             pur_mask)
+
+        # ---- Mode-based masking overrides -------------------------------------
+
+        # Parallel mode: no-op masked out on all heads
+        at_mask = jnp.where(is_parallel, at_mask.at[NO_OP].set(0), at_mask)
+        opp_mask = jnp.where(is_parallel, opp_mask.at[NO_OP].set(0), opp_mask)
+        color_mask = jnp.where(is_parallel, color_mask.at[NO_OP].set(0), color_mask)
+        slot_mask = jnp.where(is_parallel, slot_mask.at[NO_OP].set(0), slot_mask)
+        pur_mask = jnp.where(is_parallel, pur_mask.at[NO_OP].set(0), pur_mask)
+
+        # Shopping mode: colour + purchase active, others forced no-op
+        at_mask = jnp.where(is_shopping, _noop_only(at_size), at_mask)
+        opp_mask = jnp.where(is_shopping, _noop_only(opp_size), opp_mask)
+        color_mask = jnp.where(is_shopping, color_mask.at[NO_OP].set(0), color_mask)
+        slot_mask = jnp.where(is_shopping, _noop_only(slot_size), slot_mask)
+        pur_mask = jnp.where(is_shopping, pur_mask.at[NO_OP].set(0), pur_mask)
+
+        # Produce mode: colour + price_slot active, others forced no-op
+        at_mask = jnp.where(is_produce, _noop_only(at_size), at_mask)
+        opp_mask = jnp.where(is_produce, _noop_only(opp_size), opp_mask)
+        color_mask = jnp.where(is_produce, color_mask.at[NO_OP].set(0), color_mask)
+        slot_mask = jnp.where(is_produce, slot_mask.at[NO_OP].set(0), slot_mask)
+        pur_mask = jnp.where(is_produce, _noop_only(pur_size), pur_mask)
+
+        # Auction mode: action_type + purchase active
+        at_mask = jnp.where(is_auction,
+                            _noop_only(at_size).at[ACTION_MOVE_AUCTION + 1].set(1), at_mask)
+        opp_mask = jnp.where(is_auction, _noop_only(opp_size), opp_mask)
+        color_mask = jnp.where(is_auction, _noop_only(col_size), color_mask)
+        slot_mask = jnp.where(is_auction, _noop_only(slot_size), slot_mask)
 
         return {
             "action_type": at_mask,
@@ -1017,7 +1108,7 @@ class ContainerFunctional(
     # ========================================================================
 
     def _dispatch_action(self, state, action, key, params):
-        action_type = action[HEAD_ACTION_TYPE]
+        action_type = jnp.clip(action[HEAD_ACTION_TYPE] - 1, 0, NUM_ACTION_TYPES - 1)
         branches = [
             lambda s, a, k: self._action_buy_factory(s, a),
             lambda s, a, k: self._action_buy_warehouse(s, a),
@@ -1040,7 +1131,7 @@ class ContainerFunctional(
     def _action_buy_factory(self, state, action):
         player = state.current_player
         nc = state.factory_colors.shape[1]
-        color = jnp.clip(action[HEAD_COLOR], 0, nc - 1)
+        color = jnp.clip(action[HEAD_COLOR] - 1, 0, nc - 1)
 
         num_factories = jnp.sum(state.factory_colors[player])
         already_owns = state.factory_colors[player, color] > 0
@@ -1087,34 +1178,66 @@ class ContainerFunctional(
     # ========================================================================
 
     def _action_produce(self, state, action, params):
-        """Produce one container of *color* at *price_slot*, or leave idle.
-
-        On the first call each turn this initialises ``produce_pending`` from
-        the player's owned factory colours and enters recurrent mode.  Each
-        call processes one colour.  When all owned colours are processed the
-        batch finishes and the turn can advance.
+        """Enter produce mode.  On the first call each turn this initialises
+        ``produce_pending`` from the player's owned factory colours and enters
+        recurrent mode.  The actual per-factory processing (colour + price)
+        happens in ``_produce_shopping_step``.
         """
         player = state.current_player
         np_ = params.num_players
         nc = params.num_colors
         right_player = (player + 1) % np_
 
-        color = jnp.clip(action[HEAD_COLOR], 0, nc - 1)
-        slot = jnp.clip(action[HEAD_PRICE_SLOT], 0, PRODUCE_CHOICES - 1)
+        already_produced = state.produced_this_turn > 0
+        factory_count = jnp.sum(state.factory_colors[player])
+        capacity = factory_count * FACTORY_STORAGE_MULTIPLIER
+        current_stored = self._count_store_containers(state.factory_store, player)
+        has_space = current_stored < capacity
+        owned = state.factory_colors[player] > 0
+        supply_ok_colors = (state.container_supply > 0) & owned
+        any_possible = has_space & jnp.any(supply_ok_colors)
+
+        do_pay = any_possible & (~already_produced)
+
+        new_cash = state.cash.at[player].set(
+            jnp.where(do_pay, state.cash[player] - 1, state.cash[player])
+        )
+        new_cash = new_cash.at[right_player].set(
+            jnp.where(do_pay, state.cash[right_player] + 1, state.cash[right_player])
+        )
+        state = state._replace(cash=new_cash)
+
+        pending = owned.astype(jnp.int32)
+
+        state = state._replace(
+            produce_active=jnp.array(1, dtype=jnp.int32),
+            produce_pending=pending,
+            produced_this_turn=jnp.where(
+                do_pay,
+                jnp.array(1, dtype=state.produced_this_turn.dtype),
+                state.produced_this_turn,
+            ),
+        )
+        return state
+
+    # ========================================================================
+    # Recurrent produce (shopping-style continuation)
+    # ========================================================================
+
+    def _produce_shopping_step(self, state, action, params):
+        """Process one factory: read colour + price_slot, produce container
+        or leave idle.  If more factories remain pending, stay in
+        produce_active; otherwise finish and advance turn."""
+        np_ = params.num_players
+        nc = params.num_colors
+        player = state.current_player
+
+        color = jnp.clip(action[HEAD_COLOR] - 1, 0, nc - 1)
+        slot = jnp.clip(action[HEAD_PRICE_SLOT] - 1, 0, PRODUCE_CHOICES - 1)
         is_idle = slot >= LEAVE_IDLE
         place_slot = jnp.clip(slot, 0, PRICE_SLOTS - 1)
 
-        # First produce call of the batch — snapshot which factories to process.
-        pending = jnp.where(
-            state.produce_active > 0,
-            state.produce_pending,
-            state.factory_colors[player] > 0,
-        )
-        # Only act if this colour is still pending (hasn't been processed yet).
-        is_pending = (pending[color] > 0) & (state.factory_colors[player, color] > 0)
-
-        already_produced = state.produced_this_turn > 0
-
+        is_pending = (state.produce_pending[color] > 0) & (state.factory_colors[player, color] > 0)
         owns = state.factory_colors[player, color] > 0
         factory_count = jnp.sum(state.factory_colors[player])
         capacity = factory_count * FACTORY_STORAGE_MULTIPLIER
@@ -1123,18 +1246,7 @@ class ContainerFunctional(
         supply_ok = state.container_supply[color] > 0
 
         can_produce = is_pending & (~is_idle) & owns & has_space & supply_ok
-        do_pay_union = can_produce & (~already_produced)
 
-        # Cash: union dues ($1) paid only on the very first real produce.
-        new_cash = state.cash.at[player].set(
-            jnp.where(do_pay_union, state.cash[player] - 1, state.cash[player])
-        )
-        new_cash = new_cash.at[right_player].set(
-            jnp.where(do_pay_union, state.cash[right_player] + 1, state.cash[right_player])
-        )
-        state = state._replace(cash=new_cash)
-
-        # Add container to factory store.
         state = state._replace(
             factory_store=state.factory_store.at[player, color, place_slot].set(
                 jnp.where(
@@ -1150,52 +1262,22 @@ class ContainerFunctional(
                     state.container_supply[color],
                 )
             ),
-            produced_this_turn=jnp.where(
-                can_produce,
-                jnp.array(1, dtype=state.produced_this_turn.dtype),
-                state.produced_this_turn,
-            ),
         )
 
         # Mark this colour as processed.
-        pending = pending.at[color].set(
-            jnp.where(is_pending, 0, pending[color])
+        pending = state.produce_pending.at[color].set(
+            jnp.where(is_pending, 0, state.produce_pending[color])
         )
-        # If nothing left, the batch is done.
         any_remaining = jnp.any(pending > 0)
-        state = state._replace(
-            produce_pending=pending,
-            produce_active=jnp.where(any_remaining, jnp.array(1, dtype=jnp.int32),
-                                     jnp.array(0, dtype=jnp.int32)),
-        )
+        state = state._replace(produce_pending=pending)
 
-        return state
-
-    # ========================================================================
-    # Recurrent produce (shopping-style continuation)
-    # ========================================================================
-
-    def _produce_shopping_step(self, state, action, params):
-        np_ = params.num_players
-
-        # Guard: if a non-produce action arrives while produce is
-        # still active, finish the batch immediately.
-        is_produce = action[HEAD_ACTION_TYPE] == ACTION_PRODUCE
-        s = jax.lax.cond(
-            is_produce,
-            lambda x: self._action_produce(x, action, params),
-            lambda x: x,
-            state,
-        )
-
-        can = self._can_continue_producing(s)
-        s = jax.lax.cond(
-            can,
+        state = jax.lax.cond(
+            any_remaining,
             lambda x: x._replace(produce_active=jnp.array(1, dtype=jnp.int32)),
             lambda x: self._finish_producing(x, np_),
-            s,
+            state,
         )
-        return s
+        return state
 
     def _can_continue_producing(self, state):
         return jnp.any(state.produce_pending > 0)
@@ -1215,35 +1297,25 @@ class ContainerFunctional(
     # ========================================================================
 
     def _action_buy_from_factory_store(self, state, action, params):
-        """Buy one container from another player's factory store.
-
-        Sets ``shopping_active`` if another purchase is possible, so the
-        training loop can call the policy again for the next purchase.
-        Shopping ends when STOP is selected or constraints are exhausted.
+        """Select an opponent to buy from (step 1 of shopping).
+        Sets ``shopping_active`` if purchases are possible.
+        Actual container purchases happen in ``_shopping_step``.
         """
         player = state.current_player
         np_ = params.num_players
         nc = params.num_colors
 
-        opp_idx = jnp.clip(action[HEAD_OPPONENT], 0, np_ - 2)
+        opp_idx = jnp.clip(action[HEAD_OPPONENT] - 1, 0, np_ - 2)
         target = self._get_target_player(opp_idx, player, np_)
         target = jnp.clip(target, 0, np_ - 1)
 
-        purchase = action[HEAD_PURCHASE]
-        is_stop = purchase >= nc * PRICE_SLOTS
-
-        new_state = self._do_one_purchase(
-            state, jnp.array(ACTION_BUY_FROM_FACTORY_STORE, dtype=jnp.int32),
-            target, action, params,
-        )
-
-        can = (~is_stop) & self._can_continue_shopping(
-            new_state,
+        can = self._can_continue_shopping(
+            state,
             jnp.array(ACTION_BUY_FROM_FACTORY_STORE, dtype=jnp.int32),
             target, params,
         )
 
-        new_state = new_state._replace(
+        state = state._replace(
             shopping_active=jnp.where(can, jnp.array(1, dtype=jnp.int32),
                                       jnp.array(0, dtype=jnp.int32)),
             shopping_action_type=jnp.where(can, jnp.array(ACTION_BUY_FROM_FACTORY_STORE, dtype=jnp.int32),
@@ -1251,38 +1323,32 @@ class ContainerFunctional(
             shopping_target=jnp.where(can, target, jnp.array(0, dtype=jnp.int32)),
         )
 
-        return new_state
+        return state
 
     # ========================================================================
     # Action (5): Move to Harbour + Load (recurrent shopping)
     # ========================================================================
 
     def _action_move_load(self, state, action, params):
-        """Move to harbour and load one container. Sets ``shopping_active``
-        if more purchases are possible."""
+        """Select an opponent to load from (step 1 of shopping).
+        Sets ``shopping_active`` if purchases are possible.
+        Actual container loads happen in ``_shopping_step``.
+        """
         player = state.current_player
         np_ = params.num_players
         nc = params.num_colors
 
-        opp_idx = jnp.clip(action[HEAD_OPPONENT], 0, np_ - 2)
+        opp_idx = jnp.clip(action[HEAD_OPPONENT] - 1, 0, np_ - 2)
         target = self._get_target_player(opp_idx, player, np_)
         target = jnp.clip(target, 0, np_ - 1)
 
-        purchase = action[HEAD_PURCHASE]
-        is_stop = purchase >= nc * PRICE_SLOTS
-
-        new_state = self._do_one_purchase(
-            state, jnp.array(ACTION_MOVE_LOAD, dtype=jnp.int32),
-            target, action, params,
-        )
-
-        can = (~is_stop) & self._can_continue_shopping(
-            new_state,
+        can = self._can_continue_shopping(
+            state,
             jnp.array(ACTION_MOVE_LOAD, dtype=jnp.int32),
             target, params,
         )
 
-        new_state = new_state._replace(
+        state = state._replace(
             shopping_active=jnp.where(can, jnp.array(1, dtype=jnp.int32),
                                       jnp.array(0, dtype=jnp.int32)),
             shopping_action_type=jnp.where(can, jnp.array(ACTION_MOVE_LOAD, dtype=jnp.int32),
@@ -1290,7 +1356,7 @@ class ContainerFunctional(
             shopping_target=jnp.where(can, target, jnp.array(0, dtype=jnp.int32)),
         )
 
-        return new_state
+        return state
 
     # ========================================================================
     # Action (6): Move to Open Sea
@@ -1512,8 +1578,8 @@ class ContainerFunctional(
         player = state.current_player
         nc = params.num_colors
 
-        color = jnp.clip(action[HEAD_COLOR], 0, nc - 1)
-        price_slot = jnp.clip(action[HEAD_PRICE_SLOT], 0, PRICE_SLOTS - 1)
+        color = jnp.clip(action[HEAD_COLOR] - 1, 0, nc - 1)
+        price_slot = jnp.clip(action[HEAD_PRICE_SLOT] - 1, 0, PRICE_SLOTS - 1)
 
         available_factory = state.factory_store[player, color, price_slot]
         available_harbour = state.harbour_store[player, color, price_slot]
@@ -1654,6 +1720,7 @@ class ContainerFunctional(
             shopping_active=jnp.array(0, dtype=jnp.int32),
             shopping_action_type=jnp.array(0, dtype=jnp.int32),
             shopping_target=jnp.array(0, dtype=jnp.int32),
+            shopping_harbour_price=jnp.array(0, dtype=jnp.int32),
             produce_active=jnp.array(0, dtype=jnp.int32),
             produce_pending=jnp.zeros(params.num_colors, dtype=jnp.int32),
             produce_was_produced=jnp.array(0, dtype=jnp.int32),
@@ -1719,12 +1786,13 @@ class ContainerFunctional(
         )
         parts.append(jnp.sum(centered.auction_cargo > 0).astype(jnp.float32)[None])
 
-        # Shopping continuation state (3 scalars)
+        # Shopping continuation state (4 scalars)
         parts.append(
             jnp.array([
                 centered.shopping_active.astype(jnp.float32),
                 centered.shopping_action_type.astype(jnp.float32),
                 centered.shopping_target.astype(jnp.float32),
+                centered.shopping_harbour_price.astype(jnp.float32),
             ])
         )
 
