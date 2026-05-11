@@ -61,6 +61,9 @@ homepage = "https://github.com/guyreading/container_rl"
 
 [project.scripts]
 container_rl = "container_rl.cli:app"
+container-server = "container_rl.server.server:main"
+container-client = "container_rl.client.tui:main"
+container-maintainer = "container_rl.client.maintainer:main"
 
 [tool.ty]
 # All rules are enabled as "error" by default; no need to specify unless overriding.
