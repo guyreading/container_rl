@@ -157,12 +157,21 @@ class Database:
             return dict(row) if row else None
 
     def list_joinable_games(self) -> list[dict]:
+        """Return games that can be joined or rejoined.
+
+        Lobby games are shown only if they still have free slots.
+        Active games are always shown (reconnection is validated later
+        by checking the player's existing slot).
+        """
         with self._connect() as conn:
             rows = conn.execute("""
                 SELECT g.*, COUNT(gp.player_index) as slots_filled
                 FROM games g
                 LEFT JOIN game_players gp ON g.id = gp.game_id
-                WHERE g.status = 'lobby'
+                WHERE g.status = 'active'
+                   OR (g.status = 'lobby' AND (
+                       SELECT COUNT(*) FROM game_players WHERE game_id = g.id
+                   ) < g.num_players)
                 GROUP BY g.id
                 ORDER BY g.created_at DESC
             """).fetchall()
@@ -274,3 +283,25 @@ class Database:
                 "SELECT step_count FROM game_states WHERE game_id = ?", (game_id,),
             ).fetchone()
             return row["step_count"] if row else 0
+
+    # ------------------------------------------------------------------
+    # maintainer operations
+    # ------------------------------------------------------------------
+
+    def list_all_games(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("""
+                SELECT g.*, COUNT(gp.player_index) as slots_filled
+                FROM games g
+                LEFT JOIN game_players gp ON g.id = gp.game_id
+                GROUP BY g.id
+                ORDER BY g.created_at DESC
+                LIMIT 100
+            """).fetchall()
+            return [dict(r) for r in rows]
+
+    def delete_game(self, game_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM game_states WHERE game_id = ?", (game_id,))
+            conn.execute("DELETE FROM game_players WHERE game_id = ?", (game_id,))
+            conn.execute("DELETE FROM games WHERE id = ?", (game_id,))

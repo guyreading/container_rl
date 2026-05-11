@@ -48,7 +48,7 @@ class GameManager:
         self._broadcast = broadcast
         self._envs: dict[int, ContainerJaxEnv] = {}
         self._encoders: dict[int, ActionEncoder] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # create / join
@@ -67,20 +67,29 @@ class GameManager:
     def join_game(
         self, player_name: str, password: str | None, code: str,
     ) -> dict:
-        """Join an existing lobby game."""
+        """Join a lobby game or reconnect to an active game."""
         game = self.db.get_game_by_code(code)
         if not game:
             raise ValueError(f"Game '{code}' not found.")
-        if game["status"] != "lobby":
+        if game["status"] not in ("lobby", "active"):
             raise ValueError(f"Game '{code}' is not accepting players (status: {game['status']}).")
         player_id = self.db.upsert_player(player_name, password)
-        player_index = self.db.assign_player_slot(game_id=game["id"], player_id=player_id)
+
+        if game["status"] == "active":
+            # Reconnection — must already have a slot.
+            player_index = self.db.get_player_slot(game["id"], player_id)
+            if player_index is None:
+                raise ValueError(f"Player '{player_name}' is not in game '{code}'.")
+        else:
+            player_index = self.db.assign_player_slot(game_id=game["id"], player_id=player_id)
+
         return {
             "game_id": game["id"],
             "code": code,
             "player_index": player_index,
             "num_players": game["num_players"],
             "num_colors": game["num_colors"],
+            "status": game["status"],
         }
 
     def list_joinable(self) -> list[dict]:
@@ -171,7 +180,12 @@ class GameManager:
                 return {"turn_ended": True, "desc": "Game is over", "reward": 0.0, "game_over": True}
 
             actual = int(state.current_player)
-            if actual != player_index:
+            auction_active = int(state.auction_active) > 0
+            # During an auction, any non-seller player can submit a bid
+            # regardless of whose turn it nominally is.
+            if actual != player_index and not (
+                auction_active and player_index != int(state.auction_seller)
+            ):
                 return {
                     "turn_ended": False,
                     "desc": f"Not your turn (current player is {actual}).",
@@ -185,7 +199,9 @@ class GameManager:
             self._save_state(game_id, env.state)
 
             nc = encoder.num_colors
-            desc = _describe_action(action, encoder, nc)
+            db_players = self.db.get_game_players(game_id)
+            pnames = {int(pl["player_index"]): pl["name"] for pl in db_players}
+            desc = _describe_action(action, encoder, nc, env.state, pnames)
 
             new_state = env.state
             turn_ended = int(new_state.current_player) != actual
@@ -233,7 +249,7 @@ class GameManager:
         self.db.save_state(game_id, blob, int(state.step_count))
 
 
-def _describe_action(action, encoder: ActionEncoder, num_colors: int) -> str:
+def _describe_action(action, encoder: ActionEncoder, num_colors: int, state=None, player_names: dict[int, str] | None = None) -> str:
     """Return a human-readable description of *action* (flat int or multi-head array)."""
     import jax.numpy as jnp
     try:
@@ -241,30 +257,34 @@ def _describe_action(action, encoder: ActionEncoder, num_colors: int) -> str:
             atype = int(action[0])
             purchase = int(action[4])
             nc = num_colors
+            colors = ['Red','Green','Blue','Yellow','Purple']
+            opp_idx = int(action[1])  # HEAD_OPPONENT
             if atype == ACTION_PASS:
                 return "Pass"
             elif atype == ACTION_BUY_FACTORY:
-                return f"Buy {['Red','Green','Blue','Yellow','Purple'][min(int(action[2]),nc-1)]} factory"
+                return f"Buy {colors[min(int(action[2]),nc-1)]} factory"
             elif atype == ACTION_BUY_WAREHOUSE:
                 return "Buy warehouse"
             elif atype == ACTION_PRODUCE:
                 color = int(action[2])
                 slot = int(action[3])
                 if slot >= LEAVE_IDLE:
-                    return f"Leave {['Red','Green','Blue','Yellow','Purple'][min(color,nc-1)]} idle"
-                return f"Produce {['Red','Green','Blue','Yellow','Purple'][min(color,nc-1)]} at ${slot+1}"
+                    return f"Leave {colors[min(color,nc-1)]} idle"
+                return f"Produce {colors[min(color,nc-1)]} at ${slot+1}"
             elif atype == ACTION_BUY_FROM_FACTORY_STORE:
                 if purchase >= nc * PRICE_SLOTS:
                     return "Stop buying"
                 color = purchase // PRICE_SLOTS
                 slot = purchase % PRICE_SLOTS
-                return f"Buy {['Red','Green','Blue','Yellow','Purple'][min(color,nc-1)]} from factory at ${slot+1}"
+                opp_name = _opponent_name(opp_idx, state, player_names) if state else f"Player {opp_idx+1}"
+                return f"Buy {colors[min(color,nc-1)]} from {opp_name}'s factory at ${slot+1}"
             elif atype == ACTION_MOVE_LOAD:
                 if purchase >= nc * PRICE_SLOTS:
                     return "Stop loading"
                 color = purchase // PRICE_SLOTS
                 slot = purchase % PRICE_SLOTS
-                return f"Load {['Red','Green','Blue','Yellow','Purple'][min(color,nc-1)]} from harbour at ${slot+1}"
+                opp_name = _opponent_name(opp_idx, state, player_names) if state else f"Player {opp_idx+1}"
+                return f"Load {colors[min(color,nc-1)]} from {opp_name}'s harbour at ${slot+1}"
             elif atype == ACTION_MOVE_SEA:
                 return "Move to sea"
             elif atype == ACTION_MOVE_AUCTION:
@@ -282,3 +302,13 @@ def _describe_action(action, encoder: ActionEncoder, num_colors: int) -> str:
         return _ACTION_NAMES.get(atype, f"Action {atype}")
     except Exception:
         return "Action"
+
+
+def _opponent_name(opp_idx: int, state, player_names: dict[int, str] | None = None) -> str:
+    """Return the target player's name (or 'Player {n}' as fallback)."""
+    player = int(state.current_player)
+    np_ = state.cash.shape[0]
+    target = (player + opp_idx + 1) % np_
+    if player_names and target in player_names:
+        return player_names[target]
+    return f"Player {target + 1}"

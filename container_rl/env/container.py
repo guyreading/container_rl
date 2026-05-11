@@ -498,9 +498,11 @@ class ContainerFunctional(
                     s.produce_active > 0, was_produced, s.produce_was_produced,
                 ),
             )
-            # Don't advance turn if still mid-shopping, mid-produce, or mid-auction.
+            # Don't advance turn if still mid-shopping, mid-produce, mid-auction,
+            # or if the auction failed (no turn consumed for a bad auction attempt).
+            auction_failed = (atype == ACTION_MOVE_AUCTION) & (~s.auction_active.astype(jnp.bool_))
             s = jax.lax.cond(
-                (s.shopping_active > 0) | (s.produce_active > 0) | (s.auction_active > 0),
+                auction_failed | (s.shopping_active > 0) | (s.produce_active > 0) | (s.auction_active > 0),
                 lambda x: x,
                 lambda x: self._advance_turn(x, atype, np_, was_produced),
                 s,
@@ -1375,7 +1377,8 @@ class ContainerFunctional(
 
     def _action_move_auction(self, state, action, key, params):
         """Initiate an auction.  Snapshots cargo, clears the ship, and
-        enters recurrent mode so other players can submit bids."""
+        enters recurrent mode so all other players can submit bids
+        concurrently."""
         player = state.current_player
         np_ = params.num_players
 
@@ -1383,8 +1386,6 @@ class ContainerFunctional(
         ship_row = state.ship_contents[player]
         has_cargo = jnp.any(ship_row > 0)
         can_auction = at_sea & has_cargo
-
-        next_bidder = (player + 1) % np_  # first non-seller to bid
 
         state = state._replace(
             auction_active=jnp.where(can_auction, jnp.array(1, dtype=jnp.int32),
@@ -1406,7 +1407,6 @@ class ContainerFunctional(
             ship_location=state.ship_location.at[player].set(
                 jnp.where(can_auction, LOCATION_AUCTION_ISLAND, state.ship_location[player])
             ),
-            current_player=jnp.where(can_auction, next_bidder, state.current_player),
         )
         return state
 
@@ -1417,9 +1417,10 @@ class ContainerFunctional(
     def _auction_continue_step(self, state, action, key, params):
         """Process one step of the recurrent auction.
 
-        Bidding phase (auction_round == 0): each non-seller player submits
-        a blind bid via HEAD_PURCHASE.  When all bids are collected the
-        phase advances to the seller decision.
+        Bidding phase (auction_round == 0): any non-seller player can
+        submit a blind bid via HEAD_PURCHASE at any time.  When all
+        non-seller bids are collected the phase advances to the seller
+        decision.
 
         Seller decision (auction_round == 1): the seller's HEAD_PURCHASE
         signals accept (>0) or reject (0).  The auction resolves and the
@@ -1429,27 +1430,29 @@ class ContainerFunctional(
         nc = params.num_colors
         player = state.current_player
         seller = state.auction_seller
+        bidder = int(jnp.clip(action[HEAD_OPPONENT], 0, np_ - 1))
         round_ = state.auction_round
         is_bidding = round_ == 0
         is_decision = round_ == 1
 
-        bid_amount = jnp.clip(action[HEAD_PURCHASE], 0, state.cash[player])
+        bid_amount = jnp.clip(action[HEAD_PURCHASE], 0, state.cash[int(bidder)])
 
         def _store_bid(s):
-            bids = s.auction_bids.at[player].set(bid_amount)
-            next_bidder = (player + 1) % np_
-            remaining = jnp.any(bids == -1)
+            # Only record if this player hasn't bid yet and is not the seller.
+            has_bid = s.auction_bids[int(bidder)] >= 0
+            ok_to_bid = (~has_bid) & (int(bidder) != int(seller))
+            bids = s.auction_bids.at[int(bidder)].set(
+                jnp.where(ok_to_bid, bid_amount, s.auction_bids[int(bidder)])
+            )
+            # Check if all non-seller players have bid
+            all_bid = ~jnp.any(bids == -1)
             s = s._replace(auction_bids=bids)
             s = jax.lax.cond(
-                remaining,
-                lambda x: x._replace(
-                    current_player=next_bidder,
-                    auction_round=jnp.array(0, dtype=jnp.int32),
-                ),
+                all_bid,
                 lambda x: x._replace(
                     auction_round=jnp.array(1, dtype=jnp.int32),
-                    current_player=seller,
                 ),
+                lambda x: x,
                 s,
             )
             return s
@@ -1466,7 +1469,6 @@ class ContainerFunctional(
             winner = jnp.argmax(is_max.astype(jnp.int32))
             winner = jnp.where(all_zero, seller, winner)
 
-            # Tie-break with random second round
             key1, key2 = random.split(key)
             tie_bids = jnp.where(
                 tied,
