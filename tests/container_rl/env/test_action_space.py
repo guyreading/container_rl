@@ -49,6 +49,7 @@ from container_rl.env.container import (
     INITIAL_CASH,
     LEAVE_IDLE,
     LOAN_AMOUNT,
+    LOCATION_AUCTION_ISLAND,
     LOCATION_HARBOUR_OFFSET,
     LOCATION_OPEN_SEA,
     MAX_WAREHOUSES_PER_PLAYER,
@@ -644,21 +645,47 @@ class TestAuction:
         assert int(new_state.ship_location[0]) == LOCATION_AUCTION_ISLAND  # (defined in container.py)
 
     def test_auction_deposits_goods(self):
-        """After resolution the cargo lands on the island store.
+        """Full auction flow: initiate → bid → seller accepts → goods land on island.
 
-        **Why**: integration check — cargo is transferred via
-        ``_deposit_goods`` during ``_auction_continue_step`` resolution.
-        Since JIT is disabled, the immediate step resolves and goods
-        appear in island stores.
+        **Why**: the auction is a recurrent action spread across multiple
+        steps.  Calling only ``_action_move_auction`` initiates the
+        auction but does not resolve it.  We must manually step through
+        bidding and seller decision via ``_auction_continue_step`` to
+        verify the full deposit.
         """
         func_env = _make_func_env()
         params = _make_params()
         ship = jnp.array([[1, 2, 0, 0, 0], [0, 0, 0, 0, 0]], dtype=jnp.int32)
         state = _make_state(ship_contents=ship)
         key = random.PRNGKey(99)
+
+        # ── 1. Initiate auction (P0, with two containers) ───────────────
         mh = _build_multihd(ACTION_MOVE_AUCTION)
-        new_state = func_env._action_move_auction(state, mh, key, params)
-        total_island = int(jnp.sum(new_state.island_store))
+        state = func_env._action_move_auction(state, mh, key, params)
+        assert int(state.auction_active) == 1
+        assert int(state.auction_seller) == 0
+
+        # ── 2. P1 bids $5 ──────────────────────────────────────────────
+        # HEAD_OPPONENT = 1 identifies P1 as the bidder
+        key, subkey = random.split(key)
+        bid_action = jnp.array(
+            [ACTION_MOVE_AUCTION + 1, 1, 0, 0, 5], dtype=jnp.int32,
+        )
+        state = func_env._auction_continue_step(state, bid_action, subkey, params)
+        # After P1's bid, auction_round → 1
+        assert int(state.auction_round) == 1
+
+        # ── 3. P0 (seller) accepts ─────────────────────────────────────
+        # HEAD_OPPONENT = 0 identifies P0 as the seller acting
+        key, subkey = random.split(key)
+        accept_action = jnp.array(
+            [ACTION_MOVE_AUCTION + 1, 0, 0, 0, 1], dtype=jnp.int32,  # 1 = accept
+        )
+        state = func_env._auction_continue_step(state, accept_action, subkey, params)
+        assert int(state.auction_active) == 0  # auction resolved
+
+        # ── 4. Goods deposited on island ────────────────────────────────
+        total_island = int(jnp.sum(state.island_store))
         assert total_island == 2
 
 
@@ -820,3 +847,687 @@ class TestDomesticSale:
         mh = _rel_to_multihd(ACTION_DOMESTIC_SALE, 0 * 50 + 0 * 10 + 0, 2, 5)
         new_state = func_env._action_domestic_sale(state, mh, params)
         assert int(new_state.cash[0]) == INITIAL_CASH
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Action mask verification — per-mode, per-head correctness
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestActionMasksParallel:
+    """Verify masks in **parallel mode** (no shopping, no produce, no auction).
+
+    In parallel mode every head's no‑op (index 0) is forced to 0.
+    All legally selectable values at indices ≥ 1 have mask = 1,
+    all illegal values have mask = 0.
+
+    The default test state:
+    - P0 owns colour‑0 factory, has 1 container of colour 0 at slot 4 ($5)
+    - P1 owns colour‑1 factory, has 1 container of colour 1 at slot 4 ($5)
+    - Both have $20 cash, 1 warehouse, empty harbour / island / ship
+    """
+
+    @staticmethod
+    def _masks(state, params=None):
+        func_env = _make_func_env()
+        if params is None:
+            params = _make_params()
+        return func_env._action_masks(state, params)
+
+    # ── Structural invariants ─────────────────────────────────────────
+
+    def test_no_op_masked_out_on_all_heads(self):
+        """Index 0 must be 0 on every head in parallel mode.
+
+        **Why**: the agent must NOT be allowed to select no‑op during a
+        normal turn — only meaningful values should be available.  No‑op
+        is reserved for heads that are irrelevant in sequential
+        continuation modes.
+        """
+        state = _make_state()
+        masks = self._masks(state)
+        assert int(masks["action_type"][0]) == 0, "action_type no‑op should be masked"
+        assert int(masks["opponent"][0]) == 0, "opponent no‑op should be masked"
+        assert int(masks["color"][0]) == 0, "colour no‑op should be masked"
+        assert int(masks["price_slot"][0]) == 0, "price_slot no‑op should be masked"
+        assert int(masks["purchase"][0]) == 0, "purchase no‑op should be masked"
+
+    def test_head_sizes(self):
+        """Mask arrays must match the declared MultiDiscrete head sizes.
+
+        **Why**: the observation appends these masks and the training
+        wrapper splits them by size — a mismatch here would cause silent
+        misalignment during PPO training.
+        """
+        from container_rl.env.container import head_sizes
+        state = _make_state()
+        masks = self._masks(state)
+        sizes = head_sizes(2, 5)  # 2 players, 5 colours → [12, 2, 6, 11, 32]
+        assert len(masks["action_type"]) == sizes[0]
+        assert len(masks["opponent"]) == sizes[1]
+        assert len(masks["color"]) == sizes[2]
+        assert len(masks["price_slot"]) == sizes[3]
+        assert len(masks["purchase"]) == sizes[4]
+
+    # ── Action-type legality ───────────────────────────────────────────
+
+    def test_buy_factory_legal(self):
+        """P0 can afford a new factory (cost $3), does NOT own all colours.
+
+        **Why**: factory cost = (1 + 1) * 3 = $6.  P0 has $20 and only
+        owns colour 0, so buy_factory (index 1) = 1.
+        """
+        state = _make_state()
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_BUY_FACTORY + 1]) == 1
+
+    def test_buy_factory_illegal_when_own_all(self):
+        """P0 already owns all 5 colours — buy_factory masked out.
+
+        **Why**: max factories = 5.  When own_all is True,
+        ``action_type[1]`` must be 0.
+        """
+        state = _make_state(factory_colors=jnp.ones((2, 5), dtype=jnp.int32))
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_BUY_FACTORY + 1]) == 0
+
+    def test_buy_factory_illegal_when_cant_afford(self):
+        """P0 has $1 — cannot afford the cheapest factory ($3).
+
+        **Why**: ``cash >= factory_cost`` is False, so the mask must be 0.
+        """
+        state = _make_state(cash=jnp.array([1, 20], dtype=jnp.int32))
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_BUY_FACTORY + 1]) == 0
+
+    def test_buy_warehouse_legal(self):
+        """P0 has 1 warehouse and $20 — can buy a 2nd ($4).
+
+        **Why**: not at max, cash >= 4 → mask = 1.
+        """
+        state = _make_state()
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_BUY_WAREHOUSE + 1]) == 1
+
+    def test_buy_warehouse_illegal_at_max(self):
+        """Already at 5 warehouses — mask must be 0."""
+        state = _make_state(
+            warehouse_count=jnp.array([MAX_WAREHOUSES_PER_PLAYER, 1], dtype=jnp.int32),
+        )
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_BUY_WAREHOUSE + 1]) == 0
+
+    def test_produce_legal(self):
+        """P0 has a factory, space, and supply — produce must be legal.
+
+        **Why**: not produced yet this turn, factory store has 1 of 2
+        capacity, colour-0 supply > 0.
+        """
+        state = _make_state()
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_PRODUCE + 1]) == 1
+
+    def test_produce_illegal_when_already_produced(self):
+        """Already produced this turn — mask must be 0."""
+        state = _make_state(produced_this_turn=jnp.array(1, dtype=jnp.int32))
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_PRODUCE + 1]) == 0
+
+    def test_produce_illegal_when_storage_full(self):
+        """Factory store at capacity — mask must be 0."""
+        full = jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32).at[0, 0, 0].set(2)
+        state = _make_state(factory_store=full)
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_PRODUCE + 1]) == 0
+
+    def test_buy_from_factory_store_legal(self):
+        """P1 has affordable stock and P0 has harbour space.
+
+        **Why**: P1's factory store has colour 1 at slot 4 ($5), P0
+        has $20 and an empty harbour (capacity 1).
+        """
+        state = _make_state()
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_BUY_FROM_FACTORY_STORE + 1]) == 1
+
+    def test_buy_from_factory_store_illegal_harbour_full(self):
+        """P0's harbour is full — cannot buy more."""
+        full_harbour = jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32).at[0, 3, 0].set(1)
+        state = _make_state(harbour_store=full_harbour)
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_BUY_FROM_FACTORY_STORE + 1]) == 0
+
+    def test_move_load_legal(self):
+        """P1 has affordable harbour stock and P0 has ship space.
+
+        **Why**: need to give P1 harbour stock for this test — default
+        state has none, so mask = 0 by default.  We create harbour stock.
+        """
+        harbour = jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32).at[1, 2, 3].set(1)
+        state = _make_state(harbour_store=harbour)
+        masks = self._masks(state)
+        # P1 has colour 2 at slot 3 ($4), P0 has $20 + empty ship (5 cap)
+        assert int(masks["action_type"][ACTION_MOVE_LOAD + 1]) == 1
+
+    def test_move_sea_legal_when_in_harbour(self):
+        """Ship in harbour — move to sea must be legal."""
+        state = _make_state(
+            ship_location=jnp.array([LOCATION_HARBOUR_OFFSET + 1, LOCATION_OPEN_SEA], dtype=jnp.int32),
+        )
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_MOVE_SEA + 1]) == 1
+
+    def test_move_sea_illegal_when_at_sea(self):
+        """Ship already at sea — move_sea is redundant but still legal (idempotent)."""
+        state = _make_state()
+        masks = self._masks(state)
+        # Currently in_harbour is False, but the handler is idempotent.
+        # The mask allows it since the condition is ``in_harbour.astype(jnp.int32)``.
+        # With ship at sea, in_harbour = False → mask = 0.
+        assert int(masks["action_type"][ACTION_MOVE_SEA + 1]) == 0
+
+    def test_auction_legal(self):
+        """Ship at sea with cargo — auction must be legal."""
+        ship = jnp.array([[1, 0, 0, 0, 0], [0, 0, 0, 0, 0]], dtype=jnp.int32)
+        state = _make_state(ship_contents=ship)
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_MOVE_AUCTION + 1]) == 1
+
+    def test_auction_illegal_empty_ship(self):
+        """No cargo — auction not allowed."""
+        state = _make_state()
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_MOVE_AUCTION + 1]) == 0
+
+    def test_pass_always_legal(self):
+        """Pass is unconditionally legal."""
+        state = _make_state()
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_PASS + 1]) == 1
+
+    def test_take_loan_legal(self):
+        """Loans < 2 — take_loan must be legal."""
+        state = _make_state()
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_TAKE_LOAN + 1]) == 1
+
+    def test_take_loan_illegal_at_max(self):
+        """Already 2 loans — take_loan masked out."""
+        state = _make_state(loans=jnp.array([2, 0], dtype=jnp.int32))
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_TAKE_LOAN + 1]) == 0
+
+    def test_repay_loan_legal(self):
+        """Has a loan and enough cash ($40) — repay must be legal."""
+        state = _make_state(cash=jnp.array([40, 20], dtype=jnp.int32),
+                            loans=jnp.array([1, 0], dtype=jnp.int32))
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_REPAY_LOAN + 1]) == 1
+
+    def test_repay_loan_illegal_no_loan(self):
+        """No outstanding loans — repay masked out."""
+        state = _make_state()
+        masks = self._masks(state)
+        assert int(masks["action_type"][ACTION_REPAY_LOAN + 1]) == 0
+
+    # ── Colour mask in parallel mode ───────────────────────────────────
+
+    def test_color_mask_shows_buyable_colours(self):
+        """P0 owns colour 0 — colours 1-4 should be buyable.
+
+        **Why**: ``not_owned`` is True for colours 1-4, cost $6 ≤ $20.
+        Indices 2-5 (= colours 1-4) should be 1, index 1 (= colour 0) = 0.
+        """
+        state = _make_state()
+        masks = self._masks(state)
+        cm = masks["color"]
+        assert int(cm[0]) == 0, "no-op masked out"
+        assert int(cm[1]) == 0, "colour 0 already owned"
+        assert int(cm[2]) == 1, "colour 1 buyable"
+        assert int(cm[3]) == 1, "colour 2 buyable"
+        assert int(cm[4]) == 1, "colour 3 buyable"
+        assert int(cm[5]) == 1, "colour 4 buyable"
+
+    def test_color_mask_all_owned(self):
+        """All colours owned — no colour options (all = 0 except no‑op)."""
+        state = _make_state(factory_colors=jnp.ones((2, 5), dtype=jnp.int32))
+        masks = self._masks(state)
+        cm = masks["color"]
+        for i in range(1, 6):
+            assert int(cm[i]) == 0, f"colour {i - 1} should be unselectable"
+
+    # ── Opponent mask in parallel mode ────────────────────────────────
+
+    def test_opponent_mask_parallel(self):
+        """P1 has factory stock — opponent must be selectable.
+
+        **Why**: the opponent mask shows opponents with affordable stock
+        at index 1 (P1).  P1 has colour-1 at slot 4 ($5 ≤ $20).
+        """
+        state = _make_state()
+        masks = self._masks(state)
+        om = masks["opponent"]
+        assert int(om[0]) == 0, "no-op masked out"
+        assert int(om[1]) == 1, "P1 has affordable stock"
+
+    # ── Purchase mask in parallel mode ─────────────────────────────────
+
+    def test_purchase_mask_parallel_all_values(self):
+        """In parallel mode all value slots 1-30 + STOP (31) are valid.
+
+        **Why**: the purchase head is a generic value slot — the
+        actual meaning depends on which action is chosen.  So all
+        non‑no‑op slots are available.
+        """
+        state = _make_state()
+        masks = self._masks(state)
+        pm = masks["purchase"]
+        assert int(pm[0]) == 0, "no-op masked out"
+        for i in range(1, 31):
+            assert int(pm[i]) == 1, f"purchase slot {i} should be valid"
+        assert int(pm[31]) == 1, "STOP always valid"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestActionMasksShopping:
+    """Verify masks during **shopping continuation** (``shopping_active = 1``).
+
+    Two sub‑modes exist:
+    - **Factory store** (``shopping_action_type == 3``): colour + harbour
+      price ($2-$6) heads active.
+    - **Ship load** (``shopping_action_type == 4``): colour + buy‑signal
+      head active.
+    """
+
+    @staticmethod
+    def _masks(state, params=None):
+        func_env = _make_func_env()
+        if params is None:
+            params = _make_params()
+        return func_env._action_masks(state, params)
+
+    def _shopping_state(self, action_type, target=1):
+        """Create a state mid‑shopping with given target opponent."""
+        harbour_store = jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32)
+        factory_store = jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32)
+        if action_type == ACTION_BUY_FROM_FACTORY_STORE:
+            # P0 buys from P1 factory: put stock for P1
+            factory_store = factory_store.at[1, 1, 4].set(1)  # colour 1, slot 4 ($5)
+        else:
+            # MOVE_LOAD: P1 harbour stock
+            harbour_store = harbour_store.at[1, 2, 3].set(1)  # colour 2, slot 3 ($4)
+        return _make_state(
+            shopping_active=jnp.array(1, dtype=jnp.int32),
+            shopping_action_type=jnp.array(action_type, dtype=jnp.int32),
+            shopping_target=jnp.array(target, dtype=jnp.int32),
+            factory_store=factory_store,
+            harbour_store=harbour_store,
+        )
+
+    def test_forced_no_op_on_action_type(self):
+        """Action type head MUST be forced to no‑op only during shopping.
+
+        **Why**: the action type was already selected in step 1; the
+        agent should not re‑select it.  Only index 0 = 1.
+        """
+        state = self._shopping_state(ACTION_BUY_FROM_FACTORY_STORE)
+        masks = self._masks(state)
+        at = masks["action_type"]
+        assert int(at[0]) == 1, "no-op forced"
+        for i in range(1, len(at)):
+            assert int(at[i]) == 0, f"action_type[{i}] should be forced off"
+
+    def test_forced_no_op_on_opponent(self):
+        """Opponent head forced to no‑op during shopping.
+
+        **Why**: the opponent was locked in step 1 via ``shopping_target``.
+        """
+        state = self._shopping_state(ACTION_BUY_FROM_FACTORY_STORE)
+        masks = self._masks(state)
+        om = masks["opponent"]
+        assert int(om[0]) == 1, "no-op forced"
+        for i in range(1, len(om)):
+            assert int(om[i]) == 0
+
+    def test_forced_no_op_on_price_slot(self):
+        """Price-slot head forced to no‑op during shopping.
+
+        **Why**: the cheapest source slot is auto‑selected by the
+        environment; the harbour price comes from the **purchase** head.
+        """
+        state = self._shopping_state(ACTION_BUY_FROM_FACTORY_STORE)
+        masks = self._masks(state)
+        sm = masks["price_slot"]
+        assert int(sm[0]) == 1
+        for i in range(1, len(sm)):
+            assert int(sm[i]) == 0
+
+    def test_colour_active_factory_shop(self):
+        """Colour head shows available colours from the target opponent.
+
+        **Why**: P1 factory has colour 1 at slot 4 → only colour 1 should
+        be selectable (index 2), others masked out.
+        """
+        state = self._shopping_state(ACTION_BUY_FROM_FACTORY_STORE)
+        masks = self._masks(state)
+        cm = masks["color"]
+        assert int(cm[0]) == 0, "no-op masked out on active head"
+        assert int(cm[2]) == 1, "colour 1 available from P1 factory"
+        assert int(cm[1]) == 0, "colour 0 not available"
+        assert int(cm[3]) == 0, "colour 2 not available"
+
+    def test_colour_active_ship_shop(self):
+        """Colour head shows available colours from target's harbour.
+
+        **Why**: P1 harbour has colour 2 at slot 3 → index 3 (= colour 2) = 1.
+        """
+        state = self._shopping_state(ACTION_MOVE_LOAD)
+        masks = self._masks(state)
+        cm = masks["color"]
+        assert int(cm[0]) == 0, "no-op masked out"
+        assert int(cm[3]) == 1, "colour 2 available from P1 harbour"
+        assert int(cm[2]) == 0, "colour 1 not available"
+
+    def test_purchase_factory_shop_harbour_prices(self):
+        """During factory shopping purchase head shows $2-$6 + STOP.
+
+        **Why**: indices 1-5 = harbour $2-$6, index 31 = STOP.
+        All other indices (6-30) must be 0.
+        """
+        state = self._shopping_state(ACTION_BUY_FROM_FACTORY_STORE)
+        masks = self._masks(state)
+        pm = masks["purchase"]
+        assert int(pm[0]) == 0, "no-op masked out"
+        for i in range(1, 6):
+            assert int(pm[i]) == 1, f"harbour price index {i} should be valid"
+        for i in range(6, 31):
+            assert int(pm[i]) == 0, f"index {i} should be masked"
+        assert int(pm[31]) == 1, "STOP valid"
+
+    def test_purchase_ship_shop_buy_or_stop(self):
+        """During ship shopping purchase head shows only 'buy' (1) + STOP (31).
+
+        **Why**: containers go to ship — no harbour price needed.
+        Index 1 = "buy this colour", index 31 = STOP.
+        """
+        state = self._shopping_state(ACTION_MOVE_LOAD)
+        masks = self._masks(state)
+        pm = masks["purchase"]
+        assert int(pm[0]) == 0, "no-op masked out"
+        assert int(pm[1]) == 1, "buy signal"
+        for i in range(2, 31):
+            assert int(pm[i]) == 0, f"index {i} should be masked (ship shop)"
+        assert int(pm[31]) == 1, "STOP valid"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestActionMasksProduce:
+    """Verify masks during **produce continuation** (``produce_active = 1``).
+
+    Only ``colour`` and ``price_slot`` heads are active.  All others are
+    forced to no‑op only.
+    """
+
+    @staticmethod
+    def _masks(state, params=None):
+        func_env = _make_func_env()
+        if params is None:
+            params = _make_params()
+        return func_env._action_masks(state, params)
+
+    def _produce_state(self):
+        """State mid‑produce with colour 0 and colour 2 pending.
+
+        P0 owns colours 0 and 2; both are pending (= 1 in produce_pending).
+        """
+        return _make_state(
+            produce_active=jnp.array(1, dtype=jnp.int32),
+            produce_pending=jnp.array([1, 0, 1, 0, 0], dtype=jnp.int32),
+            factory_colors=jnp.zeros((2, 5), dtype=jnp.int32).at[0, 0].set(1).at[0, 2].set(1).at[1, 1].set(1),
+        )
+
+    def test_forced_no_op_on_action_type_opponent_purchase(self):
+        """Action type, opponent, and purchase heads forced to no‑op only.
+
+        **Why**: during produce continuation the only decisions are
+        *which factory* (colour) and *at what price* (price_slot).
+        """
+        state = self._produce_state()
+        masks = self._masks(state)
+
+        at = masks["action_type"]
+        assert int(at[0]) == 1, "action_type forced no-op"
+        assert all(int(at[i]) == 0 for i in range(1, len(at)))
+
+        om = masks["opponent"]
+        assert int(om[0]) == 1, "opponent forced no-op"
+        assert all(int(om[i]) == 0 for i in range(1, len(om)))
+
+        pm = masks["purchase"]
+        assert int(pm[0]) == 1, "purchase forced no-op"
+        assert all(int(pm[i]) == 0 for i in range(1, len(pm)))
+
+    def test_colour_shows_pending_factories(self):
+        """Only pending factories (colours 0, 2) are selectable.
+
+        **Why**: ``produce_pending = [1, 0, 1, 0, 0]`` → indices 1 and 3
+        (= colours 0, 2) should be 1.  Colours 1, 3, 4 should be 0.
+        """
+        state = self._produce_state()
+        masks = self._masks(state)
+        cm = masks["color"]
+        assert int(cm[0]) == 0, "no-op masked out on active head"
+        assert int(cm[1]) == 1, "colour 0 pending"
+        assert int(cm[2]) == 0, "colour 1 not owned/not pending"
+        assert int(cm[3]) == 1, "colour 2 pending"
+        assert int(cm[4]) == 0, "colour 3 not owned"
+        assert int(cm[5]) == 0, "colour 4 not owned"
+
+    def test_price_slot_produce_range(self):
+        """Only $1-$4 (indices 1-4) + leave idle (index 5) are valid.
+
+        **Why**: ``PRODUCE_CHOICES = 5`` (4 prices + leave idle).
+        Indices 1-5 must be 1, indices 6-10 must be 0.
+        """
+        state = self._produce_state()
+        masks = self._masks(state)
+        sm = masks["price_slot"]
+        assert int(sm[0]) == 0, "no-op masked out"
+        for i in range(1, 6):  # indices 1-5 = slots 0-4
+            assert int(sm[i]) == 1, f"produce slot {i - 1} should be valid"
+        for i in range(6, 11):
+            assert int(sm[i]) == 0, f"slot {i - 1} should be masked"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestActionMasksAuction:
+    """Verify masks during **auction** (``auction_active = 1``).
+
+    Two sub‑modes:
+    - **Bidding** (current player ≠ seller): action_type locked to
+      AUCTION, purchase shows bid amounts 0..cash.
+    - **Seller decision** (current player == seller): action_type locked,
+      purchase shows reject (0) or accept (1).
+    """
+
+    @staticmethod
+    def _masks(state, params=None):
+        func_env = _make_func_env()
+        if params is None:
+            params = _make_params()
+        return func_env._action_masks(state, params)
+
+    def _auction_state(self, current_player=1, seller=0, cash=20):
+        """State mid‑auction.  Default: P1 is bidding, P0 is seller."""
+        return _make_state(
+            auction_active=jnp.array(1, dtype=jnp.int32),
+            auction_seller=jnp.array(seller, dtype=jnp.int32),
+            auction_cargo=jnp.array([1, 0, 0, 0, 0], dtype=jnp.int32),
+            auction_bids=jnp.array([0, -1, -1, -1], dtype=jnp.int32),  # P0 done, P1 pending
+            current_player=jnp.array(current_player, dtype=jnp.int32),
+            cash=jnp.array([cash, cash], dtype=jnp.int32),
+        )
+
+    def test_action_type_locked_to_auction(self):
+        """Only AUCTION is selectable on the action_type head.
+
+        **Why**: during auction, players cannot take any other action type.
+        Index 7 (= ACTION_MOVE_AUCTION + 1) must be 1, all others —including
+        no‑op (0)— must be 0.  The agent is forced to pick AUCTION.
+        """
+        state = self._auction_state(current_player=1, seller=0)
+        masks = self._masks(state)
+        at = masks["action_type"]
+        assert int(at[ACTION_MOVE_AUCTION + 1]) == 1, "AUCTION should be valid"
+        assert int(at[0]) == 0, "no‑op masked out (AUCTION forced)"
+
+    def test_opponent_color_price_forced_no_op(self):
+        """Colour and price_slot heads forced to no‑op during auction.
+
+        Opponent head is repurposed as direct player index during auction
+        (identifies which player is acting), so it is NOT forced no‑op.
+        """
+        state = self._auction_state()
+        masks = self._masks(state)
+        for key in ("color", "price_slot"):
+            m = masks[key]
+            assert int(m[0]) == 1, f"{key} no-op forced"
+            assert all(int(m[i]) == 0 for i in range(1, len(m))), \
+                f"{key} all non‑no‑op should be masked"
+        # Opponent head: all player indices valid during auction
+        om = masks["opponent"]
+        assert int(om[0]) == 1, "opponent index 0 (P0) valid during auction"
+        assert int(om[1]) == 1, "opponent index 1 (P1) valid during auction"
+
+    def test_purchase_bidding_shows_cash_range(self):
+        """During bidding, purchase head shows $0 bid + $1..cash bids.
+
+        **Why**: index 0 = $0 bid, indices 1..cash = valid bid amounts.
+        STOP (31) must NOT be shown.
+        """
+        state = self._auction_state(current_player=1, seller=0, cash=20)
+        masks = self._masks(state)
+        pm = masks["purchase"]
+        assert int(pm[0]) == 1, "$0 bid valid"
+        for i in range(1, 21):
+            assert int(pm[i]) == 1, f"${i} bid should be valid"
+        for i in range(21, 31):
+            assert int(pm[i]) == 0, f"${i} exceeds cash → masked"
+        assert int(pm[31]) == 0, "STOP not valid during auction"
+
+    def test_purchase_bidding_respects_low_cash(self):
+        """Player has only $5 — bid range must be $0..$5 only."""
+        state = self._auction_state(current_player=1, seller=0, cash=5)
+        masks = self._masks(state)
+        pm = masks["purchase"]
+        assert int(pm[0]) == 1, "$0 bid valid"
+        for i in range(1, 6):
+            assert int(pm[i]) == 1, f"${i} bid valid"
+        for i in range(6, 32):
+            assert int(pm[i]) == 0, f"index {i} should be masked"
+
+    def test_purchase_seller_decision(self):
+        """Seller (P0) sees only reject (index 0) or accept (index 1).
+
+        **Why**: the seller cannot bid — they only decide to accept or
+        reject the highest bid.
+        """
+        state = self._auction_state(current_player=0, seller=0, cash=20)
+        masks = self._masks(state)
+        pm = masks["purchase"]
+        assert int(pm[0]) == 1, "reject ($0) valid"
+        assert int(pm[1]) == 1, "accept valid"
+        for i in range(2, 32):
+            assert int(pm[i]) == 0, f"index {i} should be masked for seller"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestActionMasksTransitions:
+    """Verify that masks change correctly when modes transition."""
+
+    @staticmethod
+    def _masks(state, params=None):
+        func_env = _make_func_env()
+        if params is None:
+            params = _make_params()
+        return func_env._action_masks(state, params)
+
+    def test_parallel_to_produce_transition(self):
+        """Entering produce mode must switch from parallel to produce masks.
+
+        **Why**: before enter‑produce, all heads active (parallel).
+        After, only colour+price_slot active (produce).
+        """
+        state = _make_state()
+        # Parallel
+        p_masks = self._masks(state)
+        assert int(p_masks["action_type"][0]) == 0, "parallel: no‑op masked on action_type"
+        assert int(p_masks["action_type"][ACTION_PRODUCE + 1]) == 1, "parallel: produce legal"
+
+        # After entering produce mode
+        state = state._replace(
+            produce_active=jnp.array(1, dtype=jnp.int32),
+            produce_pending=jnp.array([1, 0, 0, 0, 0], dtype=jnp.int32),
+        )
+        c_masks = self._masks(state)
+        assert int(c_masks["action_type"][0]) == 1, "produce: action_type forced no‑op"
+        assert int(c_masks["color"][0]) == 0, "produce: colour active (no‑op masked)"
+        assert int(c_masks["price_slot"][0]) == 0, "produce: price_slot active"
+
+    def test_parallel_to_shopping_transition(self):
+        """Entering shopping mode must switch from parallel to shopping masks.
+
+        **Why**: after opponent selection, only colour+purchase active.
+        """
+        state = _make_state()
+        # Parallel
+        p_masks = self._masks(state)
+        assert int(p_masks["opponent"][0]) == 0, "parallel: opponent no‑op masked"
+
+        # After entering shopping (factory)
+        state = state._replace(
+            shopping_active=jnp.array(1, dtype=jnp.int32),
+            shopping_action_type=jnp.array(ACTION_BUY_FROM_FACTORY_STORE, dtype=jnp.int32),
+            shopping_target=jnp.array(1, dtype=jnp.int32),
+            factory_store=jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32).at[1, 1, 4].set(1),
+        )
+        s_masks = self._masks(state)
+        assert int(s_masks["action_type"][0]) == 1, "shopping: action_type forced no‑op"
+        assert int(s_masks["opponent"][0]) == 1, "shopping: opponent forced no‑op"
+        assert int(s_masks["color"][0]) == 0, "shopping: colour active"
+        assert int(s_masks["purchase"][0]) == 0, "shopping: purchase active"
+        assert int(s_masks["price_slot"][0]) == 1, "shopping: price_slot forced no‑op"
+
+    def test_parallel_to_auction_transition(self):
+        """Entering auction must lock action_type to AUCTION and show bid mask.
+
+        **Why**: during bidding only AUCTION is legal; purchase shows bids.
+        """
+        state = _make_state()
+        p_masks = self._masks(state)
+        assert int(p_masks["action_type"][ACTION_MOVE_AUCTION + 1]) == 0, \
+            "parallel: auction illegal (no cargo)"
+
+        # After initiating auction (P1 is first bidder)
+        state = state._replace(
+            auction_active=jnp.array(1, dtype=jnp.int32),
+            auction_seller=jnp.array(0, dtype=jnp.int32),
+            auction_cargo=jnp.array([1, 0, 0, 0, 0], dtype=jnp.int32),
+            auction_bids=jnp.array([0, -1, -1, -1], dtype=jnp.int32),
+            current_player=jnp.array(1, dtype=jnp.int32),
+        )
+        a_masks = self._masks(state)
+        assert int(a_masks["action_type"][ACTION_MOVE_AUCTION + 1]) == 1, \
+            "auction: AUCTION forced"
+        assert int(a_masks["action_type"][0]) == 0, \
+            "auction: action_type no‑op masked (AUCTION forced)"
+        assert int(a_masks["purchase"][0]) == 1, \
+            "auction: $0 bid valid"

@@ -954,17 +954,19 @@ class ContainerFunctional(
                                ]),
                                color_mask)
         # Parallel: buy-factory-eligible and domestic-sale-eligible
-        not_owned = state.factory_colors[player] == 0
+        not_owned = state.factory_colors[player] == 0  # (nc,)
+        not_owned6 = jnp.concatenate([jnp.zeros(1, dtype=jnp.bool_), not_owned])  # (nc+1,)
         color_mask = jnp.where(is_produce | is_shopping,
                                color_mask,
-                               jnp.where((~own_all) & not_owned & (cash >= factory_cost),
+                               jnp.where((~own_all) & not_owned6 & (cash >= factory_cost),
                                          jnp.ones((), dtype=jnp.int32), color_mask))
         if params.use_domestic_sale:
             has_color = (jnp.sum(state.factory_store[player], axis=1)
-                         + jnp.sum(state.harbour_store[player], axis=1)) > 0
+                         + jnp.sum(state.harbour_store[player], axis=1)) > 0  # (nc,)
+            has_color6 = jnp.concatenate([jnp.zeros(1, dtype=jnp.bool_), has_color])  # (nc+1,)
             color_mask = jnp.where(is_produce | is_shopping,
                                    color_mask,
-                                   jnp.where(has_color, jnp.ones((), dtype=jnp.int32), color_mask))
+                                   jnp.where(has_color6, jnp.ones((), dtype=jnp.int32), color_mask))
         # Shift to indices 1..nc
         color_mask = jnp.where(is_produce | is_shopping,
                                color_mask,
@@ -1051,10 +1053,15 @@ class ContainerFunctional(
         slot_mask = jnp.where(is_produce, slot_mask.at[NO_OP].set(0), slot_mask)
         pur_mask = jnp.where(is_produce, _noop_only(pur_size), pur_mask)
 
-        # Auction mode: action_type + purchase active
+        # Auction mode: action_type + opponent (bidder) + purchase active
         at_mask = jnp.where(is_auction,
-                            _noop_only(at_size).at[ACTION_MOVE_AUCTION + 1].set(1), at_mask)
-        opp_mask = jnp.where(is_auction, _noop_only(opp_size), opp_mask)
+                            jnp.zeros(at_size, dtype=jnp.int32).at[ACTION_MOVE_AUCTION + 1].set(1), at_mask)
+        # Opponent head is repurposed as direct player index during auction.
+        # All player indices (0..np-1) must be selectable.
+        opp_auction = jnp.zeros(opp_size, dtype=jnp.int32)
+        for i in range(np_):
+            opp_auction = opp_auction.at[i].set(1)
+        opp_mask = jnp.where(is_auction, opp_auction, opp_mask)
         color_mask = jnp.where(is_auction, _noop_only(col_size), color_mask)
         slot_mask = jnp.where(is_auction, _noop_only(slot_size), slot_mask)
 
