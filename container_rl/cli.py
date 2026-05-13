@@ -39,6 +39,11 @@ from container_rl.env.container import (
     HARBOUR_PRICE_CHOICES,
     HARBOUR_PRICE_MAX,
     HARBOUR_PRICE_MIN,
+    HEAD_ACTION_TYPE,
+    HEAD_COLOR,
+    HEAD_OPPONENT,
+    HEAD_PRICE_SLOT,
+    HEAD_PURCHASE,
     LEAVE_IDLE,
     LOCATION_AUCTION_ISLAND,
     LOCATION_HARBOUR_OFFSET,
@@ -46,6 +51,7 @@ from container_rl.env.container import (
     MAX_FACTORIES_PER_PLAYER,
     PRODUCE_CHOICES,
     PRICE_SLOTS,
+    PURCHASE_STOP,
     SHIP_CAPACITY,
     ActionEncoder,
     ContainerJaxEnv,
@@ -491,12 +497,21 @@ def _submenu_produce(
 
     Returns True if the submenu should cancel (user pressed q/ESC).
     """
+    import jax.numpy as jnp
+
     player = int(state.current_player)
     factories = [c for c in range(nc) if int(state.factory_colors[player, c]) > 0]
     if not factories:
         return False
 
     first_purchase = True
+
+    # ── Step 1: enter produce mode ────────────────────────────────────
+    enter_action = jnp.array(
+        [ACTION_PRODUCE + 1, 0, 0, 0, PURCHASE_STOP], dtype=jnp.int32,
+    )
+    obs, reward, term, trunc, info = env.step(enter_action)
+    history.append((env.state, f"P{player + 1}: Enter produce mode", float(reward)))
 
     for color in factories:
         header = f"[bold]Produce [{_cstyle(color)}]{_cname(color, nc)}[/{_cstyle(color)}] — pick a price:[/bold]"
@@ -546,9 +561,9 @@ def _submenu_buy_from_factory(
 ) -> bool:
     """Pick an opponent and buy containers from their factory store.
 
-    Each iteration the user picks a colour; the cheapest available price
-    for that colour is selected automatically.  Loops until the user
-    chooses to stop or no more containers are available.
+    Step 1: select opponent (action_type + opponent heads active).
+    Step 2+: pick a colour + harbour price per container (colour + purchase heads active).
+    Loops until the user chooses to stop or no more containers are available.
     Returns True if the submenu was cancelled before any purchase.
     """
     import jax.numpy as jnp
@@ -561,35 +576,39 @@ def _submenu_buy_from_factory(
 
     opp_idx = _opponent_menu_indices(player, num_players).index(target)
 
+    # ── Step 1: select opponent ───────────────────────────────────────
+    opp_action = jnp.array(
+        [ACTION_BUY_FROM_FACTORY_STORE + 1, opp_idx + 1, 0, 0, PURCHASE_STOP],
+        dtype=jnp.int32,
+    )
+    obs, reward, term, trunc, info = env.step(opp_action)
+    history.append(
+        (env.state, f"P{player + 1}: Buy from P{target + 1}'s factory", float(reward)),
+    )
+
+    if not int(env.state.shopping_active):
+        return False
+
     first_purchase = True
 
     while True:
-        # Build list of available (colour, cheapest_slot) from opponent.
-        available: list[tuple[int, int, int]] = []  # (color, slot, count)
+        # Build list of available colours from opponent.
         factory_store = env.state.factory_store
+        available_colours = set()
         for c in range(nc):
             for s in range(PRICE_SLOTS):
-                cnt = int(factory_store[target, c, s])
-                if cnt > 0:
-                    available.append((c, s, cnt))
+                if int(factory_store[target, c, s]) > 0:
+                    available_colours.add(c)
 
-        if not available:
+        if not available_colours:
             break
 
-        # Group by colour and pick the cheapest slot per colour.
-        cheapest: dict[int, int] = {}  # color -> cheapest slot
-        for c, s, _cnt in available:
-            if c not in cheapest or s < cheapest[c]:
-                cheapest[c] = s
+        color_list = sorted(available_colours)
 
-        # Build menu: one entry per available colour + a "done" option.
-        color_list = sorted(cheapest.keys())
+        # Build menu: one entry per available colour + "Done".
         options = []
         for c in color_list:
-            s = cheapest[c]
-            options.append(
-                f"[{_cstyle(c)}]{_cname(c, nc)}[/{_cstyle(c)}] at [yellow]${s + 1}[/yellow]"
-            )
+            options.append(f"[{_cstyle(c)}]{_cname(c, nc)}[/{_cstyle(c)}]")
         options.append("[bold]Done[/bold]")
         header = f"[bold]Buy from P{target + 1}'s factory — pick a colour:[/bold]"
         choice = _input_choice(options, live, nc, np_, env.state, header=header)
@@ -601,7 +620,6 @@ def _submenu_buy_from_factory(
             break  # "Done"
 
         color = color_list[choice - 1]
-        price_slot = cheapest[color]
 
         # Prompt for harbour store price ($2-$6).
         header2 = (
@@ -618,40 +636,30 @@ def _submenu_buy_from_factory(
             if first_purchase:
                 return True
             continue
-        harbour_slot = HARBOUR_PRICE_MIN + hchoice - 1
+        harbour_dollars = HARBOUR_PRICE_MIN + hchoice  # $2-$6
 
-        # Build multi-head action directly so HEAD_PRICE_SLOT carries
-        # the harbour price (encoder puts it in HEAD_PURCHASE).
-        action = jnp.array(
-            [
-                ACTION_BUY_FROM_FACTORY_STORE,
-                opp_idx,
-                0,
-                harbour_slot,
-                color * PRICE_SLOTS + price_slot,
-            ],
-            dtype=jnp.int32,
+        # ── Step 2+: colour + harbour price ────────────────────────────
+        # purchase head: index 1=$2, 2=$3, 3=$4, 4=$5, 5=$6
+        harbour_idx = harbour_dollars - 1  # 1..5
+        purchase_action = jnp.array(
+            [0, 0, color + 1, 0, harbour_idx], dtype=jnp.int32,
         )
-        obs, reward, term, trunc, info = env.step(action)
+        obs, reward, term, trunc, info = env.step(purchase_action)
         first_purchase = False
 
         desc = (
             f"P{player + 1}: Buy {_cname(color, nc)} "
-            f"from P{target + 1}'s factory at ${price_slot + 1}, "
-            f"harbour price ${harbour_slot + 1}"
+            f"from P{target + 1}'s factory, harbour price ${harbour_dollars}"
         )
-
         history.append((env.state, desc, float(reward)))
 
-        # Shopping may have auto-finished (no more space/cash/stock)
         if not int(env.state.shopping_active):
             return False
 
     # Send STOP if still shopping so the turn can advance
     if int(env.state.shopping_active) > 0:
         stop_action = jnp.array(
-            [ACTION_BUY_FROM_FACTORY_STORE, 0, 0, 0, nc * PRICE_SLOTS],
-            dtype=jnp.int32,
+            [0, 0, 0, 0, PURCHASE_STOP], dtype=jnp.int32,
         )
         obs, reward, term, trunc, info = env.step(stop_action)
         history.append((env.state, f"P{player + 1}: Stop buying", float(reward)))
@@ -665,9 +673,9 @@ def _submenu_move_load(
 ) -> bool:
     """Pick an opponent and load containers from their harbour store onto your ship.
 
-    Each iteration the user picks a colour; the cheapest available price
-    for that colour is selected automatically.  Loops until the user
-    chooses to stop or no more containers are available.
+    Step 1: select opponent (action_type + opponent heads active).
+    Step 2+: pick a colour per container (colour head active; purchase=1 for buy, 31 for STOP).
+    Loops until the user chooses to stop or no more containers are available.
     Returns True if the submenu was cancelled before any purchase.
     """
     import jax.numpy as jnp
@@ -680,32 +688,37 @@ def _submenu_move_load(
 
     opp_idx = _opponent_menu_indices(player, num_players).index(target)
 
+    # ── Step 1: select opponent ───────────────────────────────────────
+    opp_action = jnp.array(
+        [ACTION_MOVE_LOAD + 1, opp_idx + 1, 0, 0, PURCHASE_STOP],
+        dtype=jnp.int32,
+    )
+    obs, reward, term, trunc, info = env.step(opp_action)
+    history.append(
+        (env.state, f"P{player + 1}: Move to P{target + 1}'s harbour", float(reward)),
+    )
+
+    if not int(env.state.shopping_active):
+        return False
+
     first_purchase = True
 
     while True:
-        available: list[tuple[int, int, int]] = []  # (color, slot, count)
         harbour_store = env.state.harbour_store
+        available_colours = set()
         for c in range(nc):
             for s in range(PRICE_SLOTS):
-                cnt = int(harbour_store[target, c, s])
-                if cnt > 0:
-                    available.append((c, s, cnt))
+                if int(harbour_store[target, c, s]) > 0:
+                    available_colours.add(c)
 
-        if not available:
+        if not available_colours:
             break
 
-        cheapest: dict[int, int] = {}
-        for c, s, _cnt in available:
-            if c not in cheapest or s < cheapest[c]:
-                cheapest[c] = s
+        color_list = sorted(available_colours)
 
-        color_list = sorted(cheapest.keys())
         options = []
         for c in color_list:
-            s = cheapest[c]
-            options.append(
-                f"[{_cstyle(c)}]{_cname(c, nc)}[/{_cstyle(c)}] at [yellow]${s + 1}[/yellow]"
-            )
+            options.append(f"[{_cstyle(c)}]{_cname(c, nc)}[/{_cstyle(c)}]")
         options.append("[bold]Done[/bold]")
         header = f"[bold]Load from P{target + 1}'s harbour — pick a colour:[/bold]"
         choice = _input_choice(options, live, nc, np_, env.state, header=header)
@@ -717,34 +730,28 @@ def _submenu_move_load(
             break
 
         color = color_list[choice - 1]
-        price_slot = cheapest[color]
 
-        action = jnp.array(
-            [
-                ACTION_MOVE_LOAD,
-                opp_idx,
-                0,
-                0,
-                color * PRICE_SLOTS + price_slot,
-            ],
-            dtype=jnp.int32,
+        # ── Step 2+: colour + "buy" signal ─────────────────────────────
+        # purchase head: index 1 = buy, index 31 = STOP
+        buy_action = jnp.array(
+            [0, 0, color + 1, 0, 1], dtype=jnp.int32,
         )
-        obs, reward, term, trunc, info = env.step(action)
+        obs, reward, term, trunc, info = env.step(buy_action)
         first_purchase = False
 
         desc = (
             f"P{player + 1}: Load {_cname(color, nc)} "
-            f"from P{target + 1}'s harbour at ${price_slot + 1}"
+            f"from P{target + 1}'s harbour"
         )
         history.append((env.state, desc, float(reward)))
 
         if not int(env.state.shopping_active):
             return False
 
+    # Send STOP if still shopping
     if int(env.state.shopping_active) > 0:
         stop_action = jnp.array(
-            [ACTION_MOVE_LOAD, 0, 0, 0, nc * PRICE_SLOTS],
-            dtype=jnp.int32,
+            [0, 0, 0, 0, PURCHASE_STOP], dtype=jnp.int32,
         )
         obs, reward, term, trunc, info = env.step(stop_action)
         history.append((env.state, f"P{player + 1}: Stop loading", float(reward)))
@@ -982,7 +989,7 @@ def play(
                         if bid_str is None:
                             bid_str = 0
                         bid_action = jnp.array(
-                            [ACTION_MOVE_AUCTION, 0, 0, 0, bid_str],
+                            [ACTION_MOVE_AUCTION + 1, 0, 0, 0, bid_str],
                             dtype=jnp.int32,
                         )
                         obs, reward, term, trunc, info = env.step(bid_action)
@@ -1004,7 +1011,7 @@ def play(
                             choice = 1  # default accept
                         accept = 1 if choice == 1 else 0
                         dec_action = jnp.array(
-                            [ACTION_MOVE_AUCTION, 0, 0, 0, accept],
+                            [ACTION_MOVE_AUCTION + 1, 0, 0, 0, accept],
                             dtype=jnp.int32,
                         )
                         obs, reward, term, trunc, info = env.step(dec_action)
@@ -1029,7 +1036,7 @@ def play(
                                 bid_amount = py_random.randint(0, max(0, max_bid))
                                 desc = f"P{current + 1}: bid ${bid_amount}"
                             bid_action = jnp.array(
-                                [ACTION_MOVE_AUCTION, 0, 0, 0, bid_amount],
+                                [ACTION_MOVE_AUCTION + 1, 0, 0, 0, bid_amount],
                                 dtype=jnp.int32,
                             )
                             obs, reward, term, trunc, info = env.step(bid_action)

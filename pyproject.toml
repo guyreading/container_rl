@@ -37,6 +37,8 @@ dev = [
     { include-group = "test" },
     { include-group = "typecheck" },
     "container-rl",
+    "ipykernel>=7.2.0",
+    "jupyterlab>=4.5.7",
 ]
 lint = [
     "ruff",
