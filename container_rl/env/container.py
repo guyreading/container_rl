@@ -416,7 +416,31 @@ class ContainerParams:
 class ContainerFunctional(
     FuncEnv[EnvState, jax.Array, int, float, bool, RenderStateType, ContainerParams]
 ):
-    """Container game as a functional JAX environment."""
+    """Pure JAX implementation of the Container board game.
+
+    This is the **functional core** of the environment.  It implements the
+    Gymnasium ``FuncEnv`` interface with pure functions:
+
+    * ``transition(state, action, key, params) → state`` — apply one action
+    * ``observation(state, key, params) → obs`` — build the observation vector
+    * ``reward(state, action, next_state, key, params) → reward`` — compute the reward
+    * ``terminal(state, key, params) → bool`` — check for episode end
+
+    All state is stored in ``EnvState``, an immutable JAX ``NamedTuple`` of
+    ``jax.Array`` fields.  Every helper (action handlers, mask computation,
+    turn advancement) is written as a pure function of state → state, making
+    the entire pipeline ``jax.jit``-compatible for GPU‑accelerated
+    vectorised rollouts.
+
+    Use this class directly when you need **low‑level access** to the
+    functional API — for example, unit‑testing individual action handlers
+    (``_action_buy_factory``, ``_shopping_step``, …) or calling
+    ``_action_masks`` to inspect per‑head validity vectors.
+
+    For training with Stable‑Baselines3 or interactive play, wrap it in
+    ``ContainerJaxEnv`` which adds the standard Gymnasium ``step()/reset()``
+    interface and applies ``jax.jit`` automatically.
+    """
 
     metadata = {
         "render_modes": ["rgb_array"],
@@ -1958,7 +1982,33 @@ class ContainerFunctional(
 # ============================================================================
 
 class ContainerJaxEnv(FunctionalJaxEnv, EzPickle):
-    """Gymnasium wrapper for ContainerFunctional."""
+    """Standard Gymnasium ``Env`` wrapper around ``ContainerFunctional``.
+
+    This class provides the familiar Gymnasium API:
+
+    * ``reset() → (obs, info)`` — initialise a new episode
+    * ``step(action) → (obs, reward, terminated, truncated, info)`` — take one action
+
+    Internally it delegates to ``ContainerFunctional.transition()`` and
+    ``ContainerFunctional.observation()``, applying ``jax.jit`` to the
+    functional env for automatic JIT compilation and GPU acceleration.
+
+    **When to use this class:**
+    * Training — pass to ``MaskablePPO`` or any sb3 / Gymnasium trainer.
+    * Interactive play — the TUI (``cli.py``) uses this so it can call
+      ``env.step()`` without worrying about the functional internals.
+    * Integration tests — exercise the full ``step()`` / ``reset()`` cycle.
+
+    **When to use ``ContainerFunctional`` directly instead:**
+    * Unit‑testing individual action handlers or mask computation.
+    * Debugging the functional pipeline without the Gymnasium wrapper
+      overhead.
+    * In‑process vectorised rollout loops that need raw access to state.
+
+    ``EzPickle`` is mixed in so the env can be serialised for
+    ``stable_baselines3``'s ``make_vec_env`` which pickles copies across
+    subprocesses.
+    """
 
     metadata = {"render_modes": ["rgb_array"], "render_fps": 50, "jax": True}
 
