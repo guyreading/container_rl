@@ -13,15 +13,21 @@ import (
 	"github.com/charmbracelet/ssh"
 	"github.com/charmbracelet/wish"
 	"github.com/creack/pty"
+	gossh "golang.org/x/crypto/ssh"
 
 	"github.com/guyreading/container-rl-ssh/internal/auth"
 	"github.com/guyreading/container-rl-ssh/internal/db"
 )
 
-func pythonMiddleware(keys *db.KeyStore, gameAddr string) wish.Middleware {
+func pythonMiddleware(keys *db.KeyStore, gameAddr string, maintainerToken string) wish.Middleware {
 	return func(next ssh.Handler) ssh.Handler {
 		return func(s ssh.Session) {
 			defer next(s)
+
+			if len(s.Command()) > 0 && s.Command()[0] == "maintainer" {
+				launchMaintainer(s, keys, gameAddr, maintainerToken)
+				return
+			}
 
 			ctx := s.Context()
 			authStatus, _ := ctx.Value(auth.CtxAuthStatus).(auth.AuthStatus)
@@ -205,4 +211,64 @@ func findPython() string {
 		}
 	}
 	return "/usr/bin/python3"
+}
+
+func launchMaintainer(s ssh.Session, keys *db.KeyStore, gameAddr string, token string) {
+	if token == "" {
+		io.WriteString(s, "Maintainer mode is not configured on this server.\r\n")
+		s.Exit(1)
+		return
+	}
+
+	pk := s.PublicKey()
+	if pk == nil {
+		io.WriteString(s, "SSH key required for maintainer access.\r\n")
+		s.Exit(1)
+		return
+	}
+	encoded := strings.TrimSpace(string(gossh.MarshalAuthorizedKey(pk)))
+	if keys.Lookup(encoded) == nil {
+		io.WriteString(s, "Your SSH key is not registered.\r\n")
+		s.Exit(1)
+		return
+	}
+
+	ptyReq, winCh, isPty := s.Pty()
+	if !isPty {
+		io.WriteString(s, "Terminal required (-t flag).\r\n")
+		s.Exit(1)
+		return
+	}
+
+	host, port := parseAddr(gameAddr)
+	venvPython := findPython()
+	cmd := exec.Command(venvPython, "-m", "container_rl.client.maintainer",
+		"--host", host,
+		"--port", port,
+		"--token", token,
+	)
+	cmd.Env = append(os.Environ(),
+		"TERM="+ptyReq.Term,
+		"PYTHONUNBUFFERED=1",
+	)
+
+	f, err := pty.Start(cmd)
+	if err != nil {
+		fmt.Fprintf(s, "\r\nFailed to start maintainer: %s\r\n", err)
+		return
+	}
+	defer f.Close()
+
+	setWinsize(f, ptyReq.Window.Width, ptyReq.Window.Height)
+
+	go func() {
+		for win := range winCh {
+			setWinsize(f, win.Width, win.Height)
+		}
+	}()
+
+	go io.Copy(f, s)
+	io.Copy(s, f)
+
+	cmd.Wait()
 }

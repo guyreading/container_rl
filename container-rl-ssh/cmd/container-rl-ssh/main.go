@@ -15,6 +15,7 @@ func main() {
 	hostKeyDir := flag.String("host-key-dir", "./ssh_host_keys", "Host key directory")
 	keysPath := flag.String("keys", "ssh_keys.json", "SSH keys JSON file")
 	gameAddr := flag.String("game-addr", "127.0.0.1:9876", "Python game server address")
+	maintainerToken := flag.String("maintainer-token", "", "Token for maintainer access")
 	flag.Parse()
 
 	log.SetLevel(log.InfoLevel)
@@ -26,10 +27,11 @@ func main() {
 	fmt.Fprintf(os.Stderr, "  Keys: %s\n", *keysPath)
 
 	if err := server.Run(server.Config{
-		ListenAddr: *listenAddr,
-		HostKeyDir: *hostKeyDir,
-		KeysPath:   *keysPath,
-		GameAddr:   *gameAddr,
+		ListenAddr:      *listenAddr,
+		HostKeyDir:      *hostKeyDir,
+		KeysPath:        *keysPath,
+		GameAddr:        *gameAddr,
+		MaintainerToken: *maintainerToken,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %s\n", err)
 		os.Exit(1)

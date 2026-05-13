@@ -13,10 +13,11 @@ import (
 )
 
 type Config struct {
-	ListenAddr string
-	HostKeyDir string
-	KeysPath   string
-	GameAddr   string
+	ListenAddr      string
+	HostKeyDir      string
+	KeysPath        string
+	GameAddr        string
+	MaintainerToken string
 }
 
 func Run(cfg Config) error {
@@ -42,7 +43,7 @@ func Run(cfg Config) error {
 		wish.WithPublicKeyAuth(authHandlers.PublicKeyHandler),
 		wish.WithPasswordAuth(authHandlers.PasswordHandler),
 		wish.WithMiddleware(
-			pythonMiddleware(keys, cfg.GameAddr),
+			pythonMiddleware(keys, cfg.GameAddr, cfg.MaintainerToken),
 		),
 	)
 	if err != nil {
