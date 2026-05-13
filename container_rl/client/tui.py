@@ -505,6 +505,68 @@ def _update_state_from_server(live, nc, np_):
     return STATE
 
 
+# ── final scores ──────────────────────────────────────────────────────────
+
+def _show_final_scores(state, nc, np_):
+    """Show leaderboard and score breakdown at the end of the game."""
+    players = sorted(
+        [(p, _net_worth(state, p, nc)) for p in range(np_)],
+        key=lambda x: x[1], reverse=True,
+    )
+
+    # Leaderboard
+    lb = Table(title="[bold]🏆 Final Scores[/bold]", border_style="bold yellow", expand=True)
+    lb.add_column("Rank", style="dim", width=5, justify="center")
+    lb.add_column("Player", style="bold")
+    lb.add_column("Score", style="bold green", justify="right")
+    for rank, (p, total) in enumerate(players, 1):
+        marker = ["🥇", "🥈", "🥉"][rank - 1] if rank <= 3 else f"  {rank}"
+        name = PLAYER_NAMES.get(p, f"Player {p+1}")
+        lb.add_row(marker, name, f"${total}")
+
+    # Breakdown table
+    bt = Table(title="Score Breakdown", border_style="dim blue", expand=True)
+    bt.add_column("Player", style="bold")
+    bt.add_column("Cash", justify="right")
+    bt.add_column("Harbour Store", justify="right")
+    bt.add_column("Ship ($3 ea)", justify="right")
+    bt.add_column("Island", justify="right")
+    bt.add_column("Loans", justify="right")
+    bt.add_column("Total", style="bold green", justify="right")
+
+    for p, _ in players:
+        name = PLAYER_NAMES.get(p, f"Player {p+1}")
+        cash = int(state.cash[p])
+        hv = sum((s + 1) * int(state.harbour_store[p, c, s]) for c in range(nc) for s in range(PRICE_SLOTS))
+        sv = sum(3 for c in state.ship_contents[p] if int(c) > 0)
+        sec = int(state.secret_value_color[p])
+        iv = 0
+        for c in range(nc):
+            cnt = int(state.island_store[p, c])
+            if cnt > 0:
+                has_all = all(int(state.island_store[p, cc]) > 0 for cc in range(nc))
+                base = 10 if (c == sec and has_all) else (5 if c == sec else 2)
+                iv += base * cnt
+        loans = int(state.loans[p])
+        total = cash + hv + sv + iv - loans * 11
+        bt.add_row(
+            name,
+            f"${cash}",
+            f"${hv}",
+            f"${sv}",
+            f"${iv}",
+            f"[red]-${loans * 11}[/red]" if loans > 0 else "$0",
+            f"[bold green]${total}[/bold green]",
+        )
+
+    console.clear()
+    console.print(lb)
+    console.print()
+    console.print(bt)
+    console.print()
+    console.print("[dim]Press any key to exit…[/dim]")
+
+
 # ── gameplay loop ────────────────────────────────────────────────────────
 
 def _gameplay():
@@ -539,7 +601,9 @@ def _gameplay():
             FEEDBACK = ""
 
             if go:
-                _key(3); return
+                _show_final_scores(st, NUM_COLORS, NUM_PLAYERS)
+                _key(None)
+                return
 
             # ── auction mode ──
             if ac:
