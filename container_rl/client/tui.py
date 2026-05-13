@@ -601,7 +601,23 @@ def _gameplay():
                 cancelled = _submenu_buy_from_factory(live, st, NUM_COLORS, NUM_PLAYERS)
             elif atype == ACTION_MOVE_LOAD:
                 cancelled = _submenu_move_load(live, st, NUM_COLORS, NUM_PLAYERS)
-            elif atype in (ACTION_BUY_WAREHOUSE,ACTION_MOVE_SEA,ACTION_MOVE_AUCTION,ACTION_PASS,ACTION_TAKE_LOAN,ACTION_REPAY_LOAN):
+            elif atype == ACTION_MOVE_AUCTION:
+                ship_loc = int(st.ship_location[PLAYER_INDEX])
+                if ship_loc != LOCATION_OPEN_SEA:
+                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                        "[yellow]Can only go to auction from Open Sea.[/yellow]", PLAYER_INDEX))
+                    live.refresh(); _time.sleep(1.2); cancelled = True
+                else:
+                    aidx = encoder.encode(atype, {})
+            elif atype == ACTION_MOVE_SEA:
+                ship_loc = int(st.ship_location[PLAYER_INDEX])
+                if ship_loc == LOCATION_OPEN_SEA:
+                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                        "[yellow]Already in Open Sea.[/yellow]", PLAYER_INDEX))
+                    live.refresh(); _time.sleep(1.2); cancelled = True
+                else:
+                    aidx = encoder.encode(atype, {})
+            elif atype in (ACTION_BUY_WAREHOUSE, ACTION_PASS, ACTION_TAKE_LOAN, ACTION_REPAY_LOAN):
                 aidx = encoder.encode(atype, {})
 
             if cancelled: continue
