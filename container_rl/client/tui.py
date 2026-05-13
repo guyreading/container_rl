@@ -423,7 +423,7 @@ def _submenu_buy_factory(live, state, nc, np_):
 
 # ── state polling ────────────────────────────────────────────────────────
 
-def _wait_for_state(live, nc, np_, timeout=5.0):
+def _wait_for_state(live, nc, np_, timeout=10.0):
     global STATE, STATE_META, FEEDBACK
     deadline = _time.time()+timeout
     while _time.time()<deadline:
@@ -440,12 +440,13 @@ def _wait_for_state(live, nc, np_, timeout=5.0):
                     FEEDBACK += "  [bold red]GAME OVER[/bold red]"
             elif t == "error":
                 FEEDBACK = f"[red]{p.get('message','')}[/red]"
+                return STATE  # return immediately on error to show it
             elif t == "disconnected":
                 STATE = None
                 return STATE
         live.update(_render(STATE, nc, np_, "Waiting for server…", PLAYER_INDEX))
         live.refresh()
-        _time.sleep(0.05)
+        _time.sleep(0.1)
     return STATE
 
 def _update_state_from_server(live, nc, np_):
@@ -525,7 +526,7 @@ def _gameplay():
                         live.update(_render(STATE, NUM_COLORS, NUM_PLAYERS,
                                             "[dim]Auction in progress…[/dim]", PLAYER_INDEX))
                         live.refresh()
-                    _time.sleep(0.1)
+                    _time.sleep(0.3)
                 continue
 
             # ── produce/shopping modes — wait ──
@@ -545,7 +546,7 @@ def _gameplay():
                         live.update(_render(STATE, NUM_COLORS, NUM_PLAYERS,
                                             "[dim]Waiting for other player…[/dim]", PLAYER_INDEX))
                         live.refresh()
-                    _time.sleep(0.1)
+                    _time.sleep(0.3)
                 continue
 
             # ── not our turn ──
@@ -565,14 +566,14 @@ def _gameplay():
                     live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
                                         f"[dim]Waiting for {name} to play…[/dim]", PLAYER_INDEX))
                     live.refresh()
-                    _time.sleep(0.1)
+                    _time.sleep(0.3)
                 continue
 
             live.update(_render(st, NUM_COLORS, NUM_PLAYERS, feedback_now, PLAYER_INDEX))
             live.refresh()
 
             # ── our turn: read action ──
-            ch = _key(0.1)
+            ch = _key(0.3)
             if ch=="": continue
             if ch in ("q","Q"): return
             if ch not in "0123456789 ": continue
@@ -682,14 +683,29 @@ def _main_menu():
             return selected + 1
 
 def _create_screen():
-    console.clear()
-    console.print(Panel.fit(f"[bold]Create New Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]", border_style="green"))
-    console.print("[dim]Esc to go back[/dim]")
-    np_ = _simple_choice("Players:",["2","3","4","5","6"])
-    if np_ is None: return None
-    nc = _simple_choice("Colors:",["3","4","5"])
-    if nc is None: return None
-    return {"player_name": MY_NAME, "num_players": np_+1, "num_colors": nc+2}
+    """Create game with slider bar for player count (2-5). Colours always 5."""
+    num_players = 2
+    while True:
+        bar = ["█" if i < num_players else "░" for i in range(5)]
+        left = "◂" if num_players > 2 else " "
+        right = "▸" if num_players < 5 else " "
+        body = f"[bold]Create New Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]\n\n"
+        body += f"  [dim]{left}[/dim]  [bold yellow]{''.join(bar)}[/bold yellow] {num_players}  [dim]{right}[/dim]\n\n"
+        body += f"[dim]←→ / hl adjust  •  Enter to create  •  Esc to back[/dim]"
+        console.clear()
+        console.print(Panel(Text.from_markup(body), border_style="green"))
+        ch = _key(None)
+        if ch in ("\x1b", "q", "Q"):
+            return None
+        if ch in ("\x1b[D", "h", "H"):
+            if num_players > 2:
+                num_players -= 1
+        elif ch in ("\x1b[C", "l", "L"):
+            if num_players < 5:
+                num_players += 1
+        elif ch in ("\r", "\n"):
+            break
+    return {"player_name": MY_NAME, "num_players": num_players, "num_colors": 5}
 
 def _join_screen():
     console.clear()
@@ -757,7 +773,7 @@ def _show_game_list(games: list[dict]) -> str | None:
 
 def _lobby():
     global PLAYER_NAMES, NUM_PLAYERS, GAME_CODE
-    lobby_players = []
+    lobby_players = [{"player_index": idx, "name": name} for idx, name in PLAYER_NAMES.items()]
     while True:
         msgs = _drain_server()
         for m in msgs:

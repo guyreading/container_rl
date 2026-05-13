@@ -241,7 +241,10 @@ class GameManager:
 
             # Broadcast to all connected players for this game
             state_blob = serialize_state(new_state)
-            state_data = _state_to_json_data(new_state)
+            try:
+                state_data = _state_to_json_data(new_state)
+            except Exception:
+                state_data = {}
             self._broadcast(game_id, "state_update", {
                 "state": state_blob.hex(),
                 "state_data": state_data,
@@ -292,7 +295,7 @@ def _state_to_json_data(state: EnvState) -> dict:
         "harbour_store": np.asarray(state.harbour_store).tolist(),
         "island_store": np.asarray(state.island_store).tolist(),
         "ship_contents": np.asarray(state.ship_contents).tolist(),
-        "ship_location": int(state.ship_location),
+        "ship_location": np.asarray(state.ship_location).tolist(),
         "container_supply": np.asarray(state.container_supply).tolist(),
         "turn_phase": int(state.turn_phase),
         "current_player": int(state.current_player),
