@@ -300,8 +300,31 @@ def _submenu_produce(live, state, nc, np_):
     player = int(state.current_player)
     factories = [c for c in range(nc) if int(state.factory_colors[player,c])>0]
     if not factories: return True
+
+    # Check for depleted colours
+    depleted = []
+    active_colors = []
+    for c in factories:
+        if int(state.container_supply[c]) <= 0:
+            depleted.append(c)
+        else:
+            active_colors.append(c)
+
+    # Warn about depleted colours, then skip them
+    if depleted:
+        names = ", ".join(f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}]" for c in depleted)
+        live.update(_render(state, nc, np_,
+            f"[yellow]{names} depleted — skipping.[/yellow]", player))
+        live.refresh(); _time.sleep(1.2)
+
+    if not active_colors:
+        live.update(_render(state, nc, np_,
+            "[yellow]No colours available to produce (all owned colours depleted).[/yellow]", player))
+        live.refresh(); _time.sleep(1.2)
+        return True
+
     first = True
-    for color in factories:
+    for color in active_colors:
         hdr = f"[bold]Produce [{_cs(color)}]{_cn(color,nc)}[/{_cs(color)}] — pick a price:[/bold]"
         opts = [f"${i+1}" for i in range(PRODUCE_CHOICES-1)]+["[dim]leave idle[/dim]"]
         ch = _input_choice(live, state, nc, np_, opts, hdr)
@@ -596,7 +619,12 @@ def _gameplay():
                 if r is True: continue
                 if r: aidx = encoder.encode(atype, r)
             elif atype == ACTION_PRODUCE:
-                cancelled = _submenu_produce(live, st, NUM_COLORS, NUM_PLAYERS)
+                if int(st.cash[PLAYER_INDEX]) < 1:
+                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                        "[yellow]Cannot afford produce — need $1 for union dues.[/yellow]", PLAYER_INDEX))
+                    live.refresh(); _time.sleep(1.2); cancelled = True
+                else:
+                    cancelled = _submenu_produce(live, st, NUM_COLORS, NUM_PLAYERS)
             elif atype == ACTION_BUY_FROM_FACTORY_STORE:
                 cancelled = _submenu_buy_from_factory(live, st, NUM_COLORS, NUM_PLAYERS)
             elif atype == ACTION_MOVE_LOAD:
@@ -617,7 +645,40 @@ def _gameplay():
                     live.refresh(); _time.sleep(1.2); cancelled = True
                 else:
                     aidx = encoder.encode(atype, {})
-            elif atype in (ACTION_BUY_WAREHOUSE, ACTION_PASS, ACTION_TAKE_LOAN, ACTION_REPAY_LOAN):
+            elif atype == ACTION_BUY_WAREHOUSE:
+                wh = int(st.warehouse_count[PLAYER_INDEX])
+                cost = wh + 3
+                if wh >= 5:
+                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                        "[yellow]You already have the maximum number of warehouses (5).[/yellow]", PLAYER_INDEX))
+                    live.refresh(); _time.sleep(1.2); cancelled = True
+                elif int(st.cash[PLAYER_INDEX]) < cost:
+                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                        f"[yellow]Cannot afford — need ${cost}, have ${int(st.cash[PLAYER_INDEX])}.[/yellow]", PLAYER_INDEX))
+                    live.refresh(); _time.sleep(1.2); cancelled = True
+                else:
+                    aidx = encoder.encode(atype, {})
+            elif atype == ACTION_TAKE_LOAN:
+                loans = int(st.loans[PLAYER_INDEX])
+                if loans >= 2:
+                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                        "[yellow]You already have the maximum number of loans (2).[/yellow]", PLAYER_INDEX))
+                    live.refresh(); _time.sleep(1.2); cancelled = True
+                else:
+                    aidx = encoder.encode(atype, {})
+            elif atype == ACTION_REPAY_LOAN:
+                loans = int(st.loans[PLAYER_INDEX])
+                if loans < 1:
+                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                        "[yellow]You have no loans to repay.[/yellow]", PLAYER_INDEX))
+                    live.refresh(); _time.sleep(1.2); cancelled = True
+                elif int(st.cash[PLAYER_INDEX]) < 10:
+                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                        f"[yellow]Cannot afford — need $10, have ${int(st.cash[PLAYER_INDEX])}.[/yellow]", PLAYER_INDEX))
+                    live.refresh(); _time.sleep(1.2); cancelled = True
+                else:
+                    aidx = encoder.encode(atype, {})
+            elif atype in (ACTION_PASS,):
                 aidx = encoder.encode(atype, {})
 
             if cancelled: continue
