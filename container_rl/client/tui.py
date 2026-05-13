@@ -378,13 +378,18 @@ def _submenu_buy_from_factory(live, state, nc, np_):
         arr = [ACTION_BUY_FROM_FACTORY_STORE, opp_idx, 0, h_slot, color*PRICE_SLOTS+src_slot]
         _send_multi_action(arr); first=False
         _wait_for_state(live, nc, np_)
+        seller = PLAYER_NAMES.get(target, f"Player {target+1}")
+        FEEDBACK = f"[bold]Buy {_cn(color,nc)} from {seller}'s factory at ${src_slot+1} (harbour ${h_slot+1})[/bold]"
         if STATE and not int(STATE.shopping_active):
             hs = sum(int(STATE.harbour_store[PLAYER_INDEX,c,s]) for c in range(nc) for s in range(PRICE_SLOTS))
             wh = int(STATE.warehouse_count[PLAYER_INDEX])
             if hs >= wh:
-                FEEDBACK = "[yellow]Harbour store full[/yellow]"
+                msg = "[yellow]Harbour store full — buying stopped[/yellow]"
             else:
-                FEEDBACK = "[dim]No more containers available[/dim]"
+                msg = "[dim]No more containers available[/dim]"
+            live.update(_render(STATE, nc, np_, msg, PLAYER_INDEX))
+            live.refresh()
+            _key(1.0)
             return False
     # STOP
     if STATE and int(STATE.shopping_active)>0:
@@ -418,12 +423,17 @@ def _submenu_move_load(live, state, nc, np_):
         _send_multi_action([ACTION_MOVE_LOAD, opp_idx, 0, 0, color*PRICE_SLOTS+slot])
         first=False
         _wait_for_state(live, nc, np_)
+        seller = PLAYER_NAMES.get(target, f"Player {target+1}")
+        FEEDBACK = f"[bold]Load {_cn(color,nc)} from {seller}'s harbour at ${slot+1}[/bold]"
         if STATE and not int(STATE.shopping_active):
             cargo = sum(1 for i in range(SHIP_CAPACITY) if int(STATE.ship_contents[PLAYER_INDEX,i])>0)
             if cargo >= SHIP_CAPACITY:
-                FEEDBACK = "[yellow]Ship cargo full[/yellow]"
+                msg = "[yellow]Ship cargo full — loading stopped[/yellow]"
             else:
-                FEEDBACK = "[dim]No more containers available[/dim]"
+                msg = "[dim]No more containers available[/dim]"
+            live.update(_render(STATE, nc, np_, msg, PLAYER_INDEX))
+            live.refresh()
+            _key(1.0)
             return False
     # STOP
     if STATE and int(STATE.shopping_active)>0:
@@ -534,22 +544,32 @@ def _gameplay():
             # ── auction mode ──
             if ac:
                 seller = int(st.auction_seller); rnd = int(st.auction_round)
-                if cur==PLAYER_INDEX:
-                    if rnd==0 and cur!=seller:
+                if rnd == 0 and PLAYER_INDEX != seller:
+                    # Any non-seller can bid — check if we already bid.
+                    if int(st.auction_bids[PLAYER_INDEX]) < 0:
                         cargo = _desc_cargo(st.auction_cargo, NUM_COLORS)
                         bid = _input_number(live, st, NUM_COLORS, NUM_PLAYERS,
-                            f"[bold]Auction![/bold] Cargo: {cargo}\nP{cur+1}: bid (0=pass, max ${int(st.cash[cur])}):")
+                            f"[bold]Auction![/bold] Cargo: {cargo}\n{PLAYER_NAMES.get(PLAYER_INDEX, f'P{PLAYER_INDEX+1}')}: bid (0=pass, max ${int(st.cash[PLAYER_INDEX])}):")
                         bid = bid if bid is not None else 0
-                        _send_multi_action([ACTION_MOVE_AUCTION,0,0,0,bid])
+                        _send_multi_action([ACTION_MOVE_AUCTION,PLAYER_INDEX,0,0,bid])
                         _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
-                    elif rnd==1 and cur==seller:
-                        mx = int(jnp.max(st.auction_bids))
-                        ch = _input_choice(live,st,NUM_COLORS,NUM_PLAYERS,
-                            [f"[green]Accept[/green] (+${mx}×2)",f"[red]Reject[/red] (-${mx})"],
-                            f"[bold]Highest bid: ${mx}[/bold]")
-                        acc = 1 if (ch==1 if ch else True) else 0
-                        _send_multi_action([ACTION_MOVE_AUCTION,0,0,0,acc])
-                        _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
+                    else:
+                        _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
+                        if STATE and int(STATE.auction_round) == 1:
+                            pass  # will re-render on next iteration
+                        else:
+                            live.update(_render(STATE or st, NUM_COLORS, NUM_PLAYERS,
+                                                "[dim]Bid submitted — waiting for others…[/dim]", PLAYER_INDEX))
+                            live.refresh()
+                            _time.sleep(0.1)
+                elif rnd == 1 and PLAYER_INDEX == seller:
+                    mx = max(0, int(jnp.max(st.auction_bids)))
+                    ch = _input_choice(live,st,NUM_COLORS,NUM_PLAYERS,
+                        [f"[green]Accept[/green] (+${mx}×2)",f"[red]Reject[/red] (-${mx})"],
+                        f"[bold]Highest bid: ${mx}[/bold]")
+                    acc = 1 if ch==1 else 0
+                    _send_multi_action([ACTION_MOVE_AUCTION,PLAYER_INDEX,0,0,acc])
+                    _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
                 else:
                     _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
                     if STATE:
@@ -580,19 +600,15 @@ def _gameplay():
                 continue
 
             # ── not our turn ──
-            if cur!=PLAYER_INDEX:
-                name = PLAYER_NAMES.get(cur, f"P{cur+1}")
+            if cur!=PLAYER_INDEX and not ac:
+                name = PLAYER_NAMES.get(cur, f"Player {cur+1}")
                 while True:
                     _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
-                    if STATE is None:
-                        return
-                    st = STATE
-                    new_cur = int(st.current_player)
-                    if new_cur == PLAYER_INDEX:
+                    if STATE is None: return
+                    st = STATE; new_cur = int(st.current_player)
+                    if new_cur == PLAYER_INDEX or int(st.auction_active):
                         break
-                    if new_cur != cur:
-                        name = PLAYER_NAMES.get(new_cur, f"P{new_cur+1}")
-                        cur = new_cur
+                    name = PLAYER_NAMES.get(new_cur, f"Player {new_cur+1}")
                     live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
                                         f"[dim]Waiting for {name} to play…[/dim]", PLAYER_INDEX))
                     live.refresh()
@@ -685,6 +701,13 @@ def _gameplay():
             if aidx is not None:
                 _send_action(aidx)
                 _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
+                # Auction pre-check: warn if ship not at Open Sea or no cargo.
+                if atype == ACTION_MOVE_AUCTION and STATE and not int(STATE.auction_active):
+                    live.update(_render(STATE, NUM_COLORS, NUM_PLAYERS,
+                                        "[yellow]Must be at Open Sea with cargo to hold an auction[/yellow]",
+                                        PLAYER_INDEX))
+                    live.refresh()
+                    _key(1.5)
 
 
 # ── main menu ────────────────────────────────────────────────────────────
