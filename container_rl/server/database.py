@@ -5,6 +5,9 @@ Tables
 players
     id, name, password_hash, created_at
 
+ssh_keys
+    id, player_id, public_key, fingerprint, created_at
+
 games
     id, code (unique), status (lobby|active|finished),
     num_players, num_colors, seed, created_at, finished_at
@@ -97,6 +100,14 @@ class Database:
                     step_count INTEGER DEFAULT 0,
                     saved_at TEXT DEFAULT (datetime('now'))
                 );
+
+                CREATE TABLE IF NOT EXISTS ssh_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    player_id INTEGER NOT NULL REFERENCES players(id),
+                    public_key TEXT NOT NULL UNIQUE,
+                    fingerprint TEXT NOT NULL,
+                    created_at TEXT DEFAULT (datetime('now'))
+                );
             """)
 
     # ------------------------------------------------------------------
@@ -125,6 +136,39 @@ class Database:
                 (name, pw_hash),
             )
             return cur.lastrowid
+
+    def upsert_player_trusted(self, name: str) -> int:
+        """Find or create a player without password validation. Returns player id."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM players WHERE name = ?", (name,)
+            ).fetchone()
+            if row:
+                return row["id"]
+            cur = conn.execute(
+                "INSERT INTO players (name, password_hash) VALUES (?, '')",
+                (name,),
+            )
+            return cur.lastrowid
+
+    # ------------------------------------------------------------------
+    # ssh_keys
+    # ------------------------------------------------------------------
+
+    def register_key(self, player_id: int, public_key: str, fingerprint: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO ssh_keys (player_id, public_key, fingerprint) VALUES (?, ?, ?)",
+                (player_id, public_key, fingerprint),
+            )
+
+    def lookup_key(self, public_key: str) -> dict | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT p.id, p.name FROM ssh_keys k JOIN players p ON k.player_id = p.id WHERE k.public_key = ?",
+                (public_key,),
+            ).fetchone()
+            return dict(row) if row else None
 
     # ------------------------------------------------------------------
     # games
@@ -156,25 +200,40 @@ class Database:
             row = conn.execute("SELECT * FROM games WHERE id = ?", (game_id,)).fetchone()
             return dict(row) if row else None
 
-    def list_joinable_games(self) -> list[dict]:
+    def list_joinable_games(self, player_name: str | None = None) -> list[dict]:
         """Return games that can be joined or rejoined.
 
         Lobby games are shown only if they still have free slots.
-        Active games are always shown (reconnection is validated later
-        by checking the player's existing slot).
+        Active games are shown only if the player is already in them (reconnection).
+        Finished games are never shown.
         """
         with self._connect() as conn:
-            rows = conn.execute("""
-                SELECT g.*, COUNT(gp.player_index) as slots_filled
-                FROM games g
-                LEFT JOIN game_players gp ON g.id = gp.game_id
-                WHERE g.status = 'active'
-                   OR (g.status = 'lobby' AND (
-                       SELECT COUNT(*) FROM game_players WHERE game_id = g.id
-                   ) < g.num_players)
-                GROUP BY g.id
-                ORDER BY g.created_at DESC
-            """).fetchall()
+            if player_name:
+                rows = conn.execute("""
+                    SELECT * FROM (
+                        SELECT g.*,
+                            (SELECT COUNT(*) FROM game_players WHERE game_id = g.id) as slots_filled,
+                            EXISTS(
+                                SELECT 1 FROM game_players gp2
+                                JOIN players p2 ON gp2.player_id = p2.id
+                                WHERE gp2.game_id = g.id AND p2.name = ?
+                            ) as is_player
+                        FROM games g
+                    )
+                    WHERE (status = 'lobby' AND slots_filled < num_players)
+                       OR (status = 'active' AND is_player)
+                    ORDER BY created_at DESC
+                """, (player_name,)).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT * FROM (
+                        SELECT g.*,
+                            (SELECT COUNT(*) FROM game_players WHERE game_id = g.id) as slots_filled
+                        FROM games g
+                    )
+                    WHERE status = 'lobby' AND slots_filled < num_players
+                    ORDER BY created_at DESC
+                """).fetchall()
             return [dict(r) for r in rows]
 
     def set_game_status(self, game_id: int, status: str) -> None:

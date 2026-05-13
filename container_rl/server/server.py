@@ -57,7 +57,7 @@ class ClientHandler:
         elif msg_type == "join_game":
             self._handle_join(payload)
         elif msg_type == "list_games":
-            self._handle_list()
+            self._handle_list(payload)
         elif msg_type == "action":
             self._handle_action(payload)
         elif msg_type == "action_multi":
@@ -87,7 +87,9 @@ class ClientHandler:
             if num_players < 2 or num_players > 6:
                 raise ValueError("num_players must be 2–6.")
 
-            result = self.server.manager.create_game(name, password, num_players, num_colors, seed)
+            trusted = self.server._is_localhost(self.addr)
+            result = self.server.manager.create_game_trusted(name, num_players, num_colors, seed) if trusted else \
+                     self.server.manager.create_game(name, password, num_players, num_colors, seed)
             self.game_id = result["game_id"]
             self.player_index = result["player_index"]
             self.server._register_client(self)
@@ -97,6 +99,38 @@ class ClientHandler:
                 "player_index": result["player_index"],
             })
             self._send_lobby()
+        except Exception as e:
+            self.send("error", {"message": str(e)})
+
+    def _handle_join(self, p: dict) -> None:
+        try:
+            name = p.get("player_name", "").strip()
+            password = p.get("password") or None
+            code = p.get("code", "").strip().upper()
+            if not name:
+                raise ValueError("Player name is required.")
+            if not code:
+                raise ValueError("Game code is required.")
+
+            trusted = self.server._is_localhost(self.addr)
+            result = self.server.manager.join_game_trusted(name, code) if trusted else \
+                     self.server.manager.join_game(name, password, code)
+            self.game_id = result["game_id"]
+            self.player_index = result["player_index"]
+            self.server._register_client(self)
+            self.send("game_joined", {
+                "game_id": result["game_id"],
+                "code": result["code"],
+                "player_index": result["player_index"],
+                "num_players": result["num_players"],
+                "num_colors": result["num_colors"],
+                "status": result.get("status", "lobby"),
+            })
+            self._send_lobby()
+
+            started = self.server.manager.maybe_start_game(self.game_id)
+            if started:
+                self._broadcast_to_game("game_started", {})
         except Exception as e:
             self.send("error", {"message": str(e)})
 
@@ -131,11 +165,15 @@ class ClientHandler:
         except Exception as e:
             self.send("error", {"message": str(e)})
 
-    def _handle_list(self) -> None:
+    def _handle_list(self, p: dict) -> None:
         try:
-            games = self.server.manager.list_joinable()
+            player_name = p.get("player_name")
+            logger.info("list_games request player=%s", player_name)
+            games = self.server.manager.list_joinable(player_name)
+            logger.info("list_games response count=%d", len(games))
             self.send("game_list", {"games": games})
         except Exception as e:
+            logger.error("list_games error: %s", e)
             self.send("error", {"message": str(e)})
 
     def _handle_action(self, p: dict) -> None:
@@ -274,6 +312,11 @@ class GameServer:
                     lst.remove(client)
                 if not lst:
                     del self._game_clients[gid]
+
+    def _is_localhost(self, addr: tuple) -> bool:
+        """Check if the client is connecting from localhost."""
+        host = addr[0]
+        return host == "127.0.0.1" or host == "::1" or host == "localhost"
 
     def run(self) -> None:
         """Start the server and block until interrupted."""

@@ -73,11 +73,18 @@ _ORIG_TERMIOS = None
 def _enter_raw():
     global _ORIG_TERMIOS
     fd = sys.stdin.fileno()
+    if not os.isatty(fd):
+        return
     _ORIG_TERMIOS = termios.tcgetattr(fd)
-    tty.setcbreak(fd)
+    # Use TCSADRAIN instead of TCSAFLUSH to preserve already-buffered input.
+    mode = list(_ORIG_TERMIOS)
+    mode[tty.LFLAG] = _ORIG_TERMIOS[tty.LFLAG] & ~(termios.ECHO | termios.ICANON)
+    mode[tty.CC][termios.VMIN] = 1
+    mode[tty.CC][termios.VTIME] = 0
+    termios.tcsetattr(fd, termios.TCSADRAIN, mode)
 
 def _exit_raw():
-    if _ORIG_TERMIOS:
+    if _ORIG_TERMIOS is not None:
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _ORIG_TERMIOS)
 
 def _ch():
@@ -598,24 +605,40 @@ def _gameplay():
 # ── main menu ────────────────────────────────────────────────────────────
 
 def _read_line(prompt):
-    console.print(f"[bold]{prompt}[/bold] ", end=""); sys.stdout.flush()
+    sys.stdout.write(f"\033[1G\033[K\033[1m{prompt}\033[0m ")
+    sys.stdout.flush()
     buf=""
     while True:
         ch = _key(None)
         if ch=="\x1b": return None
-        if ch in ("\r","\n"): console.print(); return buf.strip()
-        if ch in ("\x7f","\x08"): buf=buf[:-1]; console.print(f"\r[bold]{prompt}[/bold] {buf} ",end=""); sys.stdout.flush()
-        elif len(ch)==1 and ch.isprintable(): buf+=ch; console.print(ch,end=""); sys.stdout.flush()
+        if ch in ("\r","\n"):
+            console.print()
+            return buf.strip()
+        if ch in ("\x7f","\x08"):
+            if buf:
+                buf=buf[:-1]
+            sys.stdout.write(f"\033[1G\033[K\033[1m{prompt}\033[0m {buf} ")
+            sys.stdout.flush()
+        elif len(ch)==1 and ch.isprintable():
+            buf+=ch
+            sys.stdout.write(ch)
+            sys.stdout.flush()
 
 def _read_password(prompt):
-    console.print(f"[bold]{prompt}[/bold] ", end=""); sys.stdout.flush()
+    sys.stdout.write(f"\033[1G\033[K\033[1m{prompt}\033[0m ")
+    sys.stdout.flush()
     buf=""
     while True:
         ch = _key(None)
         if ch=="\x1b": return None
-        if ch in ("\r","\n"): console.print(); return buf.strip() or None
-        if ch in ("\x7f","\x08"): buf=buf[:-1]
-        elif len(ch)==1 and ch.isprintable(): buf+=ch
+        if ch in ("\r","\n"):
+            console.print()
+            return buf.strip() or None
+        if ch in ("\x7f","\x08"):
+            if buf:
+                buf=buf[:-1]
+        elif len(ch)==1 and ch.isprintable():
+            buf+=ch
 
 def _simple_choice(prompt, options):
     console.print(f"[bold]{prompt}[/bold]")
@@ -645,7 +668,7 @@ def _main_menu():
         console.clear()
         console.print(Panel(frame, border_style="blue"))
         ch = _key(None)
-        if ch == "\x1b":
+        if ch in ("\x1b", "q", "Q"):
             return None
         if ch in ("\x1b[A", "k", "w"):
             selected = max(0, selected - 1)
@@ -660,22 +683,17 @@ def _main_menu():
 
 def _create_screen():
     console.clear()
-    console.print(Panel.fit("[bold]Create New Game[/bold]", border_style="green"))
-    name = _read_line("Your name:")
-    if name is None: return None
-    pw = _read_password("Password (optional):")
+    console.print(Panel.fit(f"[bold]Create New Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]", border_style="green"))
+    console.print("[dim]Esc to go back[/dim]")
     np_ = _simple_choice("Players:",["2","3","4","5","6"])
     if np_ is None: return None
     nc = _simple_choice("Colors:",["3","4","5"])
     if nc is None: return None
-    return {"player_name":name,"password":pw,"num_players":np_+1,"num_colors":nc+2}
+    return {"player_name": MY_NAME, "num_players": np_+1, "num_colors": nc+2}
 
 def _join_screen():
     console.clear()
-    console.print(Panel.fit("[bold]Join Game[/bold]", border_style="green"))
-    name = _read_line("Your name:")
-    if name is None: return None
-    pw = _read_password("Password (optional):")
+    console.print(Panel.fit(f"[bold]Join Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]", border_style="green"))
     # fetch games
     CLIENT.send("list_games")
     _time.sleep(0.5)
@@ -685,7 +703,7 @@ def _join_screen():
 
     code = _show_game_list(games)
     if code is None: return None
-    return {"player_name":name,"password":pw,"code":code}
+    return {"player_name": MY_NAME, "code": code}
 
 
 def _show_game_list(games: list[dict]) -> str | None:
@@ -718,7 +736,7 @@ def _show_game_list(games: list[dict]) -> str | None:
         console.clear()
         console.print(Panel(frame, border_style="yellow"))
         ch = _key(None)
-        if ch == "\x1b":
+        if ch in ("\x1b", "q", "Q"):
             return None
         if ch in ("\x1b[A", "k", "w"):
             selected = max(0, selected - 1)
@@ -772,9 +790,51 @@ def main():
     import argparse
     p = argparse.ArgumentParser(description="Container game client")
     p.add_argument("--host", default="127.0.0.1"); p.add_argument("--port", type=int, default=9876)
+    p.add_argument("--player-name", default="")
+    p.add_argument("--game-code", default="")
+    p.add_argument("--create", action="store_true", help="Create a new game instead of joining")
+    p.add_argument("--num-players", type=int, default=2)
+    p.add_argument("--diag", action="store_true", help="Run diagnostics without starting TUI")
     args = p.parse_args()
 
+    if args.diag:
+        import sys as _sys
+        _sys.stderr.write(f"tty={os.isatty(0)}\n")
+        _sys.stderr.write(f"player_name={args.player_name}\n")
+        _sys.stderr.write(f"game_code={args.game_code}\n")
+        _sys.stderr.write(f"host={args.host}:{args.port}\n")
+        _sys.stderr.flush()
+        try:
+            c = GameClient(args.host, args.port)
+            c.connect()
+            _sys.stderr.write("connect=ok\n")
+            if args.game_code:
+                c.send("join_game", {"player_name": args.player_name or "diag", "code": args.game_code.strip().upper()})
+                _sys.stderr.write("join_sent=ok\n")
+                for _i in range(30):
+                    m = c.recv()
+                    if m:
+                        _sys.stderr.write(f"msg={m['type']}\n")
+                        if m['type'] == 'game_joined':
+                            _sys.stderr.write(f"game_id={m['payload']['game_id']}\n")
+                            break
+                    _time.sleep(0.1)
+            _sys.stderr.write("diag=complete\n")
+            _sys.stderr.flush()
+        except Exception as e:
+            _sys.stderr.write(f"error={e}\n")
+            _sys.stderr.flush()
+        return
+
     global CLIENT, GAME_ID, PLAYER_INDEX, GAME_CODE, NUM_PLAYERS, NUM_COLORS, MY_NAME, GAME_STATUS, PLAYER_NAMES
+    import sys as _sys
+    try:
+        _sys.stderr = open("/tmp/container-tui.log", "a")
+        _sys.stderr.write(f"TUI START tty={os.isatty(0)} player={args.player_name} code={args.game_code}\n")
+        _sys.stderr.flush()
+    except OSError:
+        pass
+    MY_NAME = args.player_name or MY_NAME
     CLIENT = GameClient(args.host, args.port)
     _enter_raw()
     try:
@@ -782,6 +842,54 @@ def main():
             CLIENT.connect()
         except Exception as e:
             console.print(f"[red]Cannot connect: {e}[/red]"); return
+
+        if args.player_name and args.create:
+            MY_NAME = args.player_name
+            NUM_PLAYERS = args.num_players
+            NUM_COLORS = 5
+            CLIENT.send("create_game", {"player_name": MY_NAME, "num_players": NUM_PLAYERS, "num_colors": NUM_COLORS})
+            for _i in range(50):
+                msgs = _drain_server()
+                for m in msgs:
+                    if m.get("type")=="game_created":
+                        pp=m["payload"]; GAME_ID=pp["game_id"]; PLAYER_INDEX=pp["player_index"]; GAME_CODE=pp["code"]
+                    if m.get("type")=="lobby_update":
+                        pp=m["payload"]
+                        NUM_PLAYERS = pp.get("num_players_needed", NUM_PLAYERS)
+                        PLAYER_NAMES = {int(pl["player_index"]): pl["name"] for pl in pp.get("players", [])}
+                if GAME_ID: break
+                _time.sleep(0.1)
+            if GAME_ID is None:
+                console.print("[red]Failed to create game.[/red]"); _key(2); return
+            started = _lobby()
+            if not started: return
+            _gameplay()
+            return
+
+        if args.player_name and args.game_code:
+            MY_NAME = args.player_name
+            CLIENT.send("join_game", {"player_name": MY_NAME, "code": args.game_code.strip().upper()})
+            for _i in range(50):
+                msgs = _drain_server()
+                for m in msgs:
+                    if m.get("type")=="game_joined":
+                        pp=m["payload"]; GAME_ID=pp["game_id"]; PLAYER_INDEX=pp["player_index"]; GAME_CODE=pp["code"]
+                        NUM_PLAYERS=pp.get("num_players",NUM_PLAYERS); NUM_COLORS=pp.get("num_colors",NUM_COLORS)
+                        GAME_STATUS=pp.get("status","lobby")
+                    if m.get("type")=="lobby_update":
+                        pp=m["payload"]
+                        NUM_PLAYERS = pp.get("num_players_needed", NUM_PLAYERS)
+                        PLAYER_NAMES = {int(pl["player_index"]): pl["name"] for pl in pp.get("players", [])}
+                if GAME_ID: break
+                _time.sleep(0.1)
+            if GAME_ID is None:
+                console.print("[red]Failed to join game.[/red]"); _key(2); return
+            is_active = GAME_STATUS == "active"
+            if not is_active:
+                started = _lobby()
+                if not started: return
+            _gameplay()
+            return
 
         ch = _main_menu()
         if ch is None: return

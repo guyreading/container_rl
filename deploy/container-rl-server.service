@@ -1,0 +1,15 @@
+[Unit]
+Description=Container RL game server (TCP)
+After=network.target
+
+[Service]
+Type=simple
+User=container-rl
+Group=container-rl
+WorkingDirectory=/opt/container-rl
+ExecStart=/opt/container-rl/.venv/bin/python -m container_rl.server --host 127.0.0.1 --port 9876 --db /opt/container-rl/container_server.db
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
