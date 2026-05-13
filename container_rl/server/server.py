@@ -105,46 +105,13 @@ class ClientHandler:
     def _handle_join(self, p: dict) -> None:
         try:
             name = p.get("player_name", "").strip()
-            password = p.get("password") or None
             code = p.get("code", "").strip().upper()
             if not name:
                 raise ValueError("Player name is required.")
             if not code:
                 raise ValueError("Game code is required.")
 
-            trusted = self.server._is_localhost(self.addr)
-            result = self.server.manager.join_game_trusted(name, code) if trusted else \
-                     self.server.manager.join_game(name, password, code)
-            self.game_id = result["game_id"]
-            self.player_index = result["player_index"]
-            self.server._register_client(self)
-            self.send("game_joined", {
-                "game_id": result["game_id"],
-                "code": result["code"],
-                "player_index": result["player_index"],
-                "num_players": result["num_players"],
-                "num_colors": result["num_colors"],
-                "status": result.get("status", "lobby"),
-            })
-            self._send_lobby()
-
-            started = self.server.manager.maybe_start_game(self.game_id)
-            if started:
-                self._broadcast_to_game("game_started", {})
-        except Exception as e:
-            self.send("error", {"message": str(e)})
-
-    def _handle_join(self, p: dict) -> None:
-        try:
-            name = p.get("player_name", "").strip()
-            password = p.get("password") or None
-            code = p.get("code", "").strip().upper()
-            if not name:
-                raise ValueError("Player name is required.")
-            if not code:
-                raise ValueError("Game code is required.")
-
-            result = self.server.manager.join_game(name, password, code)
+            result = self.server.manager.join_game_trusted(name, code)
             self.game_id = result["game_id"]
             self.player_index = result["player_index"]
             self.server._register_client(self)
@@ -230,7 +197,7 @@ class ClientHandler:
             return
         players = self.server.manager.get_game_players(self.game_id)
         game = self.server.manager.get_game_info(self.game_id)
-        self.send("lobby_update", {
+        self._broadcast_to_game("lobby_update", {
             "players": players,
             "num_players_needed": game["num_players"],
             "code": game["code"],

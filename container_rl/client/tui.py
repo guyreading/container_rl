@@ -411,15 +411,22 @@ def _submenu_move_load(live, state, nc, np_):
 def _submenu_buy_factory(live, state, nc, np_):
     player = int(state.current_player)
     owned = {c for c in range(nc) if int(state.factory_colors[player,c])>0}
+    available = [c for c in range(nc) if c not in owned]
+    if len(owned) >= MAX_FACTORIES_PER_PLAYER:
+        live.update(_render(state, nc, np_, "[yellow]You already own the maximum number of factories (4).[/yellow]", player))
+        live.refresh(); _time.sleep(1); return True
+    if not available:
+        live.update(_render(state, nc, np_, "[yellow]You own all colours already.[/yellow]", player))
+        live.refresh(); _time.sleep(1); return True
     fc = len(owned); cost = (fc+1)*3
-    opts = []; colors = []
-    for c in range(nc):
-        s = " [dim](owned)[/dim]" if c in owned else ""
-        opts.append(f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}]{s}")
-        colors.append(c)
+    can_afford_any = int(state.cash[player]) >= cost
+    if not can_afford_any:
+        live.update(_render(state, nc, np_, f"[red]Cannot afford — need ${cost}, have ${int(state.cash[player])}.[/red]", player))
+        live.refresh(); _time.sleep(1); return True
+    opts = [f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}]" for c in available]
     ch = _input_choice(live, state, nc, np_, opts, f"[bold]Buy a factory — cost: [green]${cost}[/green][/bold]")
     if ch is None: return True
-    return {"color": colors[ch-1]}
+    return {"color": available[ch-1]}
 
 # ── state polling ────────────────────────────────────────────────────────
 
@@ -711,7 +718,7 @@ def _join_screen():
     console.clear()
     console.print(Panel.fit(f"[bold]Join Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]", border_style="green"))
     # fetch games
-    CLIENT.send("list_games")
+    CLIENT.send("list_games", {"player_name": MY_NAME})
     _time.sleep(0.5)
     games = []
     for m in _drain_server():
