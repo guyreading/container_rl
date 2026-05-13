@@ -64,6 +64,16 @@ class GameManager:
         self.db.assign_player_slot(game_id, player_id, 0)
         return {"game_id": game_id, "code": code, "player_index": 0}
 
+    def create_game_trusted(
+        self, player_name: str,
+        num_players: int, num_colors: int = 5, seed: int | None = None,
+    ) -> dict:
+        """Create a new game with a trusted player name (no password check)."""
+        player_id = self.db.upsert_player_trusted(player_name)
+        game_id, code = self.db.create_game(num_players, num_colors, seed)
+        self.db.assign_player_slot(game_id, player_id, 0)
+        return {"game_id": game_id, "code": code, "player_index": 0}
+
     def join_game(
         self, player_name: str, password: str | None, code: str,
     ) -> dict:
@@ -76,7 +86,6 @@ class GameManager:
         player_id = self.db.upsert_player(player_name, password)
 
         if game["status"] == "active":
-            # Reconnection — must already have a slot.
             player_index = self.db.get_player_slot(game["id"], player_id)
             if player_index is None:
                 raise ValueError(f"Player '{player_name}' is not in game '{code}'.")
@@ -92,8 +101,35 @@ class GameManager:
             "status": game["status"],
         }
 
-    def list_joinable(self) -> list[dict]:
-        return self.db.list_joinable_games()
+    def join_game_trusted(
+        self, player_name: str, code: str,
+    ) -> dict:
+        """Join a game with a trusted player name (no password check)."""
+        game = self.db.get_game_by_code(code)
+        if not game:
+            raise ValueError(f"Game '{code}' not found.")
+        if game["status"] not in ("lobby", "active"):
+            raise ValueError(f"Game '{code}' is not accepting players (status: {game['status']}).")
+        player_id = self.db.upsert_player_trusted(player_name)
+
+        if game["status"] == "active":
+            player_index = self.db.get_player_slot(game["id"], player_id)
+            if player_index is None:
+                raise ValueError(f"Player '{player_name}' is not in game '{code}'.")
+        else:
+            player_index = self.db.assign_player_slot(game_id=game["id"], player_id=player_id)
+
+        return {
+            "game_id": game["id"],
+            "code": code,
+            "player_index": player_index,
+            "num_players": game["num_players"],
+            "num_colors": game["num_colors"],
+            "status": game["status"],
+        }
+
+    def list_joinable(self, player_name: str | None = None) -> list[dict]:
+        return self.db.list_joinable_games(player_name)
 
     def get_game_players(self, game_id: int) -> list[dict]:
         return self.db.get_game_players(game_id)
@@ -212,8 +248,13 @@ class GameManager:
 
             # Broadcast to all connected players for this game
             state_blob = serialize_state(new_state)
+            try:
+                state_data = _state_to_json_data(new_state)
+            except Exception:
+                state_data = {}
             self._broadcast(game_id, "state_update", {
                 "state": state_blob.hex(),
+                "state_data": state_data,
                 "current_player": int(new_state.current_player),
                 "actions_taken": int(new_state.actions_taken),
                 "auction_active": int(new_state.auction_active),
@@ -247,6 +288,39 @@ class GameManager:
     def _save_state(self, game_id: int, state: EnvState) -> None:
         blob = serialize_state(state)
         self.db.save_state(game_id, blob, int(state.step_count))
+
+
+def _state_to_json_data(state: EnvState) -> dict:
+    """Convert EnvState fields to JSON-serializable Python types."""
+    import numpy as np
+    return {
+        "cash": np.asarray(state.cash).tolist(),
+        "loans": np.asarray(state.loans).tolist(),
+        "factory_colors": np.asarray(state.factory_colors).tolist(),
+        "warehouse_count": np.asarray(state.warehouse_count).tolist(),
+        "factory_store": np.asarray(state.factory_store).tolist(),
+        "harbour_store": np.asarray(state.harbour_store).tolist(),
+        "island_store": np.asarray(state.island_store).tolist(),
+        "ship_contents": np.asarray(state.ship_contents).tolist(),
+        "ship_location": np.asarray(state.ship_location).tolist(),
+        "container_supply": np.asarray(state.container_supply).tolist(),
+        "turn_phase": int(state.turn_phase),
+        "current_player": int(state.current_player),
+        "game_over": int(state.game_over),
+        "auction_active": int(state.auction_active),
+        "auction_seller": int(state.auction_seller),
+        "auction_cargo": np.asarray(state.auction_cargo).tolist(),
+        "auction_bids": np.asarray(state.auction_bids).tolist(),
+        "auction_round": int(state.auction_round),
+        "actions_taken": int(state.actions_taken),
+        "produced_this_turn": np.asarray(state.produced_this_turn).tolist(),
+        "shopping_active": int(state.shopping_active),
+        "shopping_action_type": int(state.shopping_action_type),
+        "shopping_target": np.asarray(state.shopping_target).tolist(),
+        "produce_active": int(state.produce_active),
+        "produce_pending": np.asarray(state.produce_pending).tolist(),
+        "produce_was_produced": np.asarray(state.produce_was_produced).tolist(),
+    }
 
 
 def _describe_action(action, encoder: ActionEncoder, num_colors: int, state=None, player_names: dict[int, str] | None = None) -> str:
