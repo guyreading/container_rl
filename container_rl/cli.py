@@ -172,14 +172,16 @@ def _compute_net_worth(state: EnvState, player: int, num_colors: int) -> int:
     loans_penalty = int(state.loans[player]) * 11
     harbour_val = int(jax.numpy.sum(state.harbour_store[player])) * 2
     ship_val = int(jax.numpy.sum(state.ship_contents[player] > 0)) * 3
-    secret = int(state.secret_value_color[player])
     island = state.island_store[player]
     has_all = int(jax.numpy.all(island > 0))
     island_val = 0
     for c in range(num_colors):
         cnt = int(island[c])
         if cnt > 0:
-            island_val += cnt * (10 if (c == secret and has_all) else 5 if c == secret else 2)
+            val = int(state.secret_card_values[player, c])
+            if val == -1:
+                val = 10 if has_all else 5
+            island_val += cnt * val
     return cash + harbour_val + ship_val + island_val - loans_penalty
 
 
@@ -188,7 +190,6 @@ def _player_card(state: EnvState, player: int, nc: int, is_current: bool, width:
     cash = int(state.cash[player])
     loans = int(state.loans[player])
     wh = int(state.warehouse_count[player])
-    secret = int(state.secret_value_color[player])
     nw = _compute_net_worth(state, player, nc)
 
     factories = []
@@ -204,7 +205,15 @@ def _player_card(state: EnvState, player: int, nc: int, is_current: bool, width:
     out = Text.from_markup(header + "\n")
     out.append(line + "\n")
     out.append_text(Text.from_markup(f"  💵 ${cash}  🏦 {loans} loans  🏭 {wh} wh\n"))
-    out.append_text(Text.from_markup(f"  🤫 [{_cstyle(secret)}]{_cname(secret, nc)}[/{_cstyle(secret)}]\n"))
+    if is_current:
+        card_parts = []
+        for c in range(nc):
+            val = int(state.secret_card_values[player, c])
+            label = "5/10" if val == -1 else str(val)
+            card_parts.append(f"[{_cstyle(c)}]{_cname(c, nc)}[/{_cstyle(c)}]={label}")
+        out.append_text(Text.from_markup(f"  🤫 {' '.join(card_parts)}\n"))
+    else:
+        out.append_text(Text.from_markup(f"  🤫 [dim]hidden[/dim]\n"))
     out.append_text(Text.from_markup(f"  Factories: {fac_str}\n"))
     out.append("\n")
     out.append_text(Text.from_markup("  [bold]Factory Store:[/bold]\n"))
