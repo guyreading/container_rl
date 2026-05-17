@@ -1,10 +1,4 @@
-"""Self-play wrapper, opponent pool, and ELO tracking for Container RL.
-
-Provides a SelfPlayWrapper that makes a multi-player Container
-environment appear single-agent to sb3 by auto-playing opponent turns
-with historical model checkpoints.  Also includes an OpponentPool
-for managing snapshots and an ELO rating system.
-"""
+"""Self-play wrapper, opponent pool, and ELO tracking for Container RL."""
 
 from __future__ import annotations
 
@@ -26,10 +20,7 @@ def expected_score(elo_a: float, elo_b: float) -> float:
 
 
 def elo_update(elo_a: float, elo_b: float, a_won: bool, k: float = 32.0) -> tuple[float, float]:
-    """Update two ELO ratings after a single game.
-
-    Returns ``(new_elo_a, new_elo_b)``.
-    """
+    """Update two ELO ratings after a single game."""
     expected = expected_score(elo_a, elo_b)
     score = 1.0 if a_won else 0.0
     delta = k * (score - expected)
@@ -39,10 +30,7 @@ def elo_update(elo_a: float, elo_b: float, a_won: bool, k: float = 32.0) -> tupl
 def rankings_from_net_worth(
     state, num_players: int, func_env: ContainerFunctional, num_colors: int
 ) -> dict[int, int]:
-    """Compute final rankings (0 = winner) from net worth.
-
-    Returns a dict mapping ``player_id → rank`` (lower is better).
-    """
+    """Compute final rankings (0 = winner) from net worth."""
     nws = {p: int(func_env._net_worth(state, p, num_colors)) for p in range(num_players)}
     sorted_players = sorted(nws, key=nws.get, reverse=True)
     return {p: rank for rank, p in enumerate(sorted_players)}
@@ -58,30 +46,19 @@ class OpponentEntry:
 
 @dataclass
 class OpponentPool:
-    """Fixed-size pool of historical model checkpoints with ELO ratings.
-
-    New opponents are added periodically (e.g. every 50 training updates).
-    When the pool is full the oldest entry is evicted.  Sampling is biased
-    towards opponents with similar ELO to provide appropriate challenges.
-    """
+    """Fixed-size pool of historical model checkpoints with ELO ratings."""
 
     max_size: int = 20
     _entries: list[OpponentEntry] = field(default_factory=list)
 
     def add(self, model_path: str, elo: float = 1000.0) -> None:
-        """Add a new opponent snapshot, evicting the oldest if full."""
         if len(self._entries) >= self.max_size:
             self._entries.pop(0)
         self._entries.append(OpponentEntry(model_path=model_path, elo=elo))
 
     def sample(self, n: int, current_elo: float, device: str = "cpu") -> list[MaskablePPO]:
-        """Sample *n* opponent models biased towards similar ELO.
-
-        Returns a list of loaded ``MaskablePPO`` instances.
-        """
         if len(self._entries) == 0:
-            raise RuntimeError("Opponent pool is empty — add at least one snapshot")
-
+            return []
         if len(self._entries) <= n:
             chosen = list(self._entries)
         else:
@@ -91,7 +68,6 @@ class OpponentPool:
             indexed = list(enumerate(scores))
             indexed.sort(key=lambda x: x[1], reverse=True)
             chosen = [self._entries[i] for i, _ in indexed[:n]]
-
         models: list[MaskablePPO] = []
         for entry in chosen:
             m = MaskablePPO.load(entry.model_path, device=device)
@@ -106,6 +82,21 @@ class OpponentPool:
         return len(self._entries) > 0
 
 
+class RandomOpponent:
+    """Fallback opponent that samples uniformly from valid (unmasked) actions."""
+
+    def predict(
+        self, obs: np.ndarray, action_masks: list[np.ndarray] | None = None,
+        deterministic: bool = False,
+    ) -> tuple[np.ndarray, None]:
+        action = np.zeros(5, dtype=np.int64)
+        if action_masks is not None:
+            for i, mask in enumerate(action_masks):
+                valid = np.flatnonzero(np.asarray(mask))
+                action[i] = np.random.choice(valid) if len(valid) > 0 else 0
+        return action, None
+
+
 class SelfPlayWrapper(gym.Wrapper):
     """Wraps a multi-player Container env for single-agent self-play training.
 
@@ -115,21 +106,20 @@ class SelfPlayWrapper(gym.Wrapper):
     transparently handling shopping / produce / auction continuation.
 
     Rewards are the training agent's **cumulative net worth change**
-    across the full action‑opponent‑response cycle — the agent sees its
-    direct reward plus any net worth change caused by opponents before
-    its next turn.
+    across the full action‑opponent‑response cycle.
     """
 
     def __init__(
         self,
         env: gym.Env,
-        opponent_models: dict[int, MaskablePPO],
+        opponent_models: dict[int, MaskablePPO | RandomOpponent],
         main_player: int = 0,
     ) -> None:
         super().__init__(env)
         self.opponent_models = opponent_models
         self.main_player = main_player
         self._agent_reward: float = 0.0
+        self._fallback = RandomOpponent()
 
     @property
     def _func_env(self) -> ContainerFunctional:
@@ -167,11 +157,16 @@ class SelfPlayWrapper(gym.Wrapper):
             for k in ("action_type", "opponent", "color", "price_slot", "purchase")
         ]
 
-    def _opponent_predict(self, model: MaskablePPO, deterministic: bool = False) -> np.ndarray:
+    def _opponent_predict(
+        self, model: MaskablePPO | RandomOpponent, deterministic: bool = False,
+    ) -> np.ndarray:
         obs = self._current_observation()
         masks = self._current_masks()
-        action, _states = model.predict(obs, action_masks=masks, deterministic=deterministic)
+        action, _ = model.predict(obs, action_masks=masks, deterministic=deterministic)
         return np.atleast_1d(action)
+
+    def _get_model(self, player_id: int) -> MaskablePPO | RandomOpponent:
+        return self.opponent_models.get(player_id, self._fallback)
 
     def reset(self, **kwargs):
         self._agent_reward = 0.0
@@ -195,6 +190,13 @@ class SelfPlayWrapper(gym.Wrapper):
         term = bool(self._state.game_over)
         total_reward = self._agent_reward
         self._agent_reward = 0.0
+
+        if term:
+            info["final_rankings"] = rankings_from_net_worth(
+                self._state, self._np, self._func_env, self._nc,
+            )
+            info["agent_rank"] = info["final_rankings"].get(self.main_player, 999)
+
         return self._current_observation(), total_reward, term, trunc, info
 
     def _advance_to_agent_turn(self) -> None:
@@ -210,8 +212,7 @@ class SelfPlayWrapper(gym.Wrapper):
         self._advance_to_agent_turn()
 
     def _play_one_opponent_turn(self, player_id: int) -> None:
-        model = self.opponent_models[player_id]
-
+        model = self._get_model(player_id)
         action = self._opponent_predict(model, deterministic=False)
         self.env.step(action)
         self._handle_continuation(model)
@@ -223,14 +224,12 @@ class SelfPlayWrapper(gym.Wrapper):
         self.env.step(action)
         self._handle_continuation(model)
 
-    def _handle_continuation(self, model: MaskablePPO) -> None:
+    def _handle_continuation(self, model: MaskablePPO | RandomOpponent) -> None:
         state = self._state
-
         while bool(state.shopping_active) or bool(state.produce_active):
             action = self._opponent_predict(model, deterministic=False)
             self.env.step(action)
             state = self._state
-
         _round = 0
         while bool(state.auction_active):
             action = self._opponent_predict(model, deterministic=False)
