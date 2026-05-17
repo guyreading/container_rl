@@ -1,13 +1,22 @@
+![container TUI](./imgs/container_tui.png)
+
 # Container RL Env
 
 ![PyPI version](https://img.shields.io/pypi/v/container-rl.svg)
 
-An RL environment to simulate the board game Container and train agents in
+An RL environment to simulate the board game Container, so you can a) connect to a TUI via ssh to play against your friends/AI b) train RL agents.
 
-* GitHub: https://github.com/guyreading/container-rl/
-* PyPI package: https://pypi.org/project/container-rl/
-* Created by: **[Guy Reading](https://guyreading.github.io/)** | GitHub https://github.com/guyreading | PyPI https://pypi.org/user/guyreading/
-* Free software: MIT License
+
+## Run
+1. Enter `ssh play-container.tech` into the teriminal.
+2. a) i) An ssh key will be searched for (Windows: `C:\Users\<you>\.ssh\id_ed25519`). You can define a custom location with the `-i <directory>` arg
+(see the ssh documentation for more details). If there is not a viable ssh key present, you will be asked to create one.
+2. a) ii) Once an ssh key has been created, enter the ssh command again and you are prompted to enter a username. This is connected
+to your ssh key so you won't need to enter this again on future logins.
+2. b) If you have already created your ssh key and username, you log straight into the TUI.
+3. a) You can create a new container game, adjusting the number of players between 2-5.
+4. b) You can join & play a game.
+
 
 ## Features
 
@@ -18,7 +27,7 @@ An RL environment to simulate the board game Container and train agents in
 * Action masking via MaskablePPO for RL training
 * Persistent game state (SQLite), rejoin mid-game with name + password
 
-## Quick Start
+## Quick Start (Dev)
 
 ### Local TUI (single machine)
 
@@ -134,7 +143,12 @@ Run quality checks (format, lint, type check, test):
 just qa
 ```
 
-## Author
+## Author & Sources
+* GitHub: https://github.com/guyreading/container-rl/
+* PyPI package: https://pypi.org/project/container-rl/
+* Created by: **[Guy Reading](https://guyreading.github.io/)** | GitHub https://github.com/guyreading | PyPI https://pypi.org/user/guyreading/
+* Free software: MIT License
+
 
 Container RL Env was created in 2026 by Guy Reading.
 
