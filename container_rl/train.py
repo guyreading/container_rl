@@ -12,8 +12,10 @@ from typing import Optional
 import gymnasium as gym
 import numpy as np
 from sb3_contrib import MaskablePPO
+from gymnasium.vector import SyncVectorEnv
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
-from stable_baselines3.common.env_util import make_vec_env
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import DummyVecEnv
 
 from container_rl import ContainerEnv
 from container_rl.env.container import head_sizes, mask_size
@@ -48,16 +50,16 @@ class ContainerMaskWrapper(gym.ObservationWrapper):
         self._raw_obs = obs
         return obs[: -self._msk_size]
 
-    def action_masks(self) -> list[np.ndarray]:
+    def action_masks(self) -> np.ndarray:
+        """Return the concatenated action mask as a single flat array.
+
+        sb3's ``env_method('action_masks')`` collects results from all
+        sub-envs and stacks them with ``np.stack``, so we must return a
+        single 1-d array, not a list of per-head arrays.
+        """
         if self._raw_obs is None:
-            return [np.ones(s, dtype=bool) for s in self._head_sizes]
-        mask_part = self._raw_obs[-self._msk_size:]
-        masks: list[np.ndarray] = []
-        offset = 0
-        for size in self._head_sizes:
-            masks.append(mask_part[offset : offset + size].astype(bool))
-            offset += size
-        return masks
+            return np.concatenate([np.ones(s, dtype=bool) for s in self._head_sizes])
+        return self._raw_obs[-self._msk_size:].astype(bool)
 
 
 class SelfPlayCallback(BaseCallback):
@@ -146,13 +148,15 @@ def main() -> None:
             for i, m in enumerate(models):
                 opponent_models[i + 1] = m
             env = SelfPlayWrapper(env, opponent_models, main_player=0)
-        return ContainerMaskWrapper(env, num_players=NUM_PLAYERS, num_colors=NUM_COLORS)
+        env = ContainerMaskWrapper(env, num_players=NUM_PLAYERS, num_colors=NUM_COLORS)
+        env = Monitor(env)  # logs episode rewards/steps to TensorBoard
+        return env
 
-    vec_env = make_vec_env(_make_env, n_envs=args.num_envs, seed=args.seed,
-                           vec_env_cls=gym.vector.SyncVectorEnv)
+    vec_env = DummyVecEnv([_make_env for _ in range(args.num_envs)])
+    vec_env.seed(args.seed)
 
-    eval_env = make_vec_env(_make_env, n_envs=1, seed=args.seed + 1,
-                            vec_env_cls=gym.vector.SyncVectorEnv)
+    eval_env = _make_env()
+    eval_env.reset(seed=args.seed + 1)
 
     eval_callback = EvalCallback(
         eval_env,
