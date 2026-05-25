@@ -1695,7 +1695,7 @@ class ContainerFunctional(
 
     def _check_game_end(self, state, num_colors):
         exhausted = jnp.sum(state.container_supply <= 0)
-        game_over = (exhausted >= 2) | (state.step_count > 1000)
+        game_over = (exhausted >= 2)
         state = state._replace(
             game_over=jnp.where(game_over, jnp.array(1, dtype=state.game_over.dtype), state.game_over)
         )

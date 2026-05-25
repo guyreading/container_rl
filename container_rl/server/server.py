@@ -79,6 +79,7 @@ class ClientHandler:
             password = p.get("password") or None
             num_players = int(p.get("num_players", 2))
             num_colors = int(p.get("num_colors", 5))
+            ai_count = int(p.get("ai_count", 0))
             seed = p.get("seed")
             if seed is not None:
                 seed = int(seed)
@@ -86,9 +87,11 @@ class ClientHandler:
                 raise ValueError("Player name is required.")
             if num_players < 2 or num_players > 6:
                 raise ValueError("num_players must be 2–6.")
+            if ai_count < 0 or ai_count >= num_players:
+                raise ValueError(f"ai_count must be 0–{num_players - 1}.")
 
             trusted = self.server._is_localhost(self.addr)
-            result = self.server.manager.create_game_trusted(name, num_players, num_colors, seed) if trusted else \
+            result = self.server.manager.create_game_trusted(name, num_players, num_colors, seed, ai_count=ai_count) if trusted else \
                      self.server.manager.create_game(name, password, num_players, num_colors, seed)
             self.game_id = result["game_id"]
             self.player_index = result["player_index"]
@@ -99,6 +102,9 @@ class ClientHandler:
                 "player_index": result["player_index"],
             })
             self._send_lobby()
+            started = self.server.manager.maybe_start_game(self.game_id)
+            if started:
+                self._broadcast_to_game("game_started", {})
         except Exception as e:
             self.send("error", {"message": str(e)})
 
@@ -247,11 +253,11 @@ class ClientHandler:
 
 class GameServer:
     def __init__(self, host: str = "0.0.0.0", port: int = 9876, db_path: str = "container_server.db",
-                 maintainer_token: str = ""):
+                 maintainer_token: str = "", ai_model_path: str | None = None):
         self.host = host
         self.port = port
         self.db = Database(db_path)
-        self.manager = GameManager(self.db, self.broadcast)
+        self.manager = GameManager(self.db, self.broadcast, ai_model_path=ai_model_path)
         self.maintainer_token = maintainer_token or os.urandom(8).hex()
         self._game_clients: dict[int, list[ClientHandler]] = {}  # game_id -> clients
         self._lock = threading.Lock()
@@ -335,11 +341,13 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=9876, help="TCP port")
     parser.add_argument("--db", default="container_server.db", help="SQLite database path")
     parser.add_argument("--maintainer-token", default="", help="Token for the maintainer client")
+    parser.add_argument("--ai-model", default=None, help="Path to trained MaskablePPO model for AI opponents")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     server = GameServer(host=args.host, port=args.port, db_path=args.db,
-                        maintainer_token=args.maintainer_token)
+                        maintainer_token=args.maintainer_token,
+                        ai_model_path=args.ai_model)
     server.run()
 
 
