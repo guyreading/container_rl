@@ -95,6 +95,17 @@ class GameManager:
                 self.db.assign_player_slot(game_id, ai_pid, slot)
         return {"game_id": game_id, "code": code, "player_index": 0, "ai_count": ai_count}
 
+    def _get_ai_slots(self, game_id: int) -> list[int]:
+        """Derive AI player slots from the database (survives server restarts)."""
+        if game_id in self._ai_slots:
+            return self._ai_slots[game_id]
+        players = self.db.get_game_players(game_id)
+        ai_slots = [int(p["player_index"]) for p in players
+                     if (p.get("name") or "").startswith("[AI]")]
+        if ai_slots:
+            self._ai_slots[game_id] = ai_slots
+        return ai_slots
+
     def join_game(
         self, player_name: str, password: str | None, code: str,
     ) -> dict:
@@ -188,7 +199,7 @@ class GameManager:
             self.db.set_game_status(game_id, "active")
 
             # If AI slots exist, auto-play their first turns if they start
-            if game_id in self._ai_slots:
+            if self._get_ai_slots(game_id):
                 self._play_ai_turns(game_id)
 
             return True
@@ -301,7 +312,7 @@ class GameManager:
                 })
 
             # Auto-play AI turns before returning control
-            if game_id in self._ai_slots and not game_over:
+            if self._get_ai_slots(game_id) and not game_over:
                 self._play_ai_turns(game_id)
 
             return {
@@ -345,7 +356,7 @@ class GameManager:
         if env is None:
             return
 
-        ai_slots = self._ai_slots.get(game_id, [])
+        ai_slots = self._get_ai_slots(game_id)
         nc = env.func_env.params.num_colors
         np_ = env.func_env.params.num_players
         ms_size = self._get_mask_size(np_, nc)
