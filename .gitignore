@@ -17,6 +17,9 @@ MANIFEST
 screenshots/
 *.db*
 runs/
+MEMORY/
+CHANGELOG/
+.opencode/
 
 # Unit test / coverage reports
 htmlcov/
