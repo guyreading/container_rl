@@ -1462,19 +1462,19 @@ class ContainerFunctional(
         nc = params.num_colors
         player = state.current_player
         seller = state.auction_seller
-        bidder = int(jnp.clip(action[HEAD_OPPONENT], 0, np_ - 1))
+        bidder = jnp.clip(action[HEAD_OPPONENT], 0, np_ - 1)
         round_ = state.auction_round
         is_bidding = round_ == 0
         is_decision = round_ == 1
 
-        bid_amount = jnp.clip(action[HEAD_PURCHASE], 0, state.cash[int(bidder)])
+        bid_amount = jnp.clip(action[HEAD_PURCHASE], 0, state.cash[bidder])
 
         def _store_bid(s):
             # Only record if this player hasn't bid yet and is not the seller.
-            has_bid = s.auction_bids[int(bidder)] >= 0
-            ok_to_bid = (~has_bid) & (int(bidder) != int(seller))
-            bids = s.auction_bids.at[int(bidder)].set(
-                jnp.where(ok_to_bid, bid_amount, s.auction_bids[int(bidder)])
+            has_bid = s.auction_bids[bidder] >= 0
+            ok_to_bid = (~has_bid) & (bidder != seller)
+            bids = s.auction_bids.at[bidder].set(
+                jnp.where(ok_to_bid, bid_amount, s.auction_bids[bidder])
             )
             # Check if all non-seller players have bid
             all_bid = ~jnp.any(bids == -1)
@@ -1696,7 +1696,7 @@ class ContainerFunctional(
 
     def _check_game_end(self, state, num_colors):
         exhausted = jnp.sum(state.container_supply <= 0)
-        game_over = (exhausted >= 2) | (state.step_count > 1000)
+        game_over = (exhausted >= 2)
         state = state._replace(
             game_over=jnp.where(game_over, jnp.array(1, dtype=state.game_over.dtype), state.game_over)
         )

@@ -88,7 +88,17 @@ def serialize_state(state: EnvState) -> bytes:
 
 
 def deserialize_state(blob: bytes) -> EnvState:
-    """Reconstruct an *EnvState* from pickled bytes."""
+    """Reconstruct an *EnvState* from pickled bytes.
+
+    Fills in missing fields (from older save formats) with zeros.
+    """
     data = pickle.loads(blob)
-    kwargs = {key: jnp.asarray(data[key]) for key in _STATE_KEYS}
+    kwargs = {}
+    for key in _STATE_KEYS:
+        if key in data:
+            kwargs[key] = jnp.asarray(data[key])
+        else:
+            # Fill missing fields with zeros (backward-compat with older saves)
+            shape = getattr(EnvState, key, None)
+            kwargs[key] = jnp.zeros((), dtype=jnp.int32)
     return EnvState(**kwargs)
