@@ -149,8 +149,9 @@ class EnvState(NamedTuple):
     current_player: jax.Array  # player index whose turn it is
     game_over: jax.Array  # 0/1
 
-    # Secret value cards: [MAX_PLAYERS], color that scores 10/5 for that player
-    secret_value_color: jax.Array
+    # Secret container value cards: [MAX_PLAYERS, MAX_COLORS], multiplier (2/4/6/10/-1)
+    # -1 is the special "5/10" card: 5 if incomplete set, 10 if all 5 colours owned.
+    secret_card_values: jax.Array
 
     # Auction state (when auction_active > 0)
     auction_active: jax.Array  # 0/1
@@ -468,7 +469,7 @@ class ContainerFunctional(
             + _np * SHIP_CAPACITY      # ship_contents
             + _nc                      # container_supply
             + 4                        # turn_phase, current_player, game_over, actions_taken
-            + _np                      # secret_value_color per player
+            + _np * _nc                 # secret_card_values per player per colour
             + 5                        # auction_active, auction_seller, auction_cargo_count
             + 4                        # shopping_active, shopping_action_type, shopping_target, shopping_harbour_price
             + 1 + _nc                  # produce_active + produce_pending (nc colours)
@@ -836,7 +837,7 @@ class ContainerFunctional(
             island_store=jnp.roll(state.island_store, shift, axis=0),
             ship_contents=jnp.roll(state.ship_contents, shift, axis=0),
             ship_location=jnp.roll(state.ship_location, shift, axis=0),
-            secret_value_color=jnp.roll(state.secret_value_color, shift, axis=0),
+            secret_card_values=jnp.roll(state.secret_card_values, shift, axis=0),
             auction_bids=jnp.roll(state.auction_bids, shift, axis=0),
 
             # ---- player-index scalars (remap) ------------------------------
@@ -1707,11 +1708,16 @@ class ContainerFunctional(
         """Initial game state."""
         if params is None:
             params = self.params
-        # Randomly assign secret value cards
+        # Randomly assign secret container value cards
+        # Each player gets a random permutation of {2, 4, 6, 10, -1}
+        # -1 is the special "5/10" card
+        base_values = jnp.array([2, 4, 6, 10, -1], dtype=jnp.int32)
+        secret_card_values = jnp.zeros((params.num_players, params.num_colors), dtype=jnp.int32)
         key1, key2 = random.split(rng)
-        secret_value_color = random.randint(
-            key1, (params.num_players,), 0, params.num_colors
-        )
+        for i in range(params.num_players):
+            key1, subkey = random.split(key1)
+            perm = random.permutation(subkey, base_values, independent=True)
+            secret_card_values = secret_card_values.at[i].set(perm)
 
         # Randomly assign starting factory colors (unique per player)
         factory_colors = jnp.zeros((params.num_players, params.num_colors), dtype=jnp.int32)
@@ -1742,7 +1748,7 @@ class ContainerFunctional(
             turn_phase=jnp.array(0, dtype=jnp.int32),
             current_player=jnp.array(0, dtype=jnp.int32),
             game_over=jnp.array(0, dtype=jnp.int32),
-            secret_value_color=secret_value_color,
+            secret_card_values=secret_card_values,
             auction_active=jnp.array(0, dtype=jnp.int32),
             auction_seller=jnp.array(0, dtype=jnp.int32),
             auction_cargo=jnp.zeros(SHIP_CAPACITY, dtype=jnp.int32),
@@ -1808,7 +1814,7 @@ class ContainerFunctional(
                 ]
             )
         )
-        parts.append(centered.secret_value_color.astype(jnp.float32))
+        parts.append(centered.secret_card_values.reshape(-1).astype(jnp.float32))
         parts.append(
             jnp.array(
                 [
@@ -1864,44 +1870,14 @@ class ContainerFunctional(
         harbour_val = jnp.sum(state.harbour_store[player]).astype(jnp.int32) * 2
         ship_val = self._count_ship_cargo(state.ship_contents, player).astype(jnp.int32) * 3
 
-        secret_color = state.secret_value_color[player].astype(jnp.int32)
-        island_row = state.island_store[player]
-        has_all_colors = jnp.all(island_row > 0)
-
-        value_per_color = jnp.full(num_colors, 2, dtype=jnp.int32)
-        value_per_color = value_per_color.at[secret_color].set(
-            jnp.where(has_all_colors, 10, 5)
-        )
-
-        counts = island_row
-        max_count = jnp.max(counts)
-        is_max_int = (counts == max_count).astype(jnp.int32)
-        num_max = jnp.sum(is_max_int)
-        is_tied = (num_max > 1).astype(jnp.int32)
-        is_secret_in_tie = is_tied * is_max_int[secret_color]
-
-        discard_col = jnp.zeros((), dtype=jnp.int32)
-        discard_col = jnp.where(is_tied == 0, jnp.argmax(is_max_int), discard_col)
-
-        secret_tie = (is_secret_in_tie > 0)
-        discard_col = jnp.where(secret_tie, secret_color, discard_col)
-
-        not_secret_tie = (is_tied > 0) & (~secret_tie)
-        cheap_vals = jnp.where(
-            is_max_int > 0, value_per_color, jnp.array(999999, dtype=jnp.int32)
-        )
-        cheapest_idx = jnp.argmin(cheap_vals)
-        discard_col = jnp.where(not_secret_tie, cheapest_idx, discard_col)
-
-        has_any = jnp.any(counts > 0)
-        final_discard = jnp.where(
-            has_any,
-            jnp.zeros(num_colors, dtype=jnp.int32).at[discard_col].set(1),
-            jnp.zeros(num_colors, dtype=jnp.int32),
-        )
-
-        scored_counts = jnp.where(final_discard > 0, jnp.array(0, dtype=jnp.int32), counts)
-        island_val = jnp.sum(scored_counts * value_per_color)
+        card_values = state.secret_card_values[player].astype(jnp.int32)
+        island_row = state.island_store[player].astype(jnp.int32)
+        has_all = jnp.all(island_row > 0)
+        # -1 means "5/10": 10 with full set, 5 otherwise
+        multipliers = jnp.where(card_values == -1,
+                                jnp.where(has_all, 10, 5),
+                                card_values)
+        island_val = jnp.sum(island_row * multipliers)
 
         total = cash + harbour_val + ship_val + island_val - loans_penalty
         return total

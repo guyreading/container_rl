@@ -70,7 +70,7 @@ _STATE_KEYS = [
     "cash", "loans", "factory_colors", "warehouse_count",
     "factory_store", "harbour_store", "island_store",
     "ship_contents", "ship_location", "container_supply",
-    "turn_phase", "current_player", "game_over", "secret_value_color",
+    "turn_phase", "current_player", "game_over", "secret_card_values",
     "auction_active", "auction_seller", "auction_cargo",
     "auction_bids", "auction_round",
     "actions_taken", "produced_this_turn",

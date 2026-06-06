@@ -182,19 +182,20 @@ def _net_worth(state, player, nc):
     hv = sum((s+1)*int(state.harbour_store[player,c,s]) for c in range(nc) for s in range(PRICE_SLOTS))
     sv = sum(3 for c in state.ship_contents[player] if int(c)>0)
     iv = 0
+    has_all = all(int(state.island_store[player, cc]) > 0 for cc in range(nc))
     for c in range(nc):
-        cnt = int(state.island_store[player,c])
-        if cnt>0:
-            sec = int(state.secret_value_color[player])
-            base = 10 if (c==sec and all(int(state.island_store[player,cc])>0 for cc in range(nc))) else (5 if c==sec else 2)
-            iv += base*cnt
-    return cash + hv + sv + iv - int(state.loans[player])*11
+        cnt = int(state.island_store[player, c])
+        if cnt > 0:
+            val = int(state.secret_card_values[player, c])
+            if val == -1:
+                val = 10 if has_all else 5
+            iv += val * cnt
+    return cash + hv + sv + iv - int(state.loans[player]) * 11
 
 def _player_card(state, player, nc, is_current):
     cash = int(state.cash[player])
     loans = int(state.loans[player])
     wh = int(state.warehouse_count[player])
-    sec = int(state.secret_value_color[player])
     nw = _net_worth(state, player, nc)
     facs = [f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}]" for c in range(nc) if int(state.factory_colors[player,c])]
     fstr = ", ".join(facs) if facs else "[dim]none[/dim]"
@@ -203,7 +204,16 @@ def _player_card(state, player, nc, is_current):
     out = Text.from_markup(f"[bold]{name}{badge}[/bold]  ${nw}\n")
     out.append("─"*28+"\n")
     out.append_text(Text.from_markup(f"  💵 ${cash}  🏦 {loans} loans  🏭 {wh} wh\n"))
-    out.append_text(Text.from_markup(f"  🤫 [{_cs(sec)}]{_cn(sec,nc)}[/{_cs(sec)}]\n"))
+    # Secret card: only visible to the player who owns it
+    if is_current:
+        card_parts = []
+        for c in range(nc):
+            val = int(state.secret_card_values[player, c])
+            label = "5/10" if val == -1 else str(val)
+            card_parts.append(f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}]={label}")
+        out.append_text(Text.from_markup(f"  🤫 {' '.join(card_parts)}\n"))
+    else:
+        out.append_text(Text.from_markup(f"  🤫 [dim]hidden[/dim]\n"))
     out.append_text(Text.from_markup(f"  Factories: {fstr}\n"))
     out.append_text(Text.from_markup("  [bold]Factory Store:[/bold]\n"))
     out.append_text(Text.from_markup(_store_compact(state.factory_store,player,nc)+"\n"))
@@ -539,14 +549,15 @@ def _show_final_scores(state, nc, np_):
         cash = int(state.cash[p])
         hv = sum((s + 1) * int(state.harbour_store[p, c, s]) for c in range(nc) for s in range(PRICE_SLOTS))
         sv = sum(3 for c in state.ship_contents[p] if int(c) > 0)
-        sec = int(state.secret_value_color[p])
+        has_all = all(int(state.island_store[p, cc]) > 0 for cc in range(nc))
         iv = 0
         for c in range(nc):
             cnt = int(state.island_store[p, c])
             if cnt > 0:
-                has_all = all(int(state.island_store[p, cc]) > 0 for cc in range(nc))
-                base = 10 if (c == sec and has_all) else (5 if c == sec else 2)
-                iv += base * cnt
+                val = int(state.secret_card_values[p, c])
+                if val == -1:
+                    val = 10 if has_all else 5
+                iv += val * cnt
         loans = int(state.loans[p])
         total = cash + hv + sv + iv - loans * 11
         bt.add_row(
@@ -994,7 +1005,7 @@ def _lobby():
                 console.print(f"  {nm}{mrk}")
         n = NUM_PLAYERS - len(lobby_players)
         console.print(f"\n[dim]{n} more needed.  q to leave.[/dim]")
-        if _ch() in ("q","Q"): return False
+        if _ch() in ("\x1b","q","Q"): return False
         _time.sleep(0.3)
     return False
 
@@ -1106,8 +1117,9 @@ def main():
             _gameplay()
             return
 
-        ch = _main_menu()
-        if ch is None: return
+        while True:
+            ch = _main_menu()
+            if ch is None: break
 
         if ch==1:
             cfg = _create_screen()
