@@ -195,6 +195,8 @@ class ClientHandler:
                 "shopping_active": int(state.shopping_active),
                 "game_over": int(state.game_over),
             })
+            # If it's an AI player's turn, auto-play it
+            self.server.manager.play_ai_turn_if_needed(self.game_id)
         except Exception as e:
             self.send("error", {"message": str(e)})
 

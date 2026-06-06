@@ -343,6 +343,17 @@ class GameManager:
             self._mask_sizes[key] = mask_size(np_, nc)
         return self._mask_sizes[key]
 
+    def play_ai_turn_if_needed(self, game_id: int) -> None:
+        """Public entry point: auto-play AI turns if it's an AI's turn.
+
+        Called after ``get_state`` (rejoin) to ensure AI players
+        take action immediately instead of waiting for a human.
+        """
+        with self._lock:
+            if game_id not in self._envs:
+                return
+            self._play_ai_turns(game_id)
+
     def _play_ai_turns(self, game_id: int) -> None:
         """Continuously play AI turns until a human player's turn or game over.
 
