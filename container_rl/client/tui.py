@@ -13,6 +13,7 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+from rich.align import Align
 from rich.console import Console, Group
 from rich.columns import Columns
 from rich.live import Live
@@ -144,6 +145,10 @@ def _send_multi_action(arr: list[int]) -> None:
     CLIENT.send("action_multi", {"action": arr})
 
 # ── rendering ────────────────────────────────────────────────────────────
+
+def _print_centered(renderable) -> None:
+    """Print a renderable centered both horizontally and vertically."""
+    console.print(Align.center(renderable, vertical="middle", height=console.height))
 
 COLOR_NAMES = ["Red", "Green", "Blue", "Yellow", "Purple"]
 COLOR_STYLES = ["red", "green", "blue", "yellow", "magenta"]
@@ -525,7 +530,7 @@ def _show_final_scores(state, nc, np_):
     )
 
     # Leaderboard
-    lb = Table(title="[bold]🏆 Final Scores[/bold]", border_style="bold yellow", expand=True)
+    lb = Table(title="[bold]🏆 Final Scores[/bold]", border_style="bold yellow")
     lb.add_column("Rank", style="dim", width=5, justify="center")
     lb.add_column("Player", style="bold")
     lb.add_column("Score", style="bold green", justify="right")
@@ -535,7 +540,7 @@ def _show_final_scores(state, nc, np_):
         lb.add_row(marker, name, f"${total}")
 
     # Breakdown table
-    bt = Table(title="Score Breakdown", border_style="dim blue", expand=True)
+    bt = Table(title="Score Breakdown", border_style="dim blue")
     bt.add_column("Player", style="bold")
     bt.add_column("Cash", justify="right")
     bt.add_column("Harbour Store", justify="right")
@@ -571,11 +576,7 @@ def _show_final_scores(state, nc, np_):
         )
 
     console.clear()
-    console.print(lb)
-    console.print()
-    console.print(bt)
-    console.print()
-    console.print("[dim]Press any key to exit…[/dim]")
+    _print_centered(Group(lb, Text(""), bt, Text(""), Text.from_markup("[dim]Press any key to exit…[/dim]")))
 
 
 # ── gameplay loop ────────────────────────────────────────────────────────
@@ -849,7 +850,7 @@ def _main_menu():
             f"[bold]🚢 Container RL — select with ↑↓ or number, Enter to confirm:[/bold]\n\n{body}"
         )
         console.clear()
-        console.print(Panel(frame, border_style="blue"))
+        _print_centered(Panel.fit(frame, border_style="blue"))
         ch = _key(None)
         if ch in ("\x1b", "q", "Q"):
             return None
@@ -893,7 +894,7 @@ def _create_screen():
             body += f"[dim]AI will fill the last {ai_players} slot(s).[/dim]\n\n"
         body += f"[dim]←→/hl adjust  •  ↑↓/jk select  •  Enter to create  •  Esc to back[/dim]"
         console.clear()
-        console.print(Panel(Text.from_markup(body), border_style="green"))
+        _print_centered(Panel.fit(Text.from_markup(body), border_style="green"))
         ch = _key(None)
         if ch in ("\x1b", "q", "Q"):
             return None
@@ -919,7 +920,7 @@ def _create_screen():
 
 def _join_screen():
     console.clear()
-    console.print(Panel.fit(f"[bold]Join Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]", border_style="green"))
+    _print_centered(Panel.fit(f"[bold]Join Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]", border_style="green"))
     # fetch games
     CLIENT.send("list_games", {"player_name": MY_NAME})
     _time.sleep(0.5)
@@ -960,7 +961,7 @@ def _show_game_list(games: list[dict]) -> str | None:
             f"[bold]Available games — ↑↓ to select, Enter to confirm, ESC to cancel:[/bold]\n\n{body}"
         )
         console.clear()
-        console.print(Panel(frame, border_style="yellow"))
+        _print_centered(Panel.fit(frame, border_style="yellow"))
         ch = _key(None)
         if ch in ("\x1b", "q", "Q"):
             return None
@@ -995,16 +996,17 @@ def _lobby():
             elif t=="game_started": return True
             elif t=="error": console.print(f"[red]{p.get('message','')}[/red]"); _key(1)
             elif t=="disconnected": return False
-        console.clear()
-        console.print(Panel.fit(f"[bold]Lobby — {GAME_CODE}[/bold]", border_style="yellow"))
+        body = f"[bold]Lobby — {GAME_CODE}[/bold]\n\n"
         if lobby_players:
-            console.print("[bold]Players:[/bold]")
+            body += "[bold]Players:[/bold]\n"
             for pl in lobby_players:
                 idx=pl.get("player_index",0); nm=pl.get("name","?")
                 mrk=" [green](you)[/green]" if int(idx)==PLAYER_INDEX else ""
-                console.print(f"  {nm}{mrk}")
+                body += f"  {nm}{mrk}\n"
         n = NUM_PLAYERS - len(lobby_players)
-        console.print(f"\n[dim]{n} more needed.  q to leave.[/dim]")
+        body += f"\n[dim]{n} more needed.  q to leave.[/dim]"
+        console.clear()
+        _print_centered(Panel.fit(Text.from_markup(body), border_style="yellow"))
         if _ch() in ("\x1b","q","Q"): return False
         _time.sleep(0.3)
     return False
@@ -1063,6 +1065,11 @@ def main():
     MY_NAME = args.player_name or MY_NAME
     CLIENT = GameClient(args.host, args.port)
     _enter_raw()
+    # Render entirely on the terminal's alternate screen buffer (like vim/htop) so
+    # repeated clear+redraw cycles never grow the terminal's scrollback/scrollbar.
+    used_alt_screen = console.set_alt_screen(True)
+    if used_alt_screen:
+        console.show_cursor(False)
     try:
         try:
             CLIENT.connect()
@@ -1172,6 +1179,9 @@ def main():
             if not started: return
         _gameplay()
     finally:
+        if used_alt_screen:
+            console.set_alt_screen(False)
+            console.show_cursor(True)
         _exit_raw()
         if CLIENT: CLIENT.disconnect()
         console.print("[dim]Goodbye![/dim]")
