@@ -104,6 +104,10 @@ def _key(timeout: float | None = None) -> str:
     ch = sys.stdin.read(1)
     if ch == "\x1b":
         fd = sys.stdin.fileno()
+        # Over SSH the rest of an escape sequence (e.g. arrow keys) can
+        # arrive in a later packet than the ESC byte; wait briefly for it
+        # so arrows aren't misread as a bare ESC keypress.
+        select.select([sys.stdin], [], [], 0.05)
         old_fl = fcntl.fcntl(fd, fcntl.F_GETFL)
         try:
             fcntl.fcntl(fd, fcntl.F_SETFL, old_fl | os.O_NONBLOCK)
@@ -146,8 +150,13 @@ def _send_multi_action(arr: list[int]) -> None:
 # ── rendering ────────────────────────────────────────────────────────────
 
 def _print_centered(renderable) -> None:
-    """Print a renderable centered both horizontally and vertically."""
-    console.print(Align.center(renderable, vertical="middle", height=console.height))
+    """Print a renderable centered both horizontally and vertically.
+
+    Renders one line short of the full screen height: a newline printed on
+    the bottom row scrolls the terminal, which pushes a line into scrollback
+    on every redraw and makes the scrollbar grow.
+    """
+    console.print(Align.center(renderable, vertical="middle", height=max(1, console.height - 1)))
 
 COLOR_NAMES = ["Red", "Green", "Blue", "Yellow", "Purple"]
 COLOR_STYLES = ["red", "green", "blue", "yellow", "magenta"]
@@ -1120,11 +1129,11 @@ def main():
 
         while True:
             ch = _main_menu()
-            if ch is None: break
+            if ch is None: return
+            cfg = _create_screen() if ch == 1 else _join_screen()
+            if cfg is not None: break
 
         if ch==1:
-            cfg = _create_screen()
-            if cfg is None: return
             MY_NAME=cfg["player_name"]
             CLIENT.send("create_game", cfg)
             _started = False
@@ -1146,8 +1155,6 @@ def main():
                     break
                 _time.sleep(0.1)
         else:
-            cfg = _join_screen()
-            if cfg is None: return
             MY_NAME=cfg["player_name"]
             CLIENT.send("join_game", cfg)
             for _i in range(50):
