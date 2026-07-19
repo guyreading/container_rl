@@ -12,7 +12,6 @@ from typing import Optional
 import gymnasium as gym
 import numpy as np
 from sb3_contrib import MaskablePPO
-from gymnasium.vector import SyncVectorEnv
 from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv

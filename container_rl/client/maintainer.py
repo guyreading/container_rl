@@ -10,7 +10,6 @@ import sys
 import termios
 import time as _time
 import tty
-from typing import Any
 
 from rich.console import Console
 from rich.panel import Panel

@@ -7,12 +7,10 @@ Usage::
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import selectors
 import socket
-import sys
 import threading
 from typing import Any
 

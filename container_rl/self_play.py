@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import random as py_random
 from dataclasses import dataclass, field
 

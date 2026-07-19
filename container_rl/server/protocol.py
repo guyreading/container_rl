@@ -99,6 +99,5 @@ def deserialize_state(blob: bytes) -> EnvState:
             kwargs[key] = jnp.asarray(data[key])
         else:
             # Fill missing fields with zeros (backward-compat with older saves)
-            shape = getattr(EnvState, key, None)
             kwargs[key] = jnp.zeros((), dtype=jnp.int32)
     return EnvState(**kwargs)

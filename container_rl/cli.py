@@ -14,7 +14,6 @@ import select
 import sys
 import termios
 import tty
-from typing import TYPE_CHECKING
 
 import jax
 import typer
@@ -36,14 +35,8 @@ from container_rl.env.container import (
     ACTION_PRODUCE,
     ACTION_REPAY_LOAN,
     ACTION_TAKE_LOAN,
-    HARBOUR_PRICE_CHOICES,
     HARBOUR_PRICE_MAX,
     HARBOUR_PRICE_MIN,
-    HEAD_ACTION_TYPE,
-    HEAD_COLOR,
-    HEAD_OPPONENT,
-    HEAD_PRICE_SLOT,
-    HEAD_PURCHASE,
     LEAVE_IDLE,
     LOCATION_AUCTION_ISLAND,
     LOCATION_HARBOUR_OFFSET,
@@ -57,9 +50,6 @@ from container_rl.env.container import (
     ContainerJaxEnv,
     EnvState,
 )
-
-if TYPE_CHECKING:
-    pass
 
 jax.config.update("jax_disable_jit", True)
 

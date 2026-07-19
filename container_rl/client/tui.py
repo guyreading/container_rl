@@ -96,7 +96,6 @@ def _ch():
 def _key(timeout: float | None = None) -> str:
     """Read a keystroke. timeout=None blocks indefinitely.  Returns escape
     sequences (e.g. ``'\\x1b[A'``) for arrow keys."""
-    import os as _os
     if timeout is not None:
         r, _, _ = select.select([sys.stdin], [], [], timeout)
         if not r:

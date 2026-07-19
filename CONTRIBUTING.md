@@ -31,7 +31,7 @@ Container RL Env could always use more documentation, whether as part of the off
 To preview the docs locally:
 
 ```sh
-just docs-serve
+uv run --group docs zensical serve
 ```
 
 This starts a local server at http://localhost:8000 with live reload. Edit files in `docs/` or add docstrings to your code (the API reference page is auto-generated).
@@ -72,16 +72,13 @@ Ready to contribute? Here's how to set up `container_rl` for local development.
 
    Now you can make your changes locally.
 
-5. When you're done making changes, check that your changes pass linting and the tests:
+5. When you're done making changes, check that your changes pass linting, type checking, and the tests:
 
    ```sh
-   just qa
-   ```
-
-   Or run the tests alone:
-
-   ```sh
-   just test
+   uv run ruff format --check .
+   uv run ruff check .
+   uv run ty check .
+   uv run pytest
    ```
 
 6. Commit your changes and push your branch to GitHub:
@@ -124,7 +121,7 @@ uv run pytest tests/
    ```
 3. **Release:**
    ```bash
-   just release
+   uv run scripts/release.py
    ```
    This creates an annotated `v*` tag, pushes it to GitHub, and creates a
    GitHub Release with the changelog contents as release notes. The tag
