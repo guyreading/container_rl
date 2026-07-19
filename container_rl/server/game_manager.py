@@ -516,7 +516,6 @@ def _state_to_json_data(state: EnvState) -> dict:
 
 def _describe_action(action, encoder: ActionEncoder, num_colors: int, state=None, player_names: dict[int, str] | None = None) -> str:
     """Return a human-readable description of *action* (flat int or multi-head array)."""
-    import jax.numpy as jnp
     try:
         if hasattr(action, "ndim") and action.ndim == 1 and action.shape[0] >= 5:
             atype = int(action[0])

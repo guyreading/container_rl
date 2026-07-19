@@ -86,7 +86,7 @@ select = [
 [tool.coverage.run]
 branch = true
 parallel = true
-source = ["src/", "tests/"]
+source = ["container_rl/", "tests/"]
 
 [tool.coverage.report]
 show_missing = true
