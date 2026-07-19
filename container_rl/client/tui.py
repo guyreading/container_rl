@@ -1064,11 +1064,6 @@ def main():
     MY_NAME = args.player_name or MY_NAME
     CLIENT = GameClient(args.host, args.port)
     _enter_raw()
-    # Render entirely on the terminal's alternate screen buffer (like vim/htop) so
-    # repeated clear+redraw cycles never grow the terminal's scrollback/scrollbar.
-    used_alt_screen = console.set_alt_screen(True)
-    if used_alt_screen:
-        console.show_cursor(False)
     try:
         try:
             CLIENT.connect()
@@ -1178,9 +1173,6 @@ def main():
             if not started: return
         _gameplay()
     finally:
-        if used_alt_screen:
-            console.set_alt_screen(False)
-            console.show_cursor(True)
         _exit_raw()
         if CLIENT: CLIENT.disconnect()
         console.print("[dim]Goodbye![/dim]")
