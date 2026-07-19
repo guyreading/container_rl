@@ -14,7 +14,6 @@ Please include:
 
 This project ships with security hardening out of the box:
 
-- **Dependabot** keeps GitHub Actions pinned by SHA and opens PRs for updates, with a 7-day cooldown to avoid adopting compromised releases immediately
 - **All actions pinned by SHA** with version comments, not floating tags
 - **Minimal workflow permissions** (`permissions: {}` at the top level, scoped per job)
 - **`persist-credentials: false`** on checkout steps to prevent token leakage
