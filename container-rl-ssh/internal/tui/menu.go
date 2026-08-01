@@ -50,9 +50,9 @@ func (m *MenuModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		debugLog("MENU_KEY type=%d string=%q runes=%v\n", msg.Type, msg.String(), msg.Runes)
 		switch msg.String() {
 		case "ctrl+c":
-			return m, tea.Quit
+			return m, QuitCmd
 		case "q", "esc":
-			return m, tea.Quit
+			return m, QuitCmd
 		case "up", "k":
 			if m.cursor > 0 {
 				m.cursor--
@@ -70,7 +70,7 @@ func (m *MenuModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				jm := NewJoinModel(m.root, m.playerName)
 				return jm, jm.fetchGames()
 			case 2:
-				return m, tea.Quit
+				return m, QuitCmd
 			}
 		}
 	}
@@ -118,7 +118,7 @@ func (m *CreateModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
-			return m, tea.Quit
+			return m, QuitCmd
 		case "q", "esc":
 			return NewMenuModel(m.root, m.playerName), nil
 		case "enter":
@@ -300,7 +300,7 @@ func (m *JoinModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c":
-			return m, tea.Quit
+			return m, QuitCmd
 		case "q", "esc":
 			return NewMenuModel(m.root, m.playerName), nil
 		}

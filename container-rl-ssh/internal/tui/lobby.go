@@ -105,7 +105,7 @@ func (m *LobbyModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case lobbyTickMsg:
 		if m.quitting {
-			return m, tea.Quit
+			return m, QuitCmd
 		}
 		return m, tea.Tick(time.Second, func(t time.Time) tea.Msg {
 			return lobbyTickMsg(t)
@@ -148,7 +148,7 @@ func (m *LobbyModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.state.TCPClient.Close()
 			m.state.TCPClient = nil
 		}
-		return m, tea.Quit
+		return m, QuitCmd
 	}
 	return m, nil
 }

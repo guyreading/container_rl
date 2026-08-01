@@ -53,14 +53,14 @@ func (m *RegisterModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.Type {
 		case tea.KeyCtrlC:
-			return m, tea.Quit
+			return m, QuitCmd
 		case tea.KeyEsc:
-			return m, tea.Quit
+			return m, QuitCmd
 		case tea.KeyEnter:
 			if m.hasKey {
 				return m.handleRegister()
 			}
-			return m, tea.Quit
+			return m, QuitCmd
 		}
 	}
 
