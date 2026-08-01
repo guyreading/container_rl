@@ -1117,9 +1117,8 @@ def main():
             _gameplay()
             return
 
-        while True:
-            ch = _main_menu()
-            if ch is None: break
+        ch = _main_menu()
+        if ch is None: return
 
         if ch==1:
             cfg = _create_screen()
