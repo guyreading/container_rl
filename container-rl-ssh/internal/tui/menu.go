@@ -99,6 +99,8 @@ type CreateModel struct {
 	root       *RootModel
 	playerName string
 	numPlayers int
+	aiPlayers  int
+	selected   int // 0 = numPlayers, 1 = aiPlayers
 	errorMsg   string
 	loading    bool
 }
@@ -108,6 +110,8 @@ func NewCreateModel(root *RootModel, playerName string) *CreateModel {
 		root:       root,
 		playerName: playerName,
 		numPlayers: 2,
+		aiPlayers:  0,
+		selected:   0,
 	}
 }
 
@@ -126,19 +130,37 @@ func (m *CreateModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			return m.handleSubmit()
+		case "up", "k":
+			if m.loading {
+				return m, nil
+			}
+			m.selected = 0
+		case "down", "j":
+			if m.loading {
+				return m, nil
+			}
+			m.selected = 1
 		case "left", "h":
 			if m.loading {
 				return m, nil
 			}
-			if m.numPlayers > 2 {
+			if m.selected == 0 && m.numPlayers > 2 {
 				m.numPlayers--
+				// Clamp AI count to new max
+				if m.aiPlayers >= m.numPlayers {
+					m.aiPlayers = m.numPlayers - 1
+				}
+			} else if m.selected == 1 && m.aiPlayers > 0 {
+				m.aiPlayers--
 			}
 		case "right", "l":
 			if m.loading {
 				return m, nil
 			}
-			if m.numPlayers < 5 {
+			if m.selected == 0 && m.numPlayers < 5 {
 				m.numPlayers++
+			} else if m.selected == 1 && m.aiPlayers < m.numPlayers-1 {
+				m.aiPlayers++
 			}
 		}
 	}
@@ -160,6 +182,7 @@ func (m *CreateModel) handleSubmit() (tea.Model, tea.Cmd) {
 		"player_name": m.playerName,
 		"num_players": m.numPlayers,
 		"num_colors":  5,
+		"ai_count":    m.aiPlayers,
 	}); err != nil {
 		m.errorMsg = fmt.Sprintf("Error creating game: %s", err)
 		m.loading = false
@@ -183,29 +206,64 @@ func (m *CreateModel) View() string {
 	b.WriteString(TitleStyle.Render("Create Game"))
 	b.WriteString(fmt.Sprintf("\n%s %s\n\n", SubtleStyle.Render("Player:"), m.playerName))
 
-	bar := make([]rune, 5)
-	for i := 0; i < 5; i++ {
-		if i < m.numPlayers {
-			bar[i] = '█'
-		} else {
-			bar[i] = '░'
-		}
-	}
-	left := "◂"
-	right := "▸"
-	if m.numPlayers <= 2 {
-		left = " "
-	}
-	if m.numPlayers >= 5 {
-		right = " "
+	// ── Players selector ──
+	playerHighlight := ""
+	aiHighlight := ""
+	if m.selected == 0 {
+		playerHighlight = CursorStyle.Render(" ←")
+	} else if m.selected == 1 {
+		aiHighlight = CursorStyle.Render(" ←")
 	}
 
-	b.WriteString(fmt.Sprintf("  %s  %s %d  %s\n\n",
-		SubtleStyle.Render(left),
-		CursorStyle.Render(string(bar)),
+	playerBar := make([]rune, 5)
+	aiBar := make([]rune, 5)
+	for i := 0; i < 5; i++ {
+		if i < m.numPlayers {
+			playerBar[i] = '█'
+		} else {
+			playerBar[i] = '░'
+		}
+		if i < m.aiPlayers {
+			aiBar[i] = '█'
+		} else {
+			aiBar[i] = '░'
+		}
+	}
+	playerLeft, playerRight := "◂", "▸"
+	aiLeft, aiRight := "◂", "▸"
+	if m.numPlayers <= 2 {
+		playerLeft = " "
+	}
+	if m.numPlayers >= 5 {
+		playerRight = " "
+	}
+	if m.aiPlayers <= 0 {
+		aiLeft = " "
+	}
+	if m.aiPlayers >= m.numPlayers-1 {
+		aiRight = " "
+	}
+
+	b.WriteString(fmt.Sprintf("  %s  %s %d  %s%s\n",
+		SubtleStyle.Render(playerLeft),
+		CursorStyle.Render(string(playerBar)),
 		m.numPlayers,
-		SubtleStyle.Render(right),
+		SubtleStyle.Render(playerRight),
+		playerHighlight,
 	))
+	b.WriteString(SubtleStyle.Render("  Players\n"))
+	b.WriteString(fmt.Sprintf("  %s  %s %d  %s%s\n",
+		SubtleStyle.Render(aiLeft),
+		CursorStyle.Render(string(aiBar)),
+		m.aiPlayers,
+		SubtleStyle.Render(aiRight),
+		aiHighlight,
+	))
+	b.WriteString(SubtleStyle.Render("  AI opponents\n\n"))
+
+	if m.aiPlayers > 0 {
+		b.WriteString(SubtleStyle.Render(fmt.Sprintf("AI will play the last %d slot(s).\n\n", m.aiPlayers)))
+	}
 	b.WriteString(SubtleStyle.Render("  ←→/hl adjust  •  Enter to create  •  Esc to back"))
 
 	b.WriteString("\n")

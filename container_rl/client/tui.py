@@ -182,19 +182,20 @@ def _net_worth(state, player, nc):
     hv = sum((s+1)*int(state.harbour_store[player,c,s]) for c in range(nc) for s in range(PRICE_SLOTS))
     sv = sum(3 for c in state.ship_contents[player] if int(c)>0)
     iv = 0
+    has_all = all(int(state.island_store[player, cc]) > 0 for cc in range(nc))
     for c in range(nc):
-        cnt = int(state.island_store[player,c])
-        if cnt>0:
-            sec = int(state.secret_value_color[player])
-            base = 10 if (c==sec and all(int(state.island_store[player,cc])>0 for cc in range(nc))) else (5 if c==sec else 2)
-            iv += base*cnt
-    return cash + hv + sv + iv - int(state.loans[player])*11
+        cnt = int(state.island_store[player, c])
+        if cnt > 0:
+            val = int(state.secret_card_values[player, c])
+            if val == -1:
+                val = 10 if has_all else 5
+            iv += val * cnt
+    return cash + hv + sv + iv - int(state.loans[player]) * 11
 
 def _player_card(state, player, nc, is_current):
     cash = int(state.cash[player])
     loans = int(state.loans[player])
     wh = int(state.warehouse_count[player])
-    sec = int(state.secret_value_color[player])
     nw = _net_worth(state, player, nc)
     facs = [f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}]" for c in range(nc) if int(state.factory_colors[player,c])]
     fstr = ", ".join(facs) if facs else "[dim]none[/dim]"
@@ -203,7 +204,16 @@ def _player_card(state, player, nc, is_current):
     out = Text.from_markup(f"[bold]{name}{badge}[/bold]  ${nw}\n")
     out.append("─"*28+"\n")
     out.append_text(Text.from_markup(f"  💵 ${cash}  🏦 {loans} loans  🏭 {wh} wh\n"))
-    out.append_text(Text.from_markup(f"  🤫 [{_cs(sec)}]{_cn(sec,nc)}[/{_cs(sec)}]\n"))
+    # Secret card: only visible to the player who owns it
+    if is_current:
+        card_parts = []
+        for c in range(nc):
+            val = int(state.secret_card_values[player, c])
+            label = "5/10" if val == -1 else str(val)
+            card_parts.append(f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}]={label}")
+        out.append_text(Text.from_markup(f"  🤫 {' '.join(card_parts)}\n"))
+    else:
+        out.append_text(Text.from_markup(f"  🤫 [dim]hidden[/dim]\n"))
     out.append_text(Text.from_markup(f"  Factories: {fstr}\n"))
     out.append_text(Text.from_markup("  [bold]Factory Store:[/bold]\n"))
     out.append_text(Text.from_markup(_store_compact(state.factory_store,player,nc)+"\n"))
@@ -539,14 +549,15 @@ def _show_final_scores(state, nc, np_):
         cash = int(state.cash[p])
         hv = sum((s + 1) * int(state.harbour_store[p, c, s]) for c in range(nc) for s in range(PRICE_SLOTS))
         sv = sum(3 for c in state.ship_contents[p] if int(c) > 0)
-        sec = int(state.secret_value_color[p])
+        has_all = all(int(state.island_store[p, cc]) > 0 for cc in range(nc))
         iv = 0
         for c in range(nc):
             cnt = int(state.island_store[p, c])
             if cnt > 0:
-                has_all = all(int(state.island_store[p, cc]) > 0 for cc in range(nc))
-                base = 10 if (c == sec and has_all) else (5 if c == sec else 2)
-                iv += base * cnt
+                val = int(state.secret_card_values[p, c])
+                if val == -1:
+                    val = 10 if has_all else 5
+                iv += val * cnt
         loans = int(state.loans[p])
         total = cash + hv + sv + iv - loans * 11
         bt.add_row(
@@ -854,29 +865,57 @@ def _main_menu():
             return selected + 1
 
 def _create_screen():
-    """Create game with slider bar for player count (2-5). Colours always 5."""
+    """Create game with slider bars for player count (2-5) and AI opponents.
+
+    ↑↓/jk switch between the two selectors.  ←→/hl adjust the selected bar.
+    Colours always 5.
+    """
     num_players = 2
+    ai_players = 0
+    selected = 0  # 0 = num_players, 1 = ai_players
     while True:
-        bar = ["█" if i < num_players else "░" for i in range(5)]
-        left = "◂" if num_players > 2 else " "
-        right = "▸" if num_players < 5 else " "
+        bar_p = ["█" if i < num_players else "░" for i in range(5)]
+        bar_a = ["█" if i < ai_players else "░" for i in range(5)]
+        left_p = "◂" if num_players > 2 else " "
+        right_p = "▸" if num_players < 5 else " "
+        left_a = "◂" if ai_players > 0 else " "
+        right_a = "▸" if ai_players < num_players - 1 else " "
+
+        sel_p = " [bold yellow]◀[/]" if selected == 0 else ""
+        sel_a = " [bold yellow]◀[/]" if selected == 1 else ""
+
         body = f"[bold]Create New Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]\n\n"
-        body += f"  [dim]{left}[/dim]  [bold yellow]{''.join(bar)}[/bold yellow] {num_players}  [dim]{right}[/dim]\n\n"
-        body += f"[dim]←→ / hl adjust  •  Enter to create  •  Esc to back[/dim]"
+        body += f"  [dim]{left_p}[/dim]  [bold yellow]{''.join(bar_p)}[/bold yellow] {num_players}  [dim]{right_p}[/dim]{sel_p}\n"
+        body += f"  [dim]Players[/dim]\n"
+        body += f"  [dim]{left_a}[/dim]  [bold yellow]{''.join(bar_a)}[/bold yellow] {ai_players}  [dim]{right_a}[/dim]{sel_a}\n"
+        body += f"  [dim]AI opponents[/dim]\n\n"
+        if ai_players > 0:
+            body += f"[dim]AI will fill the last {ai_players} slot(s).[/dim]\n\n"
+        body += f"[dim]←→/hl adjust  •  ↑↓/jk select  •  Enter to create  •  Esc to back[/dim]"
         console.clear()
         console.print(Panel(Text.from_markup(body), border_style="green"))
         ch = _key(None)
         if ch in ("\x1b", "q", "Q"):
             return None
-        if ch in ("\x1b[D", "h", "H"):
-            if num_players > 2:
+        if ch in ("\x1b[A", "k", "K"):
+            selected = 0
+        elif ch in ("\x1b[B", "j", "J"):
+            selected = 1
+        elif ch in ("\x1b[D", "h", "H"):
+            if selected == 0 and num_players > 2:
                 num_players -= 1
+                if ai_players >= num_players:
+                    ai_players = num_players - 1
+            elif selected == 1 and ai_players > 0:
+                ai_players -= 1
         elif ch in ("\x1b[C", "l", "L"):
-            if num_players < 5:
+            if selected == 0 and num_players < 5:
                 num_players += 1
+            elif selected == 1 and ai_players < num_players - 1:
+                ai_players += 1
         elif ch in ("\r", "\n"):
             break
-    return {"player_name": MY_NAME, "num_players": num_players, "num_colors": 5}
+    return {"player_name": MY_NAME, "num_players": num_players, "num_colors": 5, "ai_count": ai_players}
 
 def _join_screen():
     console.clear()
@@ -966,7 +1005,7 @@ def _lobby():
                 console.print(f"  {nm}{mrk}")
         n = NUM_PLAYERS - len(lobby_players)
         console.print(f"\n[dim]{n} more needed.  q to leave.[/dim]")
-        if _ch() in ("q","Q"): return False
+        if _ch() in ("\x1b","q","Q"): return False
         _time.sleep(0.3)
     return False
 
@@ -1086,6 +1125,7 @@ def main():
             if cfg is None: return
             MY_NAME=cfg["player_name"]
             CLIENT.send("create_game", cfg)
+            _started = False
             for _i in range(50):
                 msgs = _drain_server()
                 for m in msgs:
@@ -1097,7 +1137,11 @@ def main():
                         pp=m["payload"]
                         NUM_PLAYERS = pp.get("num_players_needed", NUM_PLAYERS)
                         PLAYER_NAMES = {int(pl["player_index"]): pl["name"] for pl in pp.get("players", [])}
-                if GAME_ID: break
+                    if m.get("type")=="game_started":
+                        _started = True
+                        GAME_STATUS = "active"
+                if GAME_ID and (GAME_STATUS == "active" or _started):
+                    break
                 _time.sleep(0.1)
         else:
             cfg = _join_screen()
