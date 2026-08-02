@@ -1076,6 +1076,9 @@ def main():
     CLIENT = GameClient(args.host, args.port)
     _enter_raw()
     try:
+        sys.stdout.write("\033[?1049h")
+        sys.stdout.flush()
+        console.show_cursor(False)
         try:
             CLIENT.connect()
         except Exception as e:
@@ -1201,6 +1204,9 @@ def main():
                     if result is BACK: continue  # back to game list
                     return
     finally:
+        console.show_cursor(True)
+        sys.stdout.write("\033[?1049l")
+        sys.stdout.flush()
         _exit_raw()
         if CLIENT: CLIENT.disconnect()
         console.print("[dim]Goodbye![/dim]")
