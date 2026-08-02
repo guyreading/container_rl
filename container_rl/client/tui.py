@@ -62,6 +62,9 @@ MY_NAME: str = ""
 GAME_STATUS: str = "lobby"
 PLAYER_NAMES: dict[int, str] = {}  # player_index -> name
 
+# ── navigation sentinel ──────────────────────────────────────────────────
+BACK = object()
+
 # ── game state (received from server) ─────────────────────────────────────
 STATE: EnvState | None = None
 STATE_META: dict = {}
@@ -257,7 +260,7 @@ def _render(state, nc, np_, feedback="", my_player=None):
         wh_c = int(state.warehouse_count[turn])+3
         fs = f"BuyFactory (${fac_c})" if fac_c else "BuyFactory"
         ws = f"BuyWarehouse (${wh_c})" if wh_c else "BuyWarehouse"
-        ht = f" [1]{fs}  [2]{ws}  [3]Produce  [4]BuyFrFactry  [5]LoadShip\n [6]MoveToSea [7]Auction [0/space]Pass [8]TakeLoan [9]RepayLoan\n [q]uit"
+        ht = f" [1]{fs}  [2]{ws}  [3]Produce  [4]BuyFrFactry  [5]LoadShip\n [6]MoveToSea [7]Auction [0/space]Pass [8]TakeLoan [9]RepayLoan\n [q]uit  [←]back"
         elems.append(Panel(Text.from_markup(ht), title="Actions", border_style="cyan"))
     elif int(state.auction_active):
         s = int(state.auction_seller); r = int(state.auction_round)
@@ -695,6 +698,7 @@ def _gameplay():
             ch = _key(0.3)
             if ch=="": continue
             if ch in ("q","Q"): return
+            if ch == "\x1b[D": return BACK
             if ch not in "0123456789 ": continue
 
             amap = {"0":ACTION_PASS," ":ACTION_PASS,"1":ACTION_BUY_FACTORY,"2":ACTION_BUY_WAREHOUSE,
@@ -927,6 +931,7 @@ def _join_screen():
 
     code = _show_game_list(games)
     if code is None: return None
+    if code is BACK: return BACK
     return {"player_name": MY_NAME, "code": code}
 
 
@@ -955,13 +960,15 @@ def _show_game_list(games: list[dict]) -> str | None:
                 lines.append(f"  {prefix} {o}")
         body = "\n".join(lines)
         frame = Text.from_markup(
-            f"[bold]Available games — ↑↓ to select, Enter to confirm, ESC to cancel:[/bold]\n\n{body}"
+            f"[bold]Available games — ↑↓ to select, Enter to confirm, ← to go back, ESC to cancel:[/bold]\n\n{body}"
         )
         console.clear()
         console.print(Align.center(Panel(frame, border_style="yellow"), vertical="middle", height=console.height))
         ch = _key(None)
         if ch in ("\x1b", "q", "Q"):
             return None
+        if ch == "\x1b[D":
+            return BACK
         if ch in ("\x1b[A", "k", "w"):
             selected = max(0, selected - 1)
         elif ch in ("\x1b[B", "j", "s"):
@@ -1003,9 +1010,14 @@ def _lobby():
                 pl_text.append(f"\n  {nm}{mrk}")
             lobby_parts.append(pl_text)
         n = NUM_PLAYERS - len(lobby_players)
-        lobby_parts.append(Text.from_markup(f"\n[dim]{n} more needed.  q to leave.[/dim]"))
+        lobby_parts.append(Text.from_markup(f"\n[dim]{n} more needed.  ← to go back, q to leave.[/dim]"))
         console.print(Align.center(Group(*lobby_parts), vertical="middle", height=console.height))
-        if _ch() in ("\x1b","q","Q"): return False
+        if _ch() == "q": return False
+        ch = _key(0.05)
+        if ch in ("\x1b", "Q"):
+            return False
+        if ch == "\x1b[D":
+            return BACK
         _time.sleep(0.3)
     return False
 
@@ -1117,59 +1129,77 @@ def main():
             _gameplay()
             return
 
-        ch = _main_menu()
-        if ch is None: return
+        while True:
+            ch = _main_menu()
+            if ch is None: return
 
-        if ch==1:
-            cfg = _create_screen()
-            if cfg is None: return
-            MY_NAME=cfg["player_name"]
-            CLIENT.send("create_game", cfg)
-            _started = False
-            for _i in range(50):
-                msgs = _drain_server()
-                for m in msgs:
-                    if m.get("type")=="game_created":
-                        pp=m["payload"]; GAME_ID=pp["game_id"]; PLAYER_INDEX=pp["player_index"]; GAME_CODE=pp["code"]
-                        NUM_PLAYERS = cfg["num_players"]
-                        NUM_COLORS = cfg["num_colors"]
-                    if m.get("type")=="lobby_update":
-                        pp=m["payload"]
-                        NUM_PLAYERS = pp.get("num_players_needed", NUM_PLAYERS)
-                        PLAYER_NAMES = {int(pl["player_index"]): pl["name"] for pl in pp.get("players", [])}
-                    if m.get("type")=="game_started":
-                        _started = True
-                        GAME_STATUS = "active"
-                if GAME_ID and (GAME_STATUS == "active" or _started):
-                    break
-                _time.sleep(0.1)
-        else:
-            cfg = _join_screen()
-            if cfg is None: return
-            MY_NAME=cfg["player_name"]
-            CLIENT.send("join_game", cfg)
-            for _i in range(50):
-                msgs = _drain_server()
-                for m in msgs:
-                    if m.get("type")=="game_joined":
-                        pp=m["payload"]; GAME_ID=pp["game_id"]; PLAYER_INDEX=pp["player_index"]; GAME_CODE=pp["code"]
-                        NUM_PLAYERS=pp.get("num_players",NUM_PLAYERS); NUM_COLORS=pp.get("num_colors",NUM_COLORS)
-                        GAME_STATUS=pp.get("status","lobby")
-                    if m.get("type")=="lobby_update":
-                        pp=m["payload"]
-                        NUM_PLAYERS = pp.get("num_players_needed", NUM_PLAYERS)
-                        PLAYER_NAMES = {int(pl["player_index"]): pl["name"] for pl in pp.get("players", [])}
-                if GAME_ID: break
-                _time.sleep(0.1)
+            if ch == 1:
+                cfg = _create_screen()
+                if cfg is None: return
+                if cfg is BACK: continue
+                MY_NAME = cfg["player_name"]
+                CLIENT.send("create_game", cfg)
+                _started = False
+                for _i in range(50):
+                    msgs = _drain_server()
+                    for m in msgs:
+                        if m.get("type") == "game_created":
+                            pp = m["payload"]; GAME_ID = pp["game_id"]; PLAYER_INDEX = pp["player_index"]; GAME_CODE = pp["code"]
+                            NUM_PLAYERS = cfg["num_players"]
+                            NUM_COLORS = cfg["num_colors"]
+                        if m.get("type") == "lobby_update":
+                            pp = m["payload"]
+                            NUM_PLAYERS = pp.get("num_players_needed", NUM_PLAYERS)
+                            PLAYER_NAMES = {int(pl["player_index"]): pl["name"] for pl in pp.get("players", [])}
+                        if m.get("type") == "game_started":
+                            _started = True
+                            GAME_STATUS = "active"
+                    if GAME_ID and (GAME_STATUS == "active" or _started):
+                        break
+                    _time.sleep(0.1)
+                if GAME_ID is None:
+                    console.print("[red]Failed to create game.[/red]"); _key(2)
+                    continue
+                is_active = GAME_STATUS == "active"
+                if not is_active:
+                    started = _lobby()
+                    if started is BACK: continue
+                    if not started: return
+                result = _gameplay()
+                if result is BACK: continue
+                return
 
-        if GAME_ID is None:
-            console.print("[red]Failed to create/join game.[/red]"); _key(2); return
-
-        is_active = GAME_STATUS == "active"
-        if not is_active:
-            started = _lobby()
-            if not started: return
-        _gameplay()
+            else:  # ch == 2
+                while True:
+                    cfg = _join_screen()
+                    if cfg is None: return
+                    if cfg is BACK: break  # back to main menu
+                    MY_NAME = cfg["player_name"]
+                    CLIENT.send("join_game", cfg)
+                    for _i in range(50):
+                        msgs = _drain_server()
+                        for m in msgs:
+                            if m.get("type") == "game_joined":
+                                pp = m["payload"]; GAME_ID = pp["game_id"]; PLAYER_INDEX = pp["player_index"]; GAME_CODE = pp["code"]
+                                NUM_PLAYERS = pp.get("num_players", NUM_PLAYERS); NUM_COLORS = pp.get("num_colors", NUM_COLORS)
+                                GAME_STATUS = pp.get("status", "lobby")
+                            if m.get("type") == "lobby_update":
+                                pp = m["payload"]
+                                NUM_PLAYERS = pp.get("num_players_needed", NUM_PLAYERS)
+                                PLAYER_NAMES = {int(pl["player_index"]): pl["name"] for pl in pp.get("players", [])}
+                        if GAME_ID: break
+                        _time.sleep(0.1)
+                    if GAME_ID is None:
+                        console.print("[red]Failed to join game.[/red]"); _key(2)
+                        continue
+                    is_active = GAME_STATUS == "active"
+                    if not is_active:
+                        started = _lobby()
+                        if started is BACK: continue  # back to game list
+                        if not started: return
+                    result = _gameplay()
+                    if result is BACK: continue  # back to game list
+                    return
     finally:
         _exit_raw()
         if CLIENT: CLIENT.disconnect()
