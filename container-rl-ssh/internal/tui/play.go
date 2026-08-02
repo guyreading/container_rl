@@ -293,7 +293,7 @@ func (m *PlayModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.state.TCPClient != nil {
 			m.state.TCPClient.Close()
 		}
-		return m, tea.Quit
+		return m, QuitCmd
 	}
 	return m, nil
 }

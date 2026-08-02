@@ -4,6 +4,7 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/ssh"
 	gossh "golang.org/x/crypto/ssh"
 
@@ -12,10 +13,14 @@ import (
 	"github.com/guyreading/container-rl-ssh/internal/db"
 )
 
+var QuitCmd = tea.Sequence(tea.ClearScreen, tea.Quit)
+
 type RootModel struct {
 	keys     *db.KeyStore
 	gameAddr string
 	model    tea.Model
+	width    int
+	height   int
 }
 
 func NewRootModel(keys *db.KeyStore, gameAddr string, s ssh.Session) (tea.Model, []tea.ProgramOption) {
@@ -53,13 +58,23 @@ func (m *RootModel) Init() tea.Cmd {
 }
 
 func (m *RootModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+	}
+
 	next, cmd := m.model.Update(msg)
 	m.model = next
 	return m, cmd
 }
 
 func (m *RootModel) View() string {
-	return m.model.View()
+	view := m.model.View()
+	if m.width == 0 || m.height == 0 {
+		return view
+	}
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, view)
 }
 
 type SharedState struct {

@@ -6,6 +6,7 @@ import threading
 from typing import Any, Callable
 
 import jax
+import numpy as np
 from container_rl.env.container import (
     ACTION_BUY_FACTORY,
     ACTION_BUY_FROM_FACTORY_STORE,
@@ -18,9 +19,12 @@ from container_rl.env.container import (
     ACTION_PRODUCE,
     ACTION_REPAY_LOAN,
     ACTION_TAKE_LOAN,
+    LEAVE_IDLE,
+    PRICE_SLOTS,
     ActionEncoder,
     ContainerJaxEnv,
     EnvState,
+    mask_size,
 )
 from container_rl.server.database import Database
 from container_rl.server.protocol import deserialize_state, serialize_state
@@ -43,12 +47,17 @@ _ACTION_NAMES = {
 
 
 class GameManager:
-    def __init__(self, db: Database, broadcast: Callable[[int, str, Any], None]):
+    def __init__(self, db: Database, broadcast: Callable[[int, str, Any], None],
+                 ai_model_path: str | None = None):
         self.db = db
         self._broadcast = broadcast
         self._envs: dict[int, ContainerJaxEnv] = {}
         self._encoders: dict[int, ActionEncoder] = {}
         self._lock = threading.RLock()
+        self._ai_model_path = ai_model_path
+        self._ai_model: Any = None  # MaskablePPO instance (lazy-loaded)
+        self._ai_slots: dict[int, list[int]] = {}  # game_id -> [ai_player_indices]
+        self._mask_sizes: dict[tuple[int, int], int] = {}  # cache mask_size per (np, nc)
 
     # ------------------------------------------------------------------
     # create / join
@@ -67,12 +76,35 @@ class GameManager:
     def create_game_trusted(
         self, player_name: str,
         num_players: int, num_colors: int = 5, seed: int | None = None,
+        ai_count: int = 0,
     ) -> dict:
-        """Create a new game with a trusted player name (no password check)."""
+        """Create a new game with a trusted player name (no password check).
+
+        *ai_count*: how many AI opponents (filled from the last slots).
+        """
         player_id = self.db.upsert_player_trusted(player_name)
         game_id, code = self.db.create_game(num_players, num_colors, seed)
         self.db.assign_player_slot(game_id, player_id, 0)
-        return {"game_id": game_id, "code": code, "player_index": 0}
+        if ai_count > 0:
+            ai_slots = list(range(num_players - ai_count, num_players))
+            self._ai_slots[game_id] = ai_slots
+            # Pre-assign DB slots for AI players so the lobby fills immediately
+            for slot in ai_slots:
+                ai_name = f"[AI] Player {slot + 1}"
+                ai_pid = self.db.upsert_player_trusted(ai_name)
+                self.db.assign_player_slot(game_id, ai_pid, slot)
+        return {"game_id": game_id, "code": code, "player_index": 0, "ai_count": ai_count}
+
+    def _get_ai_slots(self, game_id: int) -> list[int]:
+        """Derive AI player slots from the database (survives server restarts)."""
+        if game_id in self._ai_slots:
+            return self._ai_slots[game_id]
+        players = self.db.get_game_players(game_id)
+        ai_slots = [int(p["player_index"]) for p in players
+                     if (p.get("name") or "").startswith("[AI]")]
+        if ai_slots:
+            self._ai_slots[game_id] = ai_slots
+        return ai_slots
 
     def join_game(
         self, player_name: str, password: str | None, code: str,
@@ -165,6 +197,11 @@ class GameManager:
             self._encoders[game_id] = ActionEncoder(game["num_players"], game["num_colors"])
             self._save_state(game_id, env.state)
             self.db.set_game_status(game_id, "active")
+
+            # If AI slots exist, auto-play their first turns if they start
+            if self._get_ai_slots(game_id):
+                self._play_ai_turns(game_id)
+
             return True
 
     def load_or_create_env(self, game_id: int) -> ContainerJaxEnv:
@@ -274,12 +311,166 @@ class GameManager:
                     "player_index": int(new_state.current_player),
                 })
 
+            # Auto-play AI turns before returning control
+            if self._get_ai_slots(game_id) and not game_over:
+                self._play_ai_turns(game_id)
+
             return {
                 "turn_ended": turn_ended,
                 "desc": desc,
                 "reward": float(reward),
                 "game_over": game_over,
             }
+
+    # ------------------------------------------------------------------
+    # AI auto-play
+    # ------------------------------------------------------------------
+
+    def _load_ai_model(self) -> Any:
+        """Lazy-load the MaskablePPO model for AI opponents."""
+        if self._ai_model is not None:
+            return self._ai_model
+        if not self._ai_model_path:
+            return None
+        from sb3_contrib import MaskablePPO
+        self._ai_model = MaskablePPO.load(self._ai_model_path, device="cpu")
+        return self._ai_model
+
+    def _get_mask_size(self, np_: int, nc: int) -> int:
+        """Return and cache the mask tail size for given player/colour counts."""
+        key = (np_, nc)
+        if key not in self._mask_sizes:
+            self._mask_sizes[key] = mask_size(np_, nc)
+        return self._mask_sizes[key]
+
+    def play_ai_turn_if_needed(self, game_id: int) -> None:
+        """Public entry point: auto-play AI turns if it's an AI's turn.
+
+        Called after ``get_state`` (rejoin) to ensure AI players
+        take action immediately instead of waiting for a human.
+        """
+        with self._lock:
+            if game_id not in self._envs:
+                return
+            self._play_ai_turns(game_id)
+
+    def _play_ai_turns(self, game_id: int) -> None:
+        """Continuously play AI turns until a human player's turn or game over.
+
+        Called after ``maybe_start_game`` and after every ``process_action``.
+        """
+        model = self._load_ai_model()
+        if model is None:
+            return
+
+        env = self._envs.get(game_id)
+        if env is None:
+            return
+
+        ai_slots = self._get_ai_slots(game_id)
+        nc = env.func_env.params.num_colors
+        np_ = env.func_env.params.num_players
+        ms_size = self._get_mask_size(np_, nc)
+
+        # Keep playing as long as it's an AI player's turn
+        while True:
+            state = env.state
+            if int(state.game_over) > 0:
+                break
+            cp = int(state.current_player)
+            if cp not in ai_slots:
+                break
+
+            # ── 1. Get observation (strip mask tail for model input) ──
+            obs_full = np.asarray(
+                env.func_env.observation(state, jax.random.PRNGKey(0), env.func_env.params),
+                dtype=np.float32,
+            )
+            obs = obs_full[:-ms_size] if ms_size > 0 else obs_full
+
+            # ── 2. Get masks ──
+            masks_dict = env.func_env._action_masks(state, env.func_env.params)
+            masks = [
+                np.asarray(masks_dict[k], dtype=bool)
+                for k in ("action_type", "opponent", "color", "price_slot", "purchase")
+            ]
+
+            # ── 3. Predict and step ──
+            action, _ = model.predict(obs, action_masks=masks, deterministic=False)
+            action = np.atleast_1d(action)
+            obs_next, reward, term, trunc, info = env.step(action)
+            self._save_state(game_id, env.state)
+
+            # ── 4. Handle shopping / produce / auction continuation ──
+            self._play_ai_continuation(game_id, model, nc, np_, ms_size)
+
+            # ── 5. Broadcast updated state ──
+            new_state = env.state
+            state_blob = serialize_state(new_state)
+            try:
+                state_data = _state_to_json_data(new_state)
+            except Exception:
+                state_data = {}
+            self._broadcast(game_id, "state_update", {
+                "state": state_blob.hex(),
+                "state_data": state_data,
+                "current_player": int(new_state.current_player),
+                "actions_taken": int(new_state.actions_taken),
+                "auction_active": int(new_state.auction_active),
+                "produce_active": int(new_state.produce_active),
+                "shopping_active": int(new_state.shopping_active),
+                "game_over": int(new_state.game_over),
+            })
+
+            # ── 6. Check for game over ──
+            if bool(term) or int(new_state.game_over) > 0:
+                self.db.set_game_status(game_id, "finished")
+                break
+
+    def _play_ai_continuation(self, game_id: int, model: Any,
+                               nc: int, np_: int, ms_size: int) -> None:
+        """Handle shopping / produce / auction for an AI player."""
+        env = self._envs[game_id]
+        max_steps = 50
+        steps = 0
+        state = env.state
+
+        while (bool(state.shopping_active) or bool(state.produce_active)) and steps < max_steps:
+            obs_full = np.asarray(
+                env.func_env.observation(state, jax.random.PRNGKey(0), env.func_env.params),
+                dtype=np.float32,
+            )
+            obs = obs_full[:-ms_size] if ms_size > 0 else obs_full
+            masks_dict = env.func_env._action_masks(state, env.func_env.params)
+            masks = [
+                np.asarray(masks_dict[k], dtype=bool)
+                for k in ("action_type", "opponent", "color", "price_slot", "purchase")
+            ]
+            action, _ = model.predict(obs, action_masks=masks, deterministic=False)
+            action = np.atleast_1d(action)
+            env.step(action)
+            self._save_state(game_id, env.state)
+            state = env.state
+            steps += 1
+
+        steps = 0
+        while bool(state.auction_active) and steps < max_steps:
+            obs_full = np.asarray(
+                env.func_env.observation(state, jax.random.PRNGKey(0), env.func_env.params),
+                dtype=np.float32,
+            )
+            obs = obs_full[:-ms_size] if ms_size > 0 else obs_full
+            masks_dict = env.func_env._action_masks(state, env.func_env.params)
+            masks = [
+                np.asarray(masks_dict[k], dtype=bool)
+                for k in ("action_type", "opponent", "color", "price_slot", "purchase")
+            ]
+            action, _ = model.predict(obs, action_masks=masks, deterministic=False)
+            action = np.atleast_1d(action)
+            env.step(action)
+            self._save_state(game_id, env.state)
+            state = env.state
+            steps += 1
 
     # ------------------------------------------------------------------
     # helpers

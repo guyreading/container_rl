@@ -70,11 +70,12 @@ _STATE_KEYS = [
     "cash", "loans", "factory_colors", "warehouse_count",
     "factory_store", "harbour_store", "island_store",
     "ship_contents", "ship_location", "container_supply",
-    "turn_phase", "current_player", "game_over", "secret_value_color",
+    "turn_phase", "current_player", "game_over", "secret_card_values",
     "auction_active", "auction_seller", "auction_cargo",
     "auction_bids", "auction_round",
     "actions_taken", "produced_this_turn",
     "shopping_active", "shopping_action_type", "shopping_target",
+    "shopping_harbour_price",
     "produce_active", "produce_pending", "produce_was_produced",
     "step_count",
 ]
@@ -87,7 +88,17 @@ def serialize_state(state: EnvState) -> bytes:
 
 
 def deserialize_state(blob: bytes) -> EnvState:
-    """Reconstruct an *EnvState* from pickled bytes."""
+    """Reconstruct an *EnvState* from pickled bytes.
+
+    Fills in missing fields (from older save formats) with zeros.
+    """
     data = pickle.loads(blob)
-    kwargs = {key: jnp.asarray(data[key]) for key in _STATE_KEYS}
+    kwargs = {}
+    for key in _STATE_KEYS:
+        if key in data:
+            kwargs[key] = jnp.asarray(data[key])
+        else:
+            # Fill missing fields with zeros (backward-compat with older saves)
+            shape = getattr(EnvState, key, None)
+            kwargs[key] = jnp.zeros((), dtype=jnp.int32)
     return EnvState(**kwargs)
