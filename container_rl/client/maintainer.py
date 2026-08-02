@@ -105,7 +105,7 @@ def _draw_list(games: list[dict], selected: int, feedback: str = "") -> None:
     lines.append("")
     content = "\n".join(lines)
     console.clear()
-    console.print(Align.center(Panel(Text.from_markup(content), border_style="blue"), vertical="middle"))
+    console.print(Align.center(Panel(Text.from_markup(content), border_style="blue"), vertical="middle", height=console.height))
 
 
 def main():

@@ -263,7 +263,7 @@ def _render(state, nc, np_, feedback="", my_player=None):
         s = int(state.auction_seller); r = int(state.auction_round)
         t = f"Auction — P{s+1} selling" if r==0 else f"Auction — P{s+1}: accept/reject?"
         elems.append(Panel(Text(t, style="bold yellow"), title="Auction", border_style="yellow"))
-    return Align.center(Group(*elems), vertical="middle")
+    return Align.center(Group(*elems), vertical="middle", height=console.height)
 
 # ── opponent helper ──────────────────────────────────────────────────────
 
@@ -573,7 +573,7 @@ def _show_final_scores(state, nc, np_):
 
     console.clear()
     parts = [lb, bt, Text.from_markup("[dim]Press any key to exit…[/dim]")]
-    console.print(Align.center(Group(*parts), vertical="middle"))
+    console.print(Align.center(Group(*parts), vertical="middle", height=console.height))
 
 
 # ── gameplay loop ────────────────────────────────────────────────────────
@@ -847,7 +847,7 @@ def _main_menu():
             f"[bold]🚢 Container RL — select with ↑↓ or number, Enter to confirm:[/bold]\n\n{body}"
         )
         console.clear()
-        console.print(Align.center(Panel(frame, border_style="blue"), vertical="middle"))
+        console.print(Align.center(Panel(frame, border_style="blue"), vertical="middle", height=console.height))
         ch = _key(None)
         if ch in ("\x1b", "q", "Q"):
             return None
@@ -891,7 +891,7 @@ def _create_screen():
             body += f"[dim]AI will fill the last {ai_players} slot(s).[/dim]\n\n"
         body += f"[dim]←→/hl adjust  •  ↑↓/jk select  •  Enter to create  •  Esc to back[/dim]"
         console.clear()
-        console.print(Align.center(Panel(Text.from_markup(body), border_style="green"), vertical="middle"))
+        console.print(Align.center(Panel(Text.from_markup(body), border_style="green"), vertical="middle", height=console.height))
         ch = _key(None)
         if ch in ("\x1b", "q", "Q"):
             return None
@@ -917,7 +917,7 @@ def _create_screen():
 
 def _join_screen():
     console.clear()
-    console.print(Align.center(Panel.fit(f"[bold]Join Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]", border_style="green"), vertical="middle"))
+    console.print(Align.center(Panel.fit(f"[bold]Join Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]", border_style="green"), vertical="middle", height=console.height))
     # fetch games
     CLIENT.send("list_games", {"player_name": MY_NAME})
     _time.sleep(0.5)
@@ -933,7 +933,7 @@ def _join_screen():
 def _show_game_list(games: list[dict]) -> str | None:
     """Highlighted game list with ↑↓ selection.  Returns game code or None."""
     if not games:
-        console.print(Align.center("[dim]No open games found.[/dim]", vertical="middle"))
+        console.print(Align.center("[dim]No open games found.[/dim]", vertical="middle", height=console.height))
         return _read_line("Enter game code manually:")
 
     opts = [
@@ -958,7 +958,7 @@ def _show_game_list(games: list[dict]) -> str | None:
             f"[bold]Available games — ↑↓ to select, Enter to confirm, ESC to cancel:[/bold]\n\n{body}"
         )
         console.clear()
-        console.print(Align.center(Panel(frame, border_style="yellow"), vertical="middle"))
+        console.print(Align.center(Panel(frame, border_style="yellow"), vertical="middle", height=console.height))
         ch = _key(None)
         if ch in ("\x1b", "q", "Q"):
             return None
@@ -1004,7 +1004,7 @@ def _lobby():
             lobby_parts.append(pl_text)
         n = NUM_PLAYERS - len(lobby_players)
         lobby_parts.append(Text.from_markup(f"\n[dim]{n} more needed.  q to leave.[/dim]"))
-        console.print(Align.center(Group(*lobby_parts), vertical="middle"))
+        console.print(Align.center(Group(*lobby_parts), vertical="middle", height=console.height))
         if _ch() in ("\x1b","q","Q"): return False
         _time.sleep(0.3)
     return False
