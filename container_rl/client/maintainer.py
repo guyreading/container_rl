@@ -12,7 +12,8 @@ import time as _time
 import tty
 from typing import Any
 
-from rich.console import Console
+from rich.console import Console, Group
+from rich.align import Align
 from rich.panel import Panel
 from rich.text import Text
 
@@ -104,7 +105,7 @@ def _draw_list(games: list[dict], selected: int, feedback: str = "") -> None:
     lines.append("")
     content = "\n".join(lines)
     console.clear()
-    console.print(Panel(Text.from_markup(content), border_style="blue"))
+    console.print(Align.center(Panel(Text.from_markup(content), border_style="blue"), vertical="middle"))
 
 
 def main():

@@ -14,6 +14,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 from rich.console import Console, Group
+from rich.align import Align
 from rich.columns import Columns
 from rich.live import Live
 from rich.panel import Panel
@@ -262,7 +263,7 @@ def _render(state, nc, np_, feedback="", my_player=None):
         s = int(state.auction_seller); r = int(state.auction_round)
         t = f"Auction — P{s+1} selling" if r==0 else f"Auction — P{s+1}: accept/reject?"
         elems.append(Panel(Text(t, style="bold yellow"), title="Auction", border_style="yellow"))
-    return Group(*elems)
+    return Align.center(Group(*elems), vertical="middle")
 
 # ── opponent helper ──────────────────────────────────────────────────────
 
@@ -571,11 +572,8 @@ def _show_final_scores(state, nc, np_):
         )
 
     console.clear()
-    console.print(lb)
-    console.print()
-    console.print(bt)
-    console.print()
-    console.print("[dim]Press any key to exit…[/dim]")
+    parts = [lb, bt, Text.from_markup("[dim]Press any key to exit…[/dim]")]
+    console.print(Align.center(Group(*parts), vertical="middle"))
 
 
 # ── gameplay loop ────────────────────────────────────────────────────────
@@ -849,7 +847,7 @@ def _main_menu():
             f"[bold]🚢 Container RL — select with ↑↓ or number, Enter to confirm:[/bold]\n\n{body}"
         )
         console.clear()
-        console.print(Panel(frame, border_style="blue"))
+        console.print(Align.center(Panel(frame, border_style="blue"), vertical="middle"))
         ch = _key(None)
         if ch in ("\x1b", "q", "Q"):
             return None
@@ -893,7 +891,7 @@ def _create_screen():
             body += f"[dim]AI will fill the last {ai_players} slot(s).[/dim]\n\n"
         body += f"[dim]←→/hl adjust  •  ↑↓/jk select  •  Enter to create  •  Esc to back[/dim]"
         console.clear()
-        console.print(Panel(Text.from_markup(body), border_style="green"))
+        console.print(Align.center(Panel(Text.from_markup(body), border_style="green"), vertical="middle"))
         ch = _key(None)
         if ch in ("\x1b", "q", "Q"):
             return None
@@ -919,7 +917,7 @@ def _create_screen():
 
 def _join_screen():
     console.clear()
-    console.print(Panel.fit(f"[bold]Join Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]", border_style="green"))
+    console.print(Align.center(Panel.fit(f"[bold]Join Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]", border_style="green"), vertical="middle"))
     # fetch games
     CLIENT.send("list_games", {"player_name": MY_NAME})
     _time.sleep(0.5)
@@ -935,7 +933,7 @@ def _join_screen():
 def _show_game_list(games: list[dict]) -> str | None:
     """Highlighted game list with ↑↓ selection.  Returns game code or None."""
     if not games:
-        console.print("[dim]No open games found.[/dim]")
+        console.print(Align.center("[dim]No open games found.[/dim]", vertical="middle"))
         return _read_line("Enter game code manually:")
 
     opts = [
@@ -960,7 +958,7 @@ def _show_game_list(games: list[dict]) -> str | None:
             f"[bold]Available games — ↑↓ to select, Enter to confirm, ESC to cancel:[/bold]\n\n{body}"
         )
         console.clear()
-        console.print(Panel(frame, border_style="yellow"))
+        console.print(Align.center(Panel(frame, border_style="yellow"), vertical="middle"))
         ch = _key(None)
         if ch in ("\x1b", "q", "Q"):
             return None
@@ -996,15 +994,17 @@ def _lobby():
             elif t=="error": console.print(f"[red]{p.get('message','')}[/red]"); _key(1)
             elif t=="disconnected": return False
         console.clear()
-        console.print(Panel.fit(f"[bold]Lobby — {GAME_CODE}[/bold]", border_style="yellow"))
+        lobby_parts = [Panel.fit(f"[bold]Lobby — {GAME_CODE}[/bold]", border_style="yellow")]
         if lobby_players:
-            console.print("[bold]Players:[/bold]")
+            pl_text = Text.from_markup("[bold]Players:[/bold]")
             for pl in lobby_players:
                 idx=pl.get("player_index",0); nm=pl.get("name","?")
                 mrk=" [green](you)[/green]" if int(idx)==PLAYER_INDEX else ""
-                console.print(f"  {nm}{mrk}")
+                pl_text.append(f"\n  {nm}{mrk}")
+            lobby_parts.append(pl_text)
         n = NUM_PLAYERS - len(lobby_players)
-        console.print(f"\n[dim]{n} more needed.  q to leave.[/dim]")
+        lobby_parts.append(Text.from_markup(f"\n[dim]{n} more needed.  q to leave.[/dim]"))
+        console.print(Align.center(Group(*lobby_parts), vertical="middle"))
         if _ch() in ("\x1b","q","Q"): return False
         _time.sleep(0.3)
     return False
