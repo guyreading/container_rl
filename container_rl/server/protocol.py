@@ -80,6 +80,20 @@ _STATE_KEYS = [
     "step_count",
 ]
 
+# Fields that are 0-d scalars.  Only these can be safely back-filled when an
+# older save predates them — zero is a valid "unset" value and the shape is
+# unambiguous.  Anything else (a per-player or per-colour array) would need a
+# shape we cannot infer, so a missing one is an error rather than a zero.
+_SCALAR_KEYS = frozenset({
+    "turn_phase", "current_player", "game_over",
+    "auction_active", "auction_seller", "auction_round",
+    "actions_taken", "produced_this_turn",
+    "shopping_active", "shopping_action_type", "shopping_target",
+    "shopping_harbour_price",
+    "produce_active", "produce_was_produced",
+    "step_count",
+})
+
 
 def serialize_state(state: EnvState) -> bytes:
     """Convert an *EnvState* to a pickle-able bytes object."""
@@ -90,15 +104,29 @@ def serialize_state(state: EnvState) -> bytes:
 def deserialize_state(blob: bytes) -> EnvState:
     """Reconstruct an *EnvState* from pickled bytes.
 
-    Fills in missing fields (from older save formats) with zeros.
+    Scalar fields added since the save was written are back-filled with zero.
+    A missing *array* field is fatal: we cannot infer its shape, and filling a
+    0-d zero produces a state that loads cleanly and then fails much later on
+    the first index into it.
+
+    Raises:
+        ValueError: the blob predates a non-scalar field of the current
+            ``EnvState`` (e.g. a save written before ``secret_value_color``
+            became the per-colour ``secret_card_values``).
     """
     data = pickle.loads(blob)
     kwargs = {}
+    missing = []
     for key in _STATE_KEYS:
         if key in data:
             kwargs[key] = jnp.asarray(data[key])
-        else:
-            # Fill missing fields with zeros (backward-compat with older saves)
-            shape = getattr(EnvState, key, None)
+        elif key in _SCALAR_KEYS:
             kwargs[key] = jnp.zeros((), dtype=jnp.int32)
+        else:
+            missing.append(key)
+    if missing:
+        raise ValueError(
+            "Saved game state is from an incompatible older format; missing "
+            f"field(s): {', '.join(missing)}. Start a new game."
+        )
     return EnvState(**kwargs)

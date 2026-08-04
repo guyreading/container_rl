@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from typing import Any, Callable
 
@@ -45,6 +46,15 @@ _ACTION_NAMES = {
     ACTION_DOMESTIC_SALE: "Domestic sale",
 }
 
+logger = logging.getLogger(__name__)
+
+# Head order the MultiDiscrete policy expects; must match ``head_sizes``.
+_MASK_HEADS = ("action_type", "opponent", "color", "price_slot", "purchase")
+
+# Backstops so a misbehaving model cannot spin forever holding the manager lock.
+MAX_AI_TURN_STEPS = 200
+MAX_AI_CONTINUATION_STEPS = 50
+
 
 class GameManager:
     def __init__(self, db: Database, broadcast: Callable[[int, str, Any], None],
@@ -56,6 +66,7 @@ class GameManager:
         self._lock = threading.RLock()
         self._ai_model_path = ai_model_path
         self._ai_model: Any = None  # MaskablePPO instance (lazy-loaded)
+        self._ai_model_failed = False  # load/inference failed; use random legal play
         self._ai_slots: dict[int, list[int]] = {}  # game_id -> [ai_player_indices]
         self._mask_sizes: dict[tuple[int, int], int] = {}  # cache mask_size per (np, nc)
 
@@ -66,12 +77,14 @@ class GameManager:
     def create_game(
         self, player_name: str, password: str | None,
         num_players: int, num_colors: int = 5, seed: int | None = None,
+        ai_count: int = 0,
     ) -> dict:
         """Create a new game and join as the first player (slot 0)."""
         player_id = self.db.upsert_player(player_name, password)
         game_id, code = self.db.create_game(num_players, num_colors, seed)
         self.db.assign_player_slot(game_id, player_id, 0)
-        return {"game_id": game_id, "code": code, "player_index": 0}
+        self._seed_ai_slots(game_id, num_players, ai_count)
+        return {"game_id": game_id, "code": code, "player_index": 0, "ai_count": ai_count}
 
     def create_game_trusted(
         self, player_name: str,
@@ -85,23 +98,29 @@ class GameManager:
         player_id = self.db.upsert_player_trusted(player_name)
         game_id, code = self.db.create_game(num_players, num_colors, seed)
         self.db.assign_player_slot(game_id, player_id, 0)
-        if ai_count > 0:
-            ai_slots = list(range(num_players - ai_count, num_players))
-            self._ai_slots[game_id] = ai_slots
-            # Pre-assign DB slots for AI players so the lobby fills immediately
-            for slot in ai_slots:
-                ai_name = f"[AI] Player {slot + 1}"
-                ai_pid = self.db.upsert_player_trusted(ai_name)
-                self.db.assign_player_slot(game_id, ai_pid, slot)
+        self._seed_ai_slots(game_id, num_players, ai_count)
         return {"game_id": game_id, "code": code, "player_index": 0, "ai_count": ai_count}
 
+    def _seed_ai_slots(self, game_id: int, num_players: int, ai_count: int) -> None:
+        """Pre-assign the trailing slots to AI players so the lobby fills."""
+        if ai_count <= 0:
+            return
+        ai_slots = list(range(num_players - ai_count, num_players))
+        self._ai_slots[game_id] = ai_slots
+        for slot in ai_slots:
+            ai_pid = self.db.upsert_player_trusted(f"[AI] Player {slot + 1}")
+            self.db.assign_player_slot(game_id, ai_pid, slot, is_ai=True)
+
     def _get_ai_slots(self, game_id: int) -> list[int]:
-        """Derive AI player slots from the database (survives server restarts)."""
+        """Derive AI player slots from the database (survives server restarts).
+
+        Reads the ``is_ai`` flag on the slot rather than sniffing the display
+        name, so a human calling themselves "[AI] …" is not auto-played.
+        """
         if game_id in self._ai_slots:
             return self._ai_slots[game_id]
         players = self.db.get_game_players(game_id)
-        ai_slots = [int(p["player_index"]) for p in players
-                     if (p.get("name") or "").startswith("[AI]")]
+        ai_slots = [int(p["player_index"]) for p in players if p.get("is_ai")]
         if ai_slots:
             self._ai_slots[game_id] = ai_slots
         return ai_slots
@@ -197,11 +216,9 @@ class GameManager:
             self._encoders[game_id] = ActionEncoder(game["num_players"], game["num_colors"])
             self._save_state(game_id, env.state)
             self.db.set_game_status(game_id, "active")
-
-            # If AI slots exist, auto-play their first turns if they start
-            if self._get_ai_slots(game_id):
-                self._play_ai_turns(game_id)
-
+            # Deliberately does *not* auto-play AI turns here: doing so would
+            # broadcast state_update before the caller has sent game_started.
+            # Callers invoke play_ai_turn_if_needed() after announcing the start.
             return True
 
     def load_or_create_env(self, game_id: int) -> ContainerJaxEnv:
@@ -327,13 +344,27 @@ class GameManager:
     # ------------------------------------------------------------------
 
     def _load_ai_model(self) -> Any:
-        """Lazy-load the MaskablePPO model for AI opponents."""
+        """Lazy-load the MaskablePPO model for AI opponents.
+
+        Returns ``None`` if no model is configured or the model fails to
+        load (wrong path, or a checkpoint trained against an older
+        observation space).  Callers fall back to masked-random play so a
+        game is never left wedged on an AI's turn.
+        """
         if self._ai_model is not None:
             return self._ai_model
-        if not self._ai_model_path:
+        if not self._ai_model_path or self._ai_model_failed:
             return None
-        from sb3_contrib import MaskablePPO
-        self._ai_model = MaskablePPO.load(self._ai_model_path, device="cpu")
+        try:
+            from sb3_contrib import MaskablePPO
+            self._ai_model = MaskablePPO.load(self._ai_model_path, device="cpu")
+        except Exception:
+            self._ai_model_failed = True
+            logger.exception(
+                "Failed to load AI model from %s — AI players will play randomly.",
+                self._ai_model_path,
+            )
+            return None
         return self._ai_model
 
     def _get_mask_size(self, np_: int, nc: int) -> int:
@@ -342,6 +373,62 @@ class GameManager:
         if key not in self._mask_sizes:
             self._mask_sizes[key] = mask_size(np_, nc)
         return self._mask_sizes[key]
+
+    def _ai_step(self, env: ContainerJaxEnv, model: Any, ms_size: int) -> Any:
+        """Choose one action for the current player and apply it.
+
+        Returns whatever ``env.step`` returns.  The model is advisory: if it
+        is missing or raises (e.g. a checkpoint whose observation space no
+        longer matches the env), we fall back to a uniform choice among the
+        legal actions so the game keeps moving.
+        """
+        state = env.state
+        params = env.func_env.params
+        obs_full = np.asarray(
+            env.func_env.observation(state, jax.random.PRNGKey(0), params),
+            dtype=np.float32,
+        )
+        obs = obs_full[:-ms_size] if ms_size > 0 else obs_full
+
+        per_head = [
+            np.asarray(mask, dtype=bool).reshape(-1)
+            for mask in self._head_masks(env, state)
+        ]
+        # sb3-contrib does ``th.as_tensor(masks).view(-1, sum(action_dims))``,
+        # so it needs one flat concatenated mask.  A ragged list of per-head
+        # arrays raises before it ever reaches the policy.
+        flat_masks = np.concatenate(per_head)
+
+        action = None
+        if model is not None:
+            try:
+                action, _ = model.predict(obs, action_masks=flat_masks, deterministic=False)
+            except Exception:
+                if not self._ai_model_failed:
+                    self._ai_model_failed = True
+                    logger.exception(
+                        "AI model inference failed — falling back to random legal play."
+                    )
+                action = None
+        if action is None:
+            action = self._random_legal_action(per_head)
+
+        return env.step(np.atleast_1d(action))
+
+    @staticmethod
+    def _head_masks(env: ContainerJaxEnv, state: EnvState) -> list[Any]:
+        """Per-head action masks, in the head order the policy expects."""
+        masks_dict = env.func_env._action_masks(state, env.func_env.params)
+        return [masks_dict[k] for k in _MASK_HEADS]
+
+    @staticmethod
+    def _random_legal_action(per_head: list[Any]) -> np.ndarray:
+        """Uniformly sample one legal index per head (0 if a head has none)."""
+        choices = []
+        for mask in per_head:
+            legal = np.flatnonzero(mask)
+            choices.append(int(np.random.choice(legal)) if legal.size else 0)
+        return np.asarray(choices, dtype=np.int64)
 
     def play_ai_turn_if_needed(self, game_id: int) -> None:
         """Public entry point: auto-play AI turns if it's an AI's turn.
@@ -359,21 +446,23 @@ class GameManager:
 
         Called after ``maybe_start_game`` and after every ``process_action``.
         """
-        model = self._load_ai_model()
-        if model is None:
-            return
-
         env = self._envs.get(game_id)
         if env is None:
             return
 
         ai_slots = self._get_ai_slots(game_id)
+        if not ai_slots:
+            return
+
+        model = self._load_ai_model()
         nc = env.func_env.params.num_colors
         np_ = env.func_env.params.num_players
         ms_size = self._get_mask_size(np_, nc)
 
-        # Keep playing as long as it's an AI player's turn
-        while True:
+        # Keep playing as long as it's an AI player's turn.  The cap is a
+        # backstop: a model that keeps picking non-turn-ending actions must
+        # not spin forever while holding the manager lock.
+        for _ in range(MAX_AI_TURN_STEPS):
             state = env.state
             if int(state.game_over) > 0:
                 break
@@ -381,30 +470,14 @@ class GameManager:
             if cp not in ai_slots:
                 break
 
-            # ── 1. Get observation (strip mask tail for model input) ──
-            obs_full = np.asarray(
-                env.func_env.observation(state, jax.random.PRNGKey(0), env.func_env.params),
-                dtype=np.float32,
-            )
-            obs = obs_full[:-ms_size] if ms_size > 0 else obs_full
-
-            # ── 2. Get masks ──
-            masks_dict = env.func_env._action_masks(state, env.func_env.params)
-            masks = [
-                np.asarray(masks_dict[k], dtype=bool)
-                for k in ("action_type", "opponent", "color", "price_slot", "purchase")
-            ]
-
-            # ── 3. Predict and step ──
-            action, _ = model.predict(obs, action_masks=masks, deterministic=False)
-            action = np.atleast_1d(action)
-            obs_next, reward, term, trunc, info = env.step(action)
+            # ── 1. Choose and apply one action ──
+            _obs, _reward, term, _trunc, _info = self._ai_step(env, model, ms_size)
             self._save_state(game_id, env.state)
 
-            # ── 4. Handle shopping / produce / auction continuation ──
+            # ── 2. Handle shopping / produce / auction continuation ──
             self._play_ai_continuation(game_id, model, nc, np_, ms_size)
 
-            # ── 5. Broadcast updated state ──
+            # ── 3. Broadcast updated state ──
             new_state = env.state
             state_blob = serialize_state(new_state)
             try:
@@ -422,7 +495,7 @@ class GameManager:
                 "game_over": int(new_state.game_over),
             })
 
-            # ── 6. Check for game over ──
+            # ── 4. Check for game over ──
             if bool(term) or int(new_state.game_over) > 0:
                 self.db.set_game_status(game_id, "finished")
                 break
@@ -431,43 +504,19 @@ class GameManager:
                                nc: int, np_: int, ms_size: int) -> None:
         """Handle shopping / produce / auction for an AI player."""
         env = self._envs[game_id]
-        max_steps = 50
-        steps = 0
         state = env.state
 
-        while (bool(state.shopping_active) or bool(state.produce_active)) and steps < max_steps:
-            obs_full = np.asarray(
-                env.func_env.observation(state, jax.random.PRNGKey(0), env.func_env.params),
-                dtype=np.float32,
-            )
-            obs = obs_full[:-ms_size] if ms_size > 0 else obs_full
-            masks_dict = env.func_env._action_masks(state, env.func_env.params)
-            masks = [
-                np.asarray(masks_dict[k], dtype=bool)
-                for k in ("action_type", "opponent", "color", "price_slot", "purchase")
-            ]
-            action, _ = model.predict(obs, action_masks=masks, deterministic=False)
-            action = np.atleast_1d(action)
-            env.step(action)
+        steps = 0
+        while (bool(state.shopping_active) or bool(state.produce_active)) \
+                and steps < MAX_AI_CONTINUATION_STEPS:
+            self._ai_step(env, model, ms_size)
             self._save_state(game_id, env.state)
             state = env.state
             steps += 1
 
         steps = 0
-        while bool(state.auction_active) and steps < max_steps:
-            obs_full = np.asarray(
-                env.func_env.observation(state, jax.random.PRNGKey(0), env.func_env.params),
-                dtype=np.float32,
-            )
-            obs = obs_full[:-ms_size] if ms_size > 0 else obs_full
-            masks_dict = env.func_env._action_masks(state, env.func_env.params)
-            masks = [
-                np.asarray(masks_dict[k], dtype=bool)
-                for k in ("action_type", "opponent", "color", "price_slot", "purchase")
-            ]
-            action, _ = model.predict(obs, action_masks=masks, deterministic=False)
-            action = np.atleast_1d(action)
-            env.step(action)
+        while bool(state.auction_active) and steps < MAX_AI_CONTINUATION_STEPS:
+            self._ai_step(env, model, ms_size)
             self._save_state(game_id, env.state)
             state = env.state
             steps += 1

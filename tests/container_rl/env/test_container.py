@@ -23,6 +23,7 @@ from container_rl.env.container import (  # noqa: E402
     LOAN_AMOUNT,
     LOCATION_OPEN_SEA,
     PRICE_SLOTS,
+    SECRET_CARD_VALUES,
     SHIP_CAPACITY,
     ActionEncoder,
     ContainerFunctional,
@@ -48,6 +49,50 @@ def _make_initial_state(func_env=None, rng=None, num_players=2, num_colors=5):
     if rng is None:
         rng = random.PRNGKey(0)
     return func_env.initial(rng, ContainerParams(num_players=num_players, num_colors=num_colors))
+
+
+def _make_state(**overrides):
+    """Create an EnvState with defaults suitable for 2-player testing.
+
+    Both players hold the standard secret card deck in colour order, so
+    island scoring in these tests is deterministic.
+    """
+    np_, nc = 2, 5
+    defaults = dict(
+        cash=jnp.full((np_,), INITIAL_CASH, dtype=jnp.int32),
+        loans=jnp.zeros((np_,), dtype=jnp.int32),
+        factory_colors=jnp.zeros((np_, nc), dtype=jnp.int32).at[0, 0].set(1).at[1, 1].set(1),
+        warehouse_count=jnp.ones((np_,), dtype=jnp.int32),
+        factory_store=jnp.zeros((np_, nc, PRICE_SLOTS), dtype=jnp.int32).at[0, 0, 4].set(1).at[1, 1, 4].set(1),
+        harbour_store=jnp.zeros((np_, nc, PRICE_SLOTS), dtype=jnp.int32),
+        island_store=jnp.zeros((np_, nc), dtype=jnp.int32),
+        ship_contents=jnp.zeros((np_, SHIP_CAPACITY), dtype=jnp.int32),
+        ship_location=jnp.zeros((np_,), dtype=jnp.int32),
+        container_supply=jnp.full((nc,), np_ * 4, dtype=jnp.int32),
+        turn_phase=jnp.array(0, dtype=jnp.int32),
+        current_player=jnp.array(0, dtype=jnp.int32),
+        game_over=jnp.array(0, dtype=jnp.int32),
+        secret_card_values=jnp.tile(
+            jnp.array(SECRET_CARD_VALUES, dtype=jnp.int32), (np_, 1)
+        ),
+        auction_active=jnp.array(0, dtype=jnp.int32),
+        auction_seller=jnp.array(0, dtype=jnp.int32),
+        auction_cargo=jnp.zeros(SHIP_CAPACITY, dtype=jnp.int32),
+        auction_bids=jnp.zeros((np_,), dtype=jnp.int32),
+        auction_round=jnp.array(0, dtype=jnp.int32),
+        actions_taken=jnp.array(0, dtype=jnp.int32),
+        produced_this_turn=jnp.array(0, dtype=jnp.int32),
+        shopping_active=jnp.array(0, dtype=jnp.int32),
+        shopping_action_type=jnp.array(0, dtype=jnp.int32),
+        shopping_target=jnp.array(0, dtype=jnp.int32),
+        shopping_harbour_price=jnp.array(0, dtype=jnp.int32),
+        produce_active=jnp.array(0, dtype=jnp.int32),
+        produce_pending=jnp.zeros((nc,), dtype=jnp.int32),
+        produce_was_produced=jnp.array(0, dtype=jnp.int32),
+        step_count=jnp.array(0, dtype=jnp.int32),
+    )
+    defaults.update(overrides)
+    return EnvState(**defaults)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -247,10 +292,20 @@ class TestInitialState:
         state = _make_initial_state()
         assert int(state.produced_this_turn) == 0
 
-    def test_initial_secret_value_color_in_range(self):
+    def test_initial_secret_cards_are_a_permutation_of_the_deck(self):
         state = _make_initial_state(num_colors=5)
         for p in range(2):
-            assert 0 <= int(state.secret_value_color[p]) < 5
+            row = [int(v) for v in state.secret_card_values[p]]
+            assert sorted(row) == sorted(SECRET_CARD_VALUES)
+
+    def test_initial_secret_cards_match_board_width(self):
+        """The 5-card deck is trimmed/cycled so the row is always num_colors wide."""
+        for nc in (3, 4, 5):
+            state = _make_initial_state(num_colors=nc)
+            assert state.secret_card_values.shape == (2, nc)
+            # The special 5/10 card is always dealt.
+            for p in range(2):
+                assert -1 in [int(v) for v in state.secret_card_values[p]]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -422,36 +477,45 @@ class TestNetWorth:
         assert int(nw) == 39  # 30 + 3*3
 
     def test_island_scoring_with_all_colors(self):
-        """10/5 color = $10 when you have at least one of every color."""
+        """The 5/10 card scores $10 when you hold at least one of every colour."""
         func_env = _make_func_env()
         island = jnp.array([[1, 1, 1, 1, 1], [0, 0, 0, 0, 0]], dtype=jnp.int32)
         state = _make_state(
             cash=jnp.array([10, 20], dtype=jnp.int32),
             island_store=island,
-            secret_value_color=jnp.array([0, 1], dtype=jnp.int32),
         )
         nw = func_env._net_worth(state, 0, 5)
-        # has all colors -> color 0 worth $10 each, others $2 each
-        # But most abundant color is discarded (all have 1, tie involves 10/5 -> discard 10/5)
-        # Remaining: 4 containers at $2 each = $8
-        # Total: 10 + 8 = 18
-        assert int(nw) == 18
+        # card = [2, 4, 6, 10, -1]; has all colours so -1 scores 10
+        # island: 1*2 + 1*4 + 1*6 + 1*10 + 1*10 = 32
+        # total: 10 + 32 = 42
+        assert int(nw) == 42
 
     def test_island_scoring_without_all_colors(self):
-        """10/5 color = $5 when you don't have all colors."""
+        """The 5/10 card scores $5 when the set is incomplete."""
         func_env = _make_func_env()
         island = jnp.array([[3, 1, 0, 1, 0], [0, 0, 0, 0, 0]], dtype=jnp.int32)
         state = _make_state(
             cash=jnp.array([10, 20], dtype=jnp.int32),
             island_store=island,
-            secret_value_color=jnp.array([0, 1], dtype=jnp.int32),
         )
         nw = func_env._net_worth(state, 0, 5)
-        # Doesn't have all colors (colors 2, 4 missing) -> color 0 = $5 each
-        # Most abundant: color 0 with 3 -> discard all of color 0
-        # Remaining: color 1 (1) at $2, color 3 (1) at $2 = $4
-        # Total: 10 + 4 = 14
-        assert int(nw) == 14
+        # card = [2, 4, 6, 10, -1]; colours 2 and 4 missing so -1 scores 5
+        # island: 3*2 + 1*4 + 0*6 + 1*10 + 0*5 = 20
+        # total: 10 + 20 = 30
+        assert int(nw) == 30
+
+    def test_island_scoring_uses_each_colours_own_card_value(self):
+        """Every colour scores its own multiplier — nothing is discarded."""
+        func_env = _make_func_env()
+        island = jnp.array([[4, 0, 0, 0, 0], [0, 0, 0, 0, 0]], dtype=jnp.int32)
+        cards = jnp.tile(jnp.array([6, 2, 4, 10, -1], dtype=jnp.int32), (2, 1))
+        state = _make_state(
+            cash=jnp.array([0, 0], dtype=jnp.int32),
+            island_store=island,
+            secret_card_values=cards,
+        )
+        # 4 containers of colour 0, whose card value is 6 -> 24
+        assert int(func_env._net_worth(state, 0, 5)) == 24
 
     def test_island_empty_scores_zero(self):
         func_env = _make_func_env()
@@ -470,7 +534,6 @@ class TestNetWorth:
             island_store=island,
             harbour_store=store,
             ship_contents=ship,
-            secret_value_color=jnp.array([0, 1], dtype=jnp.int32),
             loans=jnp.array([1, 0], dtype=jnp.int32),
         )
         nw = func_env._net_worth(state, 0, 5)
@@ -478,10 +541,10 @@ class TestNetWorth:
         # loans: -11
         # harbour: 2 * 2 = 4
         # ship: 1 * 3 = 3
-        # island: has all colors -> color 0 = $10 each. Most abundant: color 0 (2) discarded.
-        #   Remaining: 4 containers at $2 each = $8
-        # total = 20 - 11 + 4 + 3 + 8 = 24
-        assert int(nw) == 24
+        # island: card [2, 4, 6, 10, -1], has all colours so -1 scores 10
+        #   2*2 + 1*4 + 1*6 + 1*10 + 1*10 = 34
+        # total = 20 - 11 + 4 + 3 + 34 = 50
+        assert int(nw) == 50
 
 
 
@@ -497,35 +560,35 @@ class TestAdvanceTurn:
     def test_first_action_does_not_end_turn(self):
         func_env = _make_func_env()
         state = _make_state()
-        new_state = func_env._advance_turn(state, ACTION_PASS, 2)
+        new_state = func_env._advance_turn(state, ACTION_PASS, 2, False)
         assert int(new_state.actions_taken) == 1
         assert int(new_state.current_player) == 0  # still P0
 
     def test_second_action_ends_turn(self):
         func_env = _make_func_env()
         state = _make_state(actions_taken=jnp.array(1, dtype=jnp.int32))
-        new_state = func_env._advance_turn(state, ACTION_PASS, 2)
+        new_state = func_env._advance_turn(state, ACTION_PASS, 2, False)
         assert int(new_state.actions_taken) == 0
         assert int(new_state.current_player) == 1  # moves to P1
 
     def test_auction_ends_turn_immediately(self):
         func_env = _make_func_env()
         state = _make_state(actions_taken=jnp.array(0, dtype=jnp.int32))
-        new_state = func_env._advance_turn(state, ACTION_MOVE_AUCTION, 2)
+        new_state = func_env._advance_turn(state, ACTION_MOVE_AUCTION, 2, False)
         assert int(new_state.actions_taken) == 0
         assert int(new_state.current_player) == 1  # advances even on first action
 
     def test_loan_does_not_consume_action(self):
         func_env = _make_func_env()
         state = _make_state()
-        new_state = func_env._advance_turn(state, ACTION_TAKE_LOAN, 2)
+        new_state = func_env._advance_turn(state, ACTION_TAKE_LOAN, 2, False)
         assert int(new_state.actions_taken) == 0  # unchanged
         assert int(new_state.current_player) == 0  # still P0
 
     def test_repay_loan_does_not_consume_action(self):
         func_env = _make_func_env()
         state = _make_state()
-        new_state = func_env._advance_turn(state, ACTION_REPAY_LOAN, 2)
+        new_state = func_env._advance_turn(state, ACTION_REPAY_LOAN, 2, False)
         assert int(new_state.actions_taken) == 0
 
     def test_resets_produced_flag_on_turn_end(self):
@@ -534,7 +597,7 @@ class TestAdvanceTurn:
             actions_taken=jnp.array(1, dtype=jnp.int32),
             produced_this_turn=jnp.array(1, dtype=jnp.int32),
         )
-        new_state = func_env._advance_turn(state, ACTION_PASS, 2)
+        new_state = func_env._advance_turn(state, ACTION_PASS, 2, False)
         assert int(new_state.produced_this_turn) == 0
 
     def test_wraps_around_to_player0(self):
@@ -543,7 +606,7 @@ class TestAdvanceTurn:
             current_player=jnp.array(1, dtype=jnp.int32),
             actions_taken=jnp.array(1, dtype=jnp.int32),
         )
-        new_state = func_env._advance_turn(state, ACTION_PASS, 2)
+        new_state = func_env._advance_turn(state, ACTION_PASS, 2, False)
         assert int(new_state.current_player) == 0
 
 
@@ -796,20 +859,24 @@ class TestFullGame:
         encoder = ActionEncoder(2, 5)
         obs, info = env.reset(seed=42)
 
+        # Produce must name a colour P0 actually owns a factory for.
+        p0_color = int(jnp.argmax(env.state.factory_colors[0]))
+
         total = 0.0
         actions = [
-            ACTION_PRODUCE,       # P0 produces, pays $1 -> reward -1
-            ACTION_PASS,          # P0 passes, turn ends
-            ACTION_PASS,          # P1 passes (action 1)
-            ACTION_PASS,          # P1 passes (action 2), turn back to P0
-            ACTION_TAKE_LOAN,     # P0 takes loan -> net worth change
-            ACTION_BUY_WAREHOUSE, # P0 buys warehouse -> pays money
-            ACTION_PASS,          # P0 passes
-            ACTION_PASS,          # P1 passes
-            ACTION_PASS,          # P1 passes
+            # P0 produces at $1 -> reward -1
+            (ACTION_PRODUCE, {"color": p0_color, "price_slot": 0}),
+            (ACTION_PASS, {}),          # P0 passes, turn ends
+            (ACTION_PASS, {}),          # P1 passes (action 1)
+            (ACTION_PASS, {}),          # P1 passes (action 2), turn back to P0
+            (ACTION_TAKE_LOAN, {}),     # P0 takes loan -> net worth change
+            (ACTION_BUY_WAREHOUSE, {}), # P0 buys warehouse -> pays money
+            (ACTION_PASS, {}),          # P0 passes
+            (ACTION_PASS, {}),          # P1 passes
+            (ACTION_PASS, {}),          # P1 passes
         ]
-        for atype in actions:
-            idx = encoder.encode(atype, {})
+        for atype, aparams in actions:
+            idx = encoder.encode(atype, aparams)
             obs, reward, term, trunc, info = env.step(idx)
             total += float(reward)
             if term:

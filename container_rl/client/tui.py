@@ -193,7 +193,7 @@ def _net_worth(state, player, nc):
             iv += val * cnt
     return cash + hv + sv + iv - int(state.loans[player]) * 11
 
-def _player_card(state, player, nc, is_current):
+def _player_card(state, player, nc, is_current, is_mine=False):
     cash = int(state.cash[player])
     loans = int(state.loans[player])
     wh = int(state.warehouse_count[player])
@@ -205,8 +205,10 @@ def _player_card(state, player, nc, is_current):
     out = Text.from_markup(f"[bold]{name}{badge}[/bold]  ${nw}\n")
     out.append("─"*28+"\n")
     out.append_text(Text.from_markup(f"  💵 ${cash}  🏦 {loans} loans  🏭 {wh} wh\n"))
-    # Secret card: only visible to the player who owns it
-    if is_current:
+    # Secret card: only visible to the player who owns it.  Gate on "is this
+    # my seat", not "is it this seat's turn" — every client renders the full
+    # state, so gating on the turn shows everyone the active player's card.
+    if is_mine:
         card_parts = []
         for c in range(nc):
             val = int(state.secret_card_values[player, c])
@@ -246,7 +248,7 @@ def _render(state, nc, np_, feedback="", my_player=None):
         hdr += "  [green](YOU)[/green]"
     elems.append(Panel(Text(hdr, style="bold white on blue")))
     elems.append(Panel(_supply(state,nc), title="Supply", border_style="yellow"))
-    cards = [_player_card(state,p,nc,turn==p) for p in range(np_)]
+    cards = [_player_card(state,p,nc,turn==p,my_player==p) for p in range(np_)]
     elems.append(Columns(cards, equal=False, expand=True))
     if feedback:
         elems.append(Panel(Text.from_markup(feedback, style="green"), border_style="green"))

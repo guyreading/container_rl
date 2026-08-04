@@ -13,7 +13,7 @@ games
     num_players, num_colors, seed, created_at, finished_at
 
 game_players
-    game_id, player_index, player_id, joined_at
+    game_id, player_index, player_id, is_ai, joined_at
 
 game_states
     game_id, state_blob, step_count, saved_at
@@ -90,6 +90,7 @@ class Database:
                     game_id INTEGER REFERENCES games(id) ON DELETE CASCADE,
                     player_index INTEGER NOT NULL,
                     player_id INTEGER REFERENCES players(id),
+                    is_ai INTEGER NOT NULL DEFAULT 0,
                     joined_at TEXT DEFAULT (datetime('now')),
                     PRIMARY KEY (game_id, player_index)
                 );
@@ -109,6 +110,16 @@ class Database:
                     created_at TEXT DEFAULT (datetime('now'))
                 );
             """)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """Idempotent schema top-ups for databases created by older builds."""
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(game_players)")}
+        if "is_ai" not in cols:
+            conn.execute(
+                "ALTER TABLE game_players ADD COLUMN is_ai INTEGER NOT NULL DEFAULT 0"
+            )
 
     # ------------------------------------------------------------------
     # players
@@ -258,8 +269,14 @@ class Database:
 
     def assign_player_slot(
         self, game_id: int, player_id: int, player_index: int | None = None,
+        is_ai: bool = False,
     ) -> int:
-        """Assign a player to an available slot.  Returns the player_index."""
+        """Assign a player to an available slot.  Returns the player_index.
+
+        *is_ai* marks the slot as bot-controlled.  It is recorded on the slot
+        rather than inferred from the display name, so a human cannot get
+        their turns auto-played by choosing a particular name.
+        """
         with self._connect() as conn:
             existing = conn.execute(
                 "SELECT player_index, player_id FROM game_players WHERE game_id = ? AND player_id = ?",
@@ -276,8 +293,9 @@ class Database:
                 if existing_slot:
                     raise ValueError(f"Slot {player_index} already taken.")
                 conn.execute(
-                    "INSERT OR REPLACE INTO game_players (game_id, player_index, player_id) VALUES (?, ?, ?)",
-                    (game_id, player_index, player_id),
+                    "INSERT OR REPLACE INTO game_players (game_id, player_index, player_id, is_ai) "
+                    "VALUES (?, ?, ?, ?)",
+                    (game_id, player_index, player_id, int(is_ai)),
                 )
                 return player_index
 
@@ -292,8 +310,9 @@ class Database:
             for i in range(game["num_players"]):
                 if i not in taken:
                     conn.execute(
-                        "INSERT INTO game_players (game_id, player_index, player_id) VALUES (?, ?, ?)",
-                        (game_id, i, player_id),
+                        "INSERT INTO game_players (game_id, player_index, player_id, is_ai) "
+                        "VALUES (?, ?, ?, ?)",
+                        (game_id, i, player_id, int(is_ai)),
                     )
                     return i
             raise ValueError("Game is full.")
@@ -301,7 +320,7 @@ class Database:
     def get_game_players(self, game_id: int) -> list[dict]:
         with self._connect() as conn:
             rows = conn.execute("""
-                SELECT gp.player_index, p.name, p.id as player_id
+                SELECT gp.player_index, p.name, p.id as player_id, gp.is_ai
                 FROM game_players gp
                 JOIN players p ON gp.player_id = p.id
                 WHERE gp.game_id = ?

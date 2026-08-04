@@ -47,6 +47,15 @@ LOAN_INTEREST = 1
 FACTORY_STORAGE_MULTIPLIER = 2  # storage = factories * 2
 INITIAL_CONTAINER_SUPPLY = 12  # per color
 
+# Hard cap on episode length.  Games normally end when two container colours
+# are exhausted; this is the backstop for games (and training rollouts) where
+# that never happens.
+MAX_EPISODE_STEPS = 1000
+
+# Secret container value card face values for the standard 5-colour game.
+# -1 is the special "5/10" card: 5 normally, 10 with a complete set.
+SECRET_CARD_VALUES = (2, 4, 6, 10, -1)
+
 # Action type indices
 ACTION_BUY_FACTORY = 0
 ACTION_BUY_WAREHOUSE = 1
@@ -111,6 +120,22 @@ def mask_size(num_players: int, num_colors: int) -> int:
         + (PRICE_SLOTS + 1)
         + PURCHASE_SIZE
     )
+
+
+def _secret_card_deck(num_colors: int) -> jnp.ndarray:
+    """One secret-card face value per colour, ready to be permuted.
+
+    ``SECRET_CARD_VALUES`` describes the standard 5-colour deck.  For a
+    non-standard ``num_colors`` the special 5/10 card is always kept and the
+    numeric values are truncated or cycled, so the returned row is always
+    exactly ``num_colors`` wide.
+    """
+    if num_colors <= 0:
+        return jnp.zeros((0,), dtype=jnp.int32)
+    *numeric, special = SECRET_CARD_VALUES
+    values = [numeric[i % len(numeric)] for i in range(num_colors - 1)]
+    return jnp.array([*values, special], dtype=jnp.int32)
+
 
 # Ship location encoding
 LOCATION_OPEN_SEA = 0
@@ -1696,7 +1721,12 @@ class ContainerFunctional(
 
     def _check_game_end(self, state, num_colors):
         exhausted = jnp.sum(state.container_supply <= 0)
-        game_over = (exhausted >= 2)
+        # The step cap is the only bound on episode length: gymnasium's
+        # FunctionalJaxEnv hardcodes truncated=False and nothing sets
+        # max_episode_steps, so without it a game where the supply never
+        # runs down never ends.  Raise MAX_EPISODE_STEPS if it is cutting
+        # real games short — do not remove it.
+        game_over = (exhausted >= 2) | (state.step_count > MAX_EPISODE_STEPS)
         state = state._replace(
             game_over=jnp.where(game_over, jnp.array(1, dtype=state.game_over.dtype), state.game_over)
         )
@@ -1708,10 +1738,12 @@ class ContainerFunctional(
         """Initial game state."""
         if params is None:
             params = self.params
-        # Randomly assign secret container value cards
-        # Each player gets a random permutation of {2, 4, 6, 10, -1}
-        # -1 is the special "5/10" card
-        base_values = jnp.array([2, 4, 6, 10, -1], dtype=jnp.int32)
+        # Randomly assign secret container value cards.
+        # Each player gets a random permutation of {2, 4, 6, 10, -1};
+        # -1 is the special "5/10" card.  The deck is defined for the
+        # standard 5 colours, so trim or pad it to num_colors rather than
+        # assuming a 5-wide row.
+        base_values = _secret_card_deck(params.num_colors)
         secret_card_values = jnp.zeros((params.num_players, params.num_colors), dtype=jnp.int32)
         key1, key2 = random.split(rng)
         for i in range(params.num_players):

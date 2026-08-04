@@ -62,7 +62,6 @@ type GameState struct {
 	ShoppingActive  any   `json:"shopping_active"`
 	ActionsTaken    any   `json:"actions_taken"`
 	TurnPhase       any   `json:"turn_phase"`
-	SecretColor     any   `json:"secret_value_color"`
 }
 
 func gsInt(v any, idx int) int {
@@ -424,9 +423,12 @@ func (m *PlayModel) renderPlayerCard(player, nc int) string {
 	// Stats
 	b.WriteString(fmt.Sprintf("  💵 $%-4d 🏦 %d loans  🏭 %d wh\n", cash, loans, wh))
 
-	// Secret
-	sc := gsInt(gs.SecretColor, player)
-	b.WriteString(fmt.Sprintf("  🤫 %s\n", colorStyles[sc].Render(colorNames[sc])))
+	// Secret container value card.  The broadcast state payload deliberately
+	// omits secret cards — it goes to every client — so we have nothing to
+	// show here.  Render "hidden" rather than a misleading default colour.
+	// TODO: deliver the viewer's own card on the per-client get_state
+	// response so at least your own card can be displayed.
+	b.WriteString("  🤫 hidden\n")
 
 	// Factories
 	factories := m.renderFactories(player, nc)
