@@ -1696,7 +1696,7 @@ class ContainerFunctional(
 
     def _check_game_end(self, state, num_colors):
         exhausted = jnp.sum(state.container_supply <= 0)
-        game_over = (exhausted >= 2)
+        game_over = (exhausted >= 2) | (state.step_count >= 1000)
         state = state._replace(
             game_over=jnp.where(game_over, jnp.array(1, dtype=state.game_over.dtype), state.game_over)
         )
@@ -1709,9 +1709,11 @@ class ContainerFunctional(
         if params is None:
             params = self.params
         # Randomly assign secret container value cards
-        # Each player gets a random permutation of {2, 4, 6, 10, -1}
-        # -1 is the special "5/10" card
-        base_values = jnp.array([2, 4, 6, 10, -1], dtype=jnp.int32)
+        # Each player gets a random permutation of value cards: 2, 4, 6, 10, and
+        # -1 (the special "5/10" card).  For fewer than 5 colours we drop cards
+        # from the right, keeping -1 as the last card when possible.
+        all_base = jnp.array([2, 4, 6, 10, -1], dtype=jnp.int32)
+        base_values = all_base[:params.num_colors]
         secret_card_values = jnp.zeros((params.num_players, params.num_colors), dtype=jnp.int32)
         key1, key2 = random.split(rng)
         for i in range(params.num_players):
@@ -1877,6 +1879,21 @@ class ContainerFunctional(
         multipliers = jnp.where(card_values == -1,
                                 jnp.where(has_all, 10, 5),
                                 card_values)
+
+        # Discard the most abundant colour (do not count those containers).
+        # In a tie that involves the 10/5 colour, that colour is discarded.
+        max_count = jnp.max(island_row)
+        is_max = (island_row == max_count) & (max_count > 0)
+        is_ten_five = card_values == -1
+        num_tied = jnp.sum(is_max)
+        ten_five_in_tie = jnp.any(is_max & is_ten_five)
+        discard_first_max = is_max & (jnp.arange(num_colors) == jnp.argmax(is_max.astype(jnp.int32)))
+        discard = jnp.where(
+            (num_tied > 1) & ten_five_in_tie,
+            is_max & is_ten_five,
+            jnp.where(num_tied >= 1, discard_first_max, jnp.zeros(num_colors, dtype=jnp.bool_)),
+        )
+        island_row = jnp.where(discard, 0, island_row)
         island_val = jnp.sum(island_row * multipliers)
 
         total = cash + harbour_val + ship_val + island_val - loans_penalty
