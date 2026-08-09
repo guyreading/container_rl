@@ -2,20 +2,32 @@
 
 # Container RL Env
 
-![PyPI version](https://img.shields.io/pypi/v/container-rl.svg)
-
 An RL environment to simulate the board game Container, so you can a) connect to a TUI via ssh to play against your friends/AI b) train RL agents.
 
 
 ## Run
-1. Enter `ssh play-container.tech` into the teriminal.
-2. a) i) An ssh key will be searched for (Windows: `C:\Users\<you>\.ssh\id_ed25519`). You can define a custom location with the `-i <directory>` arg
-(see the ssh documentation for more details). If there is not a viable ssh key present, you will be asked to create one.
-2. a) ii) Once an ssh key has been created, enter the ssh command again and you are prompted to enter a username. This is connected
-to your ssh key so you won't need to enter this again on future logins.
-2. b) If you have already created your ssh key and username, you log straight into the TUI.
-3. a) You can create a new container game, adjusting the number of players between 2-5.
-4. b) You can join & play a game.
+
+No install needed — the whole game runs over SSH:
+
+```bash
+ssh play-container.tech
+```
+
+1. **Sign in.** Returning players drop straight into the TUI. First time? See [First-time setup](#first-time-setup) below.
+2. **Create a game**, choosing between 2 and 5 players.
+3. **Play.** Wait for others to join your game, or join and play an existing one.
+
+### First-time setup
+
+The server expects an SSH key at the standard location — on Windows, `C:\Users\<you>\.ssh\id_ed25519`.
+
+| Your situation | What to do |
+|---|---|
+| Key at the default path | Nothing — you're ready to go. |
+| Key elsewhere, or in a different format | Point at it directly: `ssh play-container.tech -i <path/to/key>` (see the ssh documentation for details) |
+| No key at all | You'll be prompted to create one, then run the `ssh` command again. |
+
+You are then asked to choose a username. It is tied to your SSH key, so you won't need to enter it again on future logins.
 
 
 ## Features

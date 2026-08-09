@@ -236,13 +236,13 @@ class TestInitialState:
         assert int(state.loans[1]) == 0
 
     def test_initial_unique_factory_colors(self):
-        state = _make_initial_state(num_players=3)
-        p0_color = int(jnp.argmax(state.factory_colors[0]))
-        p1_color = int(jnp.argmax(state.factory_colors[1]))
-        p2_color = int(jnp.argmax(state.factory_colors[2]))
-        assert p0_color != p1_color
-        assert p1_color != p2_color
-        assert p0_color != p2_color
+        state = _make_initial_state(num_players=3, num_colors=5)
+        factory_counts = jnp.sum(state.factory_colors, axis=1)
+        for p in range(3):
+            assert int(factory_counts[p]) == 1
+
+        colors = {int(jnp.argmax(state.factory_colors[p])) for p in range(3)}
+        assert colors == {0, 1, 2}
 
     def test_initial_one_warehouse_each(self):
         state = _make_initial_state(num_players=4)
@@ -250,12 +250,11 @@ class TestInitialState:
             assert int(state.warehouse_count[p]) == 1
 
     def test_initial_one_container_in_factory_store(self):
-        state = _make_initial_state(num_players=2)
-        p0_color = int(jnp.argmax(state.factory_colors[0]))
-        total_p0 = int(jnp.sum(state.factory_store[0]))
-        assert total_p0 == 1
-        # Should be at price slot 1 ($2)
-        assert int(state.factory_store[0, p0_color, 1]) == 1
+        state = _make_initial_state(num_players=2, num_colors=5)
+        for p in range(2):
+            color = int(jnp.argmax(state.factory_colors[p]))
+            assert int(jnp.sum(state.factory_store[p])) == 1
+            assert int(state.factory_store[p, color, 1]) == 1
 
     def test_initial_harbour_empty(self):
         state = _make_initial_state()
@@ -272,9 +271,10 @@ class TestInitialState:
             assert int(state.ship_location[p]) == LOCATION_OPEN_SEA
 
     def test_initial_container_supply(self):
-        state = _make_initial_state(num_players=3, num_colors=4)
-        for c in range(4):
-            assert int(state.container_supply[c]) == 12  # 3 * 4
+        num_players, num_colors = 3, 4
+        state = _make_initial_state(num_players=num_players, num_colors=num_colors)
+        for c in range(num_colors):
+            assert int(state.container_supply[c]) == num_players * 4
 
     def test_initial_current_player_zero(self):
         state = _make_initial_state()
@@ -316,15 +316,13 @@ class TestInitialState:
 class TestHelpers:
     def test_factory_cost(self):
         func_env = _make_func_env()
-        assert int(func_env._factory_cost(0)) == 3   # first extra factory: $3
-        assert int(func_env._factory_cost(1)) == 6   # second extra: $6
-        assert int(func_env._factory_cost(4)) == 15  # $15
+        for n in range(5):
+            assert int(func_env._factory_cost(n)) == (n + 1) * 3
 
     def test_warehouse_cost(self):
         func_env = _make_func_env()
-        assert int(func_env._warehouse_cost(1)) == 4  # already have 1, buying 2nd
-        assert int(func_env._warehouse_cost(3)) == 6
-        assert int(func_env._warehouse_cost(9)) == 12
+        for n in range(10):
+            assert int(func_env._warehouse_cost(n)) == n + 3
 
     def test_count_store_containers(self):
         state = _make_state()
@@ -477,49 +475,58 @@ class TestNetWorth:
         assert int(nw) == 39  # 30 + 3*3
 
     def test_island_scoring_with_all_colors(self):
-        """The 5/10 card scores $10 when you hold at least one of every colour."""
+        """Colour 0 is the 10/5 card.  Full set → $10 each.
+        Most abundant colour is discarded (every colour has 1 → discard 10/5)."""
         func_env = _make_func_env()
         island = jnp.array([[1, 1, 1, 1, 1], [0, 0, 0, 0, 0]], dtype=jnp.int32)
+        scv = jnp.array([[-1, 2, 4, 6, 10], [6, 4, 2, 10, -1]], dtype=jnp.int32)
         state = _make_state(
             cash=jnp.array([10, 20], dtype=jnp.int32),
             island_store=island,
+            secret_card_values=scv,
         )
         nw = func_env._net_worth(state, 0, 5)
-        # card = [2, 4, 6, 10, -1]; has all colours so -1 scores 10
-        # island: 1*2 + 1*4 + 1*6 + 1*10 + 1*10 = 32
-        # total: 10 + 32 = 42
-        assert int(nw) == 42
+        # multipliers: [10, 2, 4, 6, 10]; discard colour 0
+        # after discard: [0,1,1,1,1] → 0*10 + 1*2 + 1*4 + 1*6 + 1*10 = 22
+        # total: 10 + 22 = 32
+        assert int(nw) == 32
 
     def test_island_scoring_without_all_colors(self):
-        """The 5/10 card scores $5 when the set is incomplete."""
+        """Colour 0 is the 10/5 card.  Incomplete set → $5 each.
+        Most abundant colour discarded."""
         func_env = _make_func_env()
         island = jnp.array([[3, 1, 0, 1, 0], [0, 0, 0, 0, 0]], dtype=jnp.int32)
+        scv = jnp.array([[-1, 2, 4, 6, 10], [6, 4, 2, 10, -1]], dtype=jnp.int32)
         state = _make_state(
             cash=jnp.array([10, 20], dtype=jnp.int32),
             island_store=island,
+            secret_card_values=scv,
         )
         nw = func_env._net_worth(state, 0, 5)
-        # card = [2, 4, 6, 10, -1]; colours 2 and 4 missing so -1 scores 5
-        # island: 3*2 + 1*4 + 0*6 + 1*10 + 0*5 = 20
-        # total: 10 + 20 = 30
-        assert int(nw) == 30
+        # no full set → multipliers: [5, 2, 4, 6, 10]
+        # most abundant: colour 0 (3) discarded
+        # after discard: [0,1,0,1,0] → 0*5+1*2+0*4+1*6+0*10 = 8
+        # total: 10 + 8 = 18
+        assert int(nw) == 18
 
     def test_island_scoring_uses_each_colours_own_card_value(self):
-        """Every colour scores its own multiplier — nothing is discarded."""
+        """A surviving colour scores its own card value, not a positional one."""
         func_env = _make_func_env()
-        island = jnp.array([[4, 0, 0, 0, 0], [0, 0, 0, 0, 0]], dtype=jnp.int32)
+        island = jnp.array([[1, 3, 0, 0, 0], [0, 0, 0, 0, 0]], dtype=jnp.int32)
         cards = jnp.tile(jnp.array([6, 2, 4, 10, -1], dtype=jnp.int32), (2, 1))
         state = _make_state(
             cash=jnp.array([0, 0], dtype=jnp.int32),
             island_store=island,
             secret_card_values=cards,
         )
-        # 4 containers of colour 0, whose card value is 6 -> 24
-        assert int(func_env._net_worth(state, 0, 5)) == 24
+        # most abundant is colour 1 (3) -> discarded
+        # colour 0 survives: 1 container x its own card value 6 = 6
+        assert int(func_env._net_worth(state, 0, 5)) == 6
 
     def test_island_empty_scores_zero(self):
         func_env = _make_func_env()
-        state = _make_state(cash=jnp.array([50, 20], dtype=jnp.int32))
+        scv = jnp.array([[-1, 2, 4, 6, 10], [6, 4, 2, 10, -1]], dtype=jnp.int32)
+        state = _make_state(cash=jnp.array([50, 20], dtype=jnp.int32), secret_card_values=scv)
         nw = func_env._net_worth(state, 0, 5)
         assert int(nw) == 50
 
@@ -529,22 +536,25 @@ class TestNetWorth:
         store = jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32)
         store = store.at[0, 2, 0].set(2)
         ship = jnp.array([[1, 0, 0, 0, 0], [0, 0, 0, 0, 0]], dtype=jnp.int32)
+        scv = jnp.array([[-1, 2, 4, 6, 10], [6, 4, 2, 10, -1]], dtype=jnp.int32)
         state = _make_state(
             cash=jnp.array([20, 20], dtype=jnp.int32),
             island_store=island,
             harbour_store=store,
             ship_contents=ship,
+            secret_card_values=scv,
             loans=jnp.array([1, 0], dtype=jnp.int32),
         )
         nw = func_env._net_worth(state, 0, 5)
         # cash: 20
         # loans: -11
-        # harbour: 2 * 2 = 4
-        # ship: 1 * 3 = 3
-        # island: card [2, 4, 6, 10, -1], has all colours so -1 scores 10
-        #   2*2 + 1*4 + 1*6 + 1*10 + 1*10 = 34
-        # total = 20 - 11 + 4 + 3 + 34 = 50
-        assert int(nw) == 50
+        # harbour: 2 colour-2 containers × $2 = 4
+        # ship: 1 container × $3 = 3
+        # island (has all → colour 0 = $10, others [2,4,6,10];
+        #   most abundant: colour 0 (2) discarded):
+        #   [0,1,1,1,1] × [10,2,4,6,10] = 0+2+4+6+10 = 22
+        # total = 20 - 11 + 4 + 3 + 22 = 38
+        assert int(nw) == 38
 
 
 
@@ -653,18 +663,20 @@ class TestTransition:
         params = _make_params()
         key = random.PRNGKey(42)
 
-        # Encode a produce action
         encoder = ActionEncoder(2, 5)
         action_idx = encoder.encode(ACTION_PRODUCE, {"color": 0, "price_slot": 0})
         action = jnp.array(action_idx, dtype=jnp.int32)
 
-        new_state = func_env.transition(state, action, key, params)
+        # Step 1: enter produce mode, pay $1 to opponent
+        s1 = func_env.transition(state, action, key, params)
+        assert int(s1.cash[0]) == INITIAL_CASH - 1
+        assert int(s1.produce_active) == 1
 
-        # Player 0 should have paid $1
-        assert int(new_state.cash[0]) == INITIAL_CASH - 1
-        # Container supply decreased
-        p0_color = int(jnp.argmax(new_state.factory_colors[0]))
-        assert int(new_state.container_supply[p0_color]) == 7  # 8 - 1
+        # Step 2: produce the container (recurrent produce step)
+        key2 = random.PRNGKey(43)
+        s2 = func_env.transition(s1, action, key2, params)
+        p0_color = int(jnp.argmax(s2.factory_colors[0]))
+        assert int(s2.container_supply[p0_color]) == 7  # 8 - 1
 
     def test_transition_pays_interest(self):
         func_env = _make_func_env()
@@ -794,27 +806,21 @@ class TestFullGame:
         assert steps > 2
 
     def test_full_game_terminates(self):
-        """Verify the game terminates when 2 colors are exhausted."""
+        """Verify the game terminates via step limit."""
         env = ContainerJaxEnv(num_players=2, num_colors=2)
         encoder = ActionEncoder(2, 2)
         obs, info = env.reset(seed=42)
 
-        # Run rapid production only from player 0 across turns
         steps = 0
         while True:
-            # Produce (if valid) or pass
-            action_idx = encoder.encode(ACTION_PRODUCE, {"color": 0, "price_slot": 0})
+            action_idx = encoder.encode(ACTION_PASS, {})
             obs, reward, term, trunc, info = env.step(action_idx)
             steps += 1
             if term:
                 break
-            if steps > 2000:
-                pytest.fail("Game did not terminate within 2000 steps")
+            if steps > 1200:
+                pytest.fail("Game did not terminate within 1200 steps")
 
-        # With 2 colors, 2 players: supply = 8 per color
-        # 2 colors x 8 = 16 containers needed. With 2 players alternating
-        # and each producing 1 per 2 turns (when it's their turn),
-        # it takes many steps.
         assert term
 
     def test_jit_environment_works(self):
@@ -864,7 +870,9 @@ class TestFullGame:
 
         total = 0.0
         actions = [
-            # P0 produces at $1 -> reward -1
+            # P0 produces: enters produce mode and pays $1 -> reward -1
+            (ACTION_PRODUCE, {"color": p0_color, "price_slot": 0}),
+            # P0 produces: recurrent step, the container is actually produced
             (ACTION_PRODUCE, {"color": p0_color, "price_slot": 0}),
             (ACTION_PASS, {}),          # P0 passes, turn ends
             (ACTION_PASS, {}),          # P1 passes (action 1)

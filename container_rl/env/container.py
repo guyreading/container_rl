@@ -1909,6 +1909,21 @@ class ContainerFunctional(
         multipliers = jnp.where(card_values == -1,
                                 jnp.where(has_all, 10, 5),
                                 card_values)
+
+        # Discard the most abundant colour (do not count those containers).
+        # In a tie that involves the 10/5 colour, that colour is discarded.
+        max_count = jnp.max(island_row)
+        is_max = (island_row == max_count) & (max_count > 0)
+        is_ten_five = card_values == -1
+        num_tied = jnp.sum(is_max)
+        ten_five_in_tie = jnp.any(is_max & is_ten_five)
+        discard_first_max = is_max & (jnp.arange(num_colors) == jnp.argmax(is_max.astype(jnp.int32)))
+        discard = jnp.where(
+            (num_tied > 1) & ten_five_in_tie,
+            is_max & is_ten_five,
+            jnp.where(num_tied >= 1, discard_first_max, jnp.zeros(num_colors, dtype=jnp.bool_)),
+        )
+        island_row = jnp.where(discard, 0, island_row)
         island_val = jnp.sum(island_row * multipliers)
 
         total = cash + harbour_val + ship_val + island_val - loans_penalty
