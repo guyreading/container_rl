@@ -92,7 +92,7 @@ class ClientHandler:
 
             trusted = self.server._is_localhost(self.addr)
             result = self.server.manager.create_game_trusted(name, num_players, num_colors, seed, ai_count=ai_count) if trusted else \
-                     self.server.manager.create_game(name, password, num_players, num_colors, seed)
+                     self.server.manager.create_game(name, password, num_players, num_colors, seed, ai_count=ai_count)
             self.game_id = result["game_id"]
             self.player_index = result["player_index"]
             self.server._register_client(self)
@@ -104,7 +104,10 @@ class ClientHandler:
             self._send_lobby()
             started = self.server.manager.maybe_start_game(self.game_id)
             if started:
+                # Announce the start before any AI moves, so clients never see
+                # a state_update for a game they think is still in the lobby.
                 self._broadcast_to_game("game_started", {})
+                self.server.manager.play_ai_turn_if_needed(self.game_id)
         except Exception as e:
             self.send("error", {"message": str(e)})
 
@@ -134,7 +137,10 @@ class ClientHandler:
             # Check if game can start
             started = self.server.manager.maybe_start_game(self.game_id)
             if started:
+                # Announce the start before any AI moves, so clients never see
+                # a state_update for a game they think is still in the lobby.
                 self._broadcast_to_game("game_started", {})
+                self.server.manager.play_ai_turn_if_needed(self.game_id)
         except Exception as e:
             self.send("error", {"message": str(e)})
 

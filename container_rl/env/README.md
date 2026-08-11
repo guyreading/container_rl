@@ -110,13 +110,14 @@ obs_size = np * 4                    # cash, loans, warehouse_count, ship_locati
          + np * SHIP_CAPACITY        # ship_contents
          + nc                        # container_supply
          + 4                         # turn_phase, current_player, game_over, actions_taken
-         + np                        # secret_value_color per player
+         + np * nc                   # secret_card_values per player per colour
          + 5                         # auction_active, auction_seller, auction_cargo_count
-         + 3                         # shopping_active, shopping_action_type, shopping_target
-         + mask_size                 # action_type(11) + opponent(np-1) + color(nc) + price_slot(10) + purchase(nc*10+1)
+         + 4                         # shopping_active, shopping_action_type, shopping_target, shopping_harbour_price
+         + 1 + nc                    # produce_active + produce_pending
+         + mask_size                 # action_type(12) + opponent(np) + color(nc+1) + price_slot(11) + purchase(32)
 ```
 
-For 2 players, 5 colours: **335** elements (254 game state + 3 shopping + 78 action masks).
+For 2 players, 5 colours: **335** elements (272 game state + 63 action masks).
 
 ## Reward
 

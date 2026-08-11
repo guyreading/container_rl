@@ -196,7 +196,7 @@ def _net_worth(state, player, nc):
             iv += val * cnt
     return cash + hv + sv + iv - int(state.loans[player]) * 11
 
-def _player_card(state, player, nc, is_current):
+def _player_card(state, player, nc, is_current, is_mine=False):
     cash = int(state.cash[player])
     loans = int(state.loans[player])
     wh = int(state.warehouse_count[player])
@@ -208,8 +208,10 @@ def _player_card(state, player, nc, is_current):
     out = Text.from_markup(f"[bold]{name}{badge}[/bold]  ${nw}\n")
     out.append("─"*28+"\n")
     out.append_text(Text.from_markup(f"  💵 ${cash}  🏦 {loans} loans  🏭 {wh} wh\n"))
-    # Secret card: only visible to the player who owns it
-    if is_current:
+    # Secret card: only visible to the player who owns it.  Gate on "is this
+    # my seat", not "is it this seat's turn" — every client renders the full
+    # state, so gating on the turn shows everyone the active player's card.
+    if is_mine:
         card_parts = []
         for c in range(nc):
             val = int(state.secret_card_values[player, c])
@@ -249,7 +251,7 @@ def _render(state, nc, np_, feedback="", my_player=None):
         hdr += "  [green](YOU)[/green]"
     elems.append(Panel(Text(hdr, style="bold white on blue")))
     elems.append(Panel(_supply(state,nc), title="Supply", border_style="yellow"))
-    cards = [_player_card(state,p,nc,turn==p) for p in range(np_)]
+    cards = [_player_card(state,p,nc,turn==p,my_player==p) for p in range(np_)]
     elems.append(Columns(cards, equal=False, expand=True))
     if feedback:
         elems.append(Panel(Text.from_markup(feedback, style="green"), border_style="green"))
@@ -1012,13 +1014,18 @@ def _lobby():
         n = NUM_PLAYERS - len(lobby_players)
         lobby_parts.append(Text.from_markup(f"\n[dim]{n} more needed.  ← to go back, q to leave.[/dim]"))
         console.print(Align.center(Group(*lobby_parts), vertical="middle", height=console.height))
-        if _ch() == "q": return False
-        ch = _key(0.05)
-        if ch in ("\x1b", "Q"):
-            return False
+        # One read, not two.  ``_ch()`` followed by ``_key()`` split the keyspace
+        # by *timing*: whichever call happened to see the byte handled it and the
+        # other never got a chance, so ESC/Q/<- were swallowed whenever the press
+        # landed outside the short ``_key`` window (and ``q`` whenever it landed
+        # inside it).  ``_key`` also reassembles escape sequences, which a raw
+        # one-byte ``_ch()`` cannot -- it would strip the ``\x1b`` off ``<-`` and
+        # leave ``[D`` in the buffer.  The timeout doubles as the poll interval.
+        ch = _key(0.3)
         if ch == "\x1b[D":
             return BACK
-        _time.sleep(0.3)
+        if ch in ("q", "Q", "\x1b"):
+            return False
     return False
 
 
@@ -1065,6 +1072,7 @@ def main():
         return
 
     global CLIENT, GAME_ID, PLAYER_INDEX, GAME_CODE, NUM_PLAYERS, NUM_COLORS, MY_NAME, GAME_STATUS, PLAYER_NAMES
+    global STATE, STATE_META
     import sys as _sys
     try:
         _sys.stderr = open("/tmp/container-tui.log", "a")
@@ -1082,7 +1090,10 @@ def main():
         try:
             CLIENT.connect()
         except Exception as e:
-            console.print(f"[red]Cannot connect: {e}[/red]"); return
+            # Pause before returning: the ``finally`` below drops the alternate
+            # screen buffer, which wipes anything printed here.  Every other
+            # error path in this function already pauses for the same reason.
+            console.print(f"[red]Cannot connect: {e}[/red]"); _key(2); return
 
         if args.player_name and args.create:
             MY_NAME = args.player_name
@@ -1133,6 +1144,20 @@ def main():
             return
 
         while True:
+            # Clear the previous game before offering a new one.  These are
+            # module globals; the back button returns here with them still
+            # populated, and the create/join wait loops below break as soon as
+            # ``GAME_ID`` is truthy -- so without this reset the next game
+            # short-circuits on the *old* id and drops you back into the game
+            # you just left.
+            GAME_ID = None
+            GAME_CODE = ""
+            PLAYER_INDEX = 0
+            GAME_STATUS = "lobby"
+            PLAYER_NAMES = {}
+            STATE = None
+            STATE_META = {}
+
             ch = _main_menu()
             if ch is None: return
 

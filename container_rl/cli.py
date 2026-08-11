@@ -186,7 +186,13 @@ def _compute_net_worth(state: EnvState, player: int, num_colors: int) -> int:
 
 
 def _player_card(state: EnvState, player: int, nc: int, is_current: bool, width: int = 28) -> Text:
-    """Render a compact one-player card as a Text object."""
+    """Render a compact one-player card as a Text object.
+
+    This is the hot-seat CLI: one screen, passed between players, so the
+    active player's secret card is shown and everyone else's is hidden.
+    The networked client gates on the viewer's own seat instead — see
+    ``container_rl.client.tui._player_card``.
+    """
     cash = int(state.cash[player])
     loans = int(state.loans[player])
     wh = int(state.warehouse_count[player])

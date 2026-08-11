@@ -99,7 +99,9 @@ def _make_state(**overrides):
         turn_phase=jnp.array(0, dtype=jnp.int32),
         current_player=jnp.array(0, dtype=jnp.int32),
         game_over=jnp.array(0, dtype=jnp.int32),
-        secret_card_values=jnp.zeros((np_, nc), dtype=jnp.int32),
+        secret_card_values=jnp.tile(
+            jnp.array([2, 4, 6, 10, -1], dtype=jnp.int32), (np_, 1)
+        ),
         auction_active=jnp.array(0, dtype=jnp.int32),
         auction_seller=jnp.array(0, dtype=jnp.int32),
         auction_cargo=jnp.zeros(SHIP_CAPACITY, dtype=jnp.int32),
