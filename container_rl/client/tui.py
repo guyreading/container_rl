@@ -33,6 +33,7 @@ from container_rl.env.container import (
     ACTION_PRODUCE,
     ACTION_REPAY_LOAN,
     ACTION_TAKE_LOAN,
+    FACTORY_STORAGE_MULTIPLIER,
     HARBOUR_PRICE_CHOICES,
     HARBOUR_PRICE_MIN,
     LEAVE_IDLE,
@@ -361,6 +362,16 @@ def _submenu_produce(live, state, nc, np_):
     player = int(state.current_player)
     factories = [c for c in range(nc) if int(state.factory_colors[player,c])>0]
     if not factories: return True
+
+    # A full factory store is the other reason the env rejects producing —
+    # catch it here so the action is not spent on a no-op.
+    capacity = len(factories) * FACTORY_STORAGE_MULTIPLIER
+    if int(state.factory_store[player].sum()) >= capacity:
+        live.update(_render(state, nc, np_,
+            f"[yellow]Factory store is full ({capacity}) — sell some before producing.[/yellow]",
+            player))
+        live.refresh(); _time.sleep(1.2)
+        return True
 
     # Check for depleted colours
     depleted = []
