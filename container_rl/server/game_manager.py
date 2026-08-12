@@ -21,7 +21,7 @@ from container_rl.env.container import (
     ACTION_REPAY_LOAN,
     ACTION_TAKE_LOAN,
     LEAVE_IDLE,
-    PRICE_SLOTS,
+    PURCHASE_STOP,
     ActionEncoder,
     ContainerJaxEnv,
     EnvState,
@@ -291,7 +291,9 @@ class GameManager:
             nc = encoder.num_colors
             db_players = self.db.get_game_players(game_id)
             pnames = {int(pl["player_index"]): pl["name"] for pl in db_players}
-            desc = _describe_action(action, encoder, nc, env.state, pnames)
+            # Name opponents relative to whoever acted, not to whoever is up
+            # next: the turn may already have advanced by now.
+            desc = _describe_action(action, encoder, nc, env.state, pnames, actor=actual)
 
             new_state = env.state
             turn_ended = int(new_state.current_player) != actual
@@ -563,42 +565,50 @@ def _state_to_json_data(state: EnvState) -> dict:
     }
 
 
-def _describe_action(action, encoder: ActionEncoder, num_colors: int, state=None, player_names: dict[int, str] | None = None) -> str:
+def _describe_action(action, encoder: ActionEncoder, num_colors: int, state=None,
+                     player_names: dict[int, str] | None = None,
+                     actor: int | None = None) -> str:
     """Return a human-readable description of *action* (flat int or multi-head array)."""
     import jax.numpy as jnp
     try:
         if hasattr(action, "ndim") and action.ndim == 1 and action.shape[0] >= 5:
-            atype = int(action[0])
+            # Every head reserves index 0 for no-op, so each one decodes as
+            # ``head - 1``.  The purchase head is the exception: 0 = no-op,
+            # 1-30 = values, PURCHASE_STOP = stop.
+            atype = int(action[0]) - 1
             purchase = int(action[4])
             nc = num_colors
             colors = ['Red','Green','Blue','Yellow','Purple']
-            opp_idx = int(action[1])  # HEAD_OPPONENT
+            opp_idx = int(action[1]) - 1  # HEAD_OPPONENT
+            color = max(int(action[2]) - 1, 0)
             if atype == ACTION_PASS:
                 return "Pass"
             elif atype == ACTION_BUY_FACTORY:
-                return f"Buy {colors[min(int(action[2]),nc-1)]} factory"
+                return f"Buy {colors[min(color,nc-1)]} factory"
             elif atype == ACTION_BUY_WAREHOUSE:
                 return "Buy warehouse"
             elif atype == ACTION_PRODUCE:
-                color = int(action[2])
-                slot = int(action[3])
+                slot = int(action[3]) - 1
+                if slot < 0:
+                    return "Produce"  # the opening action, before any factory
                 if slot >= LEAVE_IDLE:
                     return f"Leave {colors[min(color,nc-1)]} idle"
                 return f"Produce {colors[min(color,nc-1)]} at ${slot+1}"
             elif atype == ACTION_BUY_FROM_FACTORY_STORE:
-                if purchase >= nc * PRICE_SLOTS:
+                if purchase >= PURCHASE_STOP:
                     return "Stop buying"
-                color = purchase // PRICE_SLOTS
-                slot = purchase % PRICE_SLOTS
-                opp_name = _opponent_name(opp_idx, state, player_names) if state else f"Player {opp_idx+1}"
-                return f"Buy {colors[min(color,nc-1)]} from {opp_name}'s factory at ${slot+1}"
+                opp_name = _opponent_name(opp_idx, state, player_names, actor) if state else f"Player {opp_idx+1}"
+                if int(action[2]) == 0:
+                    return f"Buy from {opp_name}'s factory"
+                return (f"Buy {colors[min(color,nc-1)]} from {opp_name}'s factory "
+                        f"(harbour ${min(max(purchase + 1, 2), 6)})")
             elif atype == ACTION_MOVE_LOAD:
-                if purchase >= nc * PRICE_SLOTS:
+                if purchase >= PURCHASE_STOP:
                     return "Stop loading"
-                color = purchase // PRICE_SLOTS
-                slot = purchase % PRICE_SLOTS
-                opp_name = _opponent_name(opp_idx, state, player_names) if state else f"Player {opp_idx+1}"
-                return f"Load {colors[min(color,nc-1)]} from {opp_name}'s harbour at ${slot+1}"
+                opp_name = _opponent_name(opp_idx, state, player_names, actor) if state else f"Player {opp_idx+1}"
+                if int(action[2]) == 0:
+                    return f"Load from {opp_name}'s harbour"
+                return f"Load {colors[min(color,nc-1)]} from {opp_name}'s harbour"
             elif atype == ACTION_MOVE_SEA:
                 return "Move to sea"
             elif atype == ACTION_MOVE_AUCTION:
@@ -618,9 +628,14 @@ def _describe_action(action, encoder: ActionEncoder, num_colors: int, state=None
         return "Action"
 
 
-def _opponent_name(opp_idx: int, state, player_names: dict[int, str] | None = None) -> str:
-    """Return the target player's name (or 'Player {n}' as fallback)."""
-    player = int(state.current_player)
+def _opponent_name(opp_idx: int, state, player_names: dict[int, str] | None = None,
+                   actor: int | None = None) -> str:
+    """Return the target player's name (or 'Player {n}' as fallback).
+
+    *actor* is the player who took the action; it defaults to whoever is
+    up now, which is only the same player mid-turn.
+    """
+    player = int(state.current_player) if actor is None else int(actor)
     np_ = state.cash.shape[0]
     target = (player + opp_idx + 1) % np_
     if player_names and target in player_names:
