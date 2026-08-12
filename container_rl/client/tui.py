@@ -70,6 +70,17 @@ STATE: EnvState | None = None
 STATE_META: dict = {}
 FEEDBACK: str = ""
 
+# ── move history ─────────────────────────────────────────────────────────
+# The server never replays past positions, so the client keeps every state it
+# is sent and ←/→ walk through them.  Entries are (state, description); the
+# description is filled in from ``action_result`` when the server tells us what
+# the move was, and falls back to naming whoever was to play.
+HISTORY: list[tuple[EnvState, str]] = []
+HIST_IDX: int = 0
+VIEWING_HISTORY: bool = False
+_LAST_BLOB: str = ""  # dedupe key: the hex blob of the last state we recorded
+_AWAITING_DESC: bool = False  # a recorded position is still unnamed
+
 # How long to wait for the first ``state_update`` after joining.  Generous on
 # purpose: rebuilding a game's env from the database (and loading the AI model
 # on a server that has just restarted) takes far longer than a round trip.  We
@@ -244,7 +255,7 @@ def _supply(state, nc):
         else: parts.append(f"[{_cs(c)}]{_cn(c,nc)}[/{_cs(c)}]: {'█'*min(cnt,10)} {cnt}")
     return Text.from_markup("  │  ".join(parts)+f"  │  [bold]Exhausted: {ex}/2[/bold]")
 
-def _render(state, nc, np_, feedback="", my_player=None):
+def _render(state, nc, np_, feedback="", my_player=None, hist_msg=""):
     elems = []
     turn = int(state.current_player)
     acts = int(state.actions_taken)
@@ -256,6 +267,8 @@ def _render(state, nc, np_, feedback="", my_player=None):
     if my_player is not None and turn == my_player:
         hdr += "  [green](YOU)[/green]"
     elems.append(Panel(Text(hdr, style="bold white on blue")))
+    if hist_msg:
+        elems.append(Panel(Text.from_markup(hist_msg), border_style="yellow"))
     elems.append(Panel(_supply(state,nc), title="Supply", border_style="yellow"))
     cards = [_player_card(state,p,nc,turn==p,my_player==p) for p in range(np_)]
     elems.append(Columns(cards, equal=False, expand=True))
@@ -268,7 +281,13 @@ def _render(state, nc, np_, feedback="", my_player=None):
         wh_c = int(state.warehouse_count[turn])+3
         fs = f"BuyFactory (${fac_c})" if fac_c else "BuyFactory"
         ws = f"BuyWarehouse (${wh_c})" if wh_c else "BuyWarehouse"
-        ht = f" [1]{fs}  [2]{ws}  [3]Produce  [4]BuyFrFactry  [5]LoadShip\n [6]MoveToSea [7]Auction [0/space]Pass [8]TakeLoan [9]RepayLoan\n [q]uit  [←]back"
+        # ``\[`` on the letter-led keys: rich reads a bracketed word starting
+        # with a letter as a style tag and eats it, which is why the old
+        # ``[q]uit`` rendered as a bare "uit".  Digit- and arrow-led ones are
+        # not markup, so they pass through as typed.
+        ht = (f" [1]{fs}  [2]{ws}  [3]Produce  [4]BuyFrFactry  [5]LoadShip\n"
+              " [6]MoveToSea [7]Auction [0/space]Pass [8]TakeLoan [9]RepayLoan\n"
+              " \\[q]uit  [←→]move history  \\[esc]game lobby")
         elems.append(Panel(Text.from_markup(ht), title="Actions", border_style="cyan"))
     elif int(state.auction_active):
         s = int(state.auction_seller); r = int(state.auction_round)
@@ -483,6 +502,54 @@ def _submenu_buy_factory(live, state, nc, np_):
     if ch is None: return True
     return {"color": available[ch-1]}
 
+# ── move history ─────────────────────────────────────────────────────────
+
+def _reset_history() -> None:
+    global HIST_IDX, VIEWING_HISTORY, _LAST_BLOB, _AWAITING_DESC
+    HISTORY.clear()
+    HIST_IDX = 0
+    VIEWING_HISTORY = False
+    _LAST_BLOB = ""
+    _AWAITING_DESC = False
+
+def _push_history(blob: str, state) -> None:
+    """Record a position we have been sent.
+
+    Deduped on the serialized blob: the server re-sends the current state when
+    we join and after a move it refused, and neither is a new step.  Browsing
+    is not disturbed by an arrival — ``HIST_IDX`` only follows the end of the
+    list while we are watching live play."""
+    global HIST_IDX, _LAST_BLOB, _AWAITING_DESC
+    if not blob or blob == _LAST_BLOB or state is None:
+        return
+    _LAST_BLOB = blob
+    _AWAITING_DESC = True
+    # Name whoever was to move *into* this position; ``action_result`` upgrades
+    # it to the real description when the server sends us one.
+    if HISTORY:
+        mover = int(HISTORY[-1][0].current_player)
+        desc = f"{PLAYER_NAMES.get(mover, f'Player {mover+1}')} played"
+    else:
+        desc = "(start)"
+    HISTORY.append((state, desc))
+    if not VIEWING_HISTORY:
+        HIST_IDX = len(HISTORY) - 1
+
+def _describe_last(desc: str) -> None:
+    """Attach the server's description to the latest recorded position.
+
+    Only the first description after a new position counts: a refused move
+    ("Not your turn…") also arrives as an ``action_result`` but did not change
+    the board, and labelling the previous move with it would be a lie."""
+    global _AWAITING_DESC
+    if desc and HISTORY and _AWAITING_DESC:
+        HISTORY[-1] = (HISTORY[-1][0], desc)
+        _AWAITING_DESC = False
+
+def _hist_msg() -> str:
+    return (f"[bold yellow]Move {HIST_IDX}/{len(HISTORY)-1} — history view[/bold yellow]"
+            "  [dim]←→ browse  •  → to the end for live play  •  esc lobby[/dim]")
+
 # ── state polling ────────────────────────────────────────────────────────
 
 def _wait_for_state(live, nc, np_, timeout=10.0):
@@ -495,9 +562,11 @@ def _wait_for_state(live, nc, np_, timeout=10.0):
                 STATE_META = p
                 if p.get("state"):
                     STATE = deserialize_state(bytes.fromhex(p["state"]))
+                    _push_history(p["state"], STATE)
                 return STATE
             elif t == "action_result":
                 FEEDBACK = f"[bold]{p.get('desc','')}[/bold]"
+                _describe_last(p.get("desc", ""))
                 if p.get("game_over"):
                     FEEDBACK += "  [bold red]GAME OVER[/bold red]"
             elif t == "error":
@@ -519,7 +588,9 @@ def _update_state_from_server(live, nc, np_):
             STATE_META=p
             if p.get("state"):
                 STATE = deserialize_state(bytes.fromhex(p["state"]))
+                _push_history(p["state"], STATE)
         elif t=="action_result":
+            _describe_last(p.get("desc",""))
             if p.get("game_over"): FEEDBACK="[bold red]GAME OVER[/bold red]"
             else: FEEDBACK=f"[bold]{p.get('desc','')}[/bold]"
         elif t=="error": FEEDBACK=f"[red]{p.get('message','')}[/red]"
@@ -583,19 +654,22 @@ def _show_final_scores(state, nc, np_):
         )
 
     console.clear()
-    parts = [lb, bt, Text.from_markup("[dim]Press any key to exit…[/dim]")]
+    parts = [lb, bt, Text.from_markup("[dim]← to review the moves  •  any other key to exit…[/dim]")]
     console.print(Align.center(Group(*parts), vertical="middle", height=console.height))
 
 
 # ── gameplay loop ────────────────────────────────────────────────────────
 
 def _gameplay():
-    global STATE, STATE_META, FEEDBACK
+    global STATE, STATE_META, FEEDBACK, HIST_IDX, VIEWING_HISTORY
     # Start from a clean slate.  These are module globals: joining a second
     # game in the same session would otherwise short-circuit the wait loop
     # below on the *previous* game's state and render the wrong board.
     STATE = None
     STATE_META = {}
+    # The history belongs to one game; carrying it into the next would let ←
+    # walk back into a board we are no longer playing.
+    _reset_history()
 
     # Ask for the initial state.  The server may have to rebuild the game's
     # env from the database first -- nothing is held in memory across a server
@@ -622,6 +696,7 @@ def _gameplay():
                     err = err or f"Could not read the saved game: {e}"
                     continue
                 STATE_META = p
+                _push_history(blob, STATE)
                 err = None  # a good state supersedes an earlier complaint
             elif t == "error":
                 # The server could not load the game -- e.g. a save written by
@@ -675,9 +750,37 @@ def _gameplay():
             feedback_now = FEEDBACK
             FEEDBACK = ""
 
+            # ── history view ──
+            # Sits above every other branch: the auction and waiting branches
+            # below never read a key, so browsing has to be resolved here or a
+            # ← pressed on someone else's turn would be swallowed.  Moves that
+            # arrive while we browse are still recorded, just not shown.
+            if VIEWING_HISTORY and HISTORY:
+                HIST_IDX = max(0, min(HIST_IDX, len(HISTORY) - 1))
+                hst, hdesc = HISTORY[HIST_IDX]
+                live.update(_render(hst, NUM_COLORS, NUM_PLAYERS, hdesc,
+                                    PLAYER_INDEX, hist_msg=_hist_msg()))
+                live.refresh()
+                ch = _key(0.3)
+                if ch in ("q","Q"): return
+                if ch == "\x1b": return BACK
+                if ch == "\x1b[D":
+                    HIST_IDX = max(0, HIST_IDX - 1)
+                elif ch == "\x1b[C":
+                    HIST_IDX += 1
+                    # Stepping off the end is how you get back to live play.
+                    if HIST_IDX >= len(HISTORY) - 1:
+                        HIST_IDX = len(HISTORY) - 1
+                        VIEWING_HISTORY = False
+                continue
+
             if go:
                 _show_final_scores(st, NUM_COLORS, NUM_PLAYERS)
-                _key(None)
+                ch = _key(None)
+                if ch == "\x1b[D" and len(HISTORY) > 1:
+                    VIEWING_HISTORY = True
+                    HIST_IDX = len(HISTORY) - 2
+                    continue
                 return
 
             # ── auction mode ──
@@ -751,7 +854,16 @@ def _gameplay():
                     live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
                                         f"[dim]Waiting for {name} to play…[/dim]", PLAYER_INDEX))
                     live.refresh()
-                    _time.sleep(0.3)
+                    # Read rather than sleep: waiting on someone else is
+                    # exactly when you want to look back over the game, and
+                    # this loop used to swallow every keystroke.
+                    ch = _key(0.3)
+                    if ch in ("q","Q"): return
+                    if ch == "\x1b": return BACK
+                    if ch == "\x1b[D" and len(HISTORY) > 1:
+                        VIEWING_HISTORY = True
+                        HIST_IDX = len(HISTORY) - 2
+                        break  # the outer loop draws the history view
                 continue
 
             live.update(_render(st, NUM_COLORS, NUM_PLAYERS, feedback_now, PLAYER_INDEX))
@@ -761,7 +873,12 @@ def _gameplay():
             ch = _key(0.3)
             if ch=="": continue
             if ch in ("q","Q"): return
-            if ch == "\x1b[D": return BACK
+            if ch == "\x1b": return BACK
+            if ch == "\x1b[D":
+                if len(HISTORY) > 1:
+                    VIEWING_HISTORY = True
+                    HIST_IDX = len(HISTORY) - 2
+                continue
             if ch not in "0123456789 ": continue
 
             amap = {"0":ACTION_PASS," ":ACTION_PASS,"1":ACTION_BUY_FACTORY,"2":ACTION_BUY_WAREHOUSE,

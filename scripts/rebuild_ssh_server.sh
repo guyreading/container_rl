@@ -12,17 +12,51 @@ GO_BINARY="/opt/container-rl/container-rl-ssh"
 SSH_SERVICE="container-rl-ssh"
 PYTHON_SERVICE="container-rl-server"
 
+# ── Run as your login user, not as root ────────────────────────────────────
+# This script elevates the handful of steps that actually need it (installing
+# into /opt, writing systemd units, restarting services) with its own sudo
+# calls.  Running the *whole* thing as root breaks the Go build: the toolchain
+# shells out to git, and git rejects a checkout owned by another user with
+# "detected dubious ownership", which surfaces as
+#   error obtaining VCS status: exit status 128
+if [[ $EUID -eq 0 ]]; then
+    echo "ERROR: don't run this as root (or under sudo)." >&2
+    echo "  Run it as the user that owns this checkout, e.g.:" >&2
+    echo "      ./scripts/rebuild_ssh_server.sh" >&2
+    echo "  It calls sudo itself for the steps that need privileges, so you" >&2
+    echo "  will be prompted for your password once." >&2
+    exit 1
+fi
+
+# Fail early and clearly rather than midway through, once services are down.
+if ! command -v go > /dev/null; then
+    echo "ERROR: 'go' is not on PATH for $(id -un)." >&2
+    echo "  Install Go for this user, or add it: export PATH=/usr/local/go/bin:\$PATH" >&2
+    exit 1
+fi
+if ! sudo -v; then
+    echo "ERROR: $(id -un) cannot use sudo, which this script needs." >&2
+    exit 1
+fi
+
 # Maintainer token — never hardcode this; it gates maintainer_list /
 # maintainer_delete on the game server.  Supply it via the environment:
-#   MAINTAINER_TOKEN=... sudo -E ./scripts/rebuild_ssh_server.sh
+#   MAINTAINER_TOKEN=... ./scripts/rebuild_ssh_server.sh
 # or drop it in a root-only file at /etc/container-rl/maintainer-token.
 TOKEN_FILE="${TOKEN_FILE:-/etc/container-rl/maintainer-token}"
-if [[ -z "${MAINTAINER_TOKEN:-}" ]] && [[ -r "$TOKEN_FILE" ]]; then
-    MAINTAINER_TOKEN="$(< "$TOKEN_FILE")"
+if [[ -z "${MAINTAINER_TOKEN:-}" ]]; then
+    if [[ -r "$TOKEN_FILE" ]]; then
+        MAINTAINER_TOKEN="$(< "$TOKEN_FILE")"
+    elif sudo test -r "$TOKEN_FILE"; then
+        # The token file is deliberately root-only (mode 600), so an ordinary
+        # user cannot read it directly -- go through sudo rather than forcing
+        # the whole script to run as root.
+        MAINTAINER_TOKEN="$(sudo cat "$TOKEN_FILE")"
+    fi
 fi
 if [[ -z "${MAINTAINER_TOKEN:-}" ]]; then
     echo "ERROR: MAINTAINER_TOKEN is not set and $TOKEN_FILE is unreadable." >&2
-    echo "  Set it explicitly:  MAINTAINER_TOKEN=... sudo -E $0" >&2
+    echo "  Set it explicitly:  MAINTAINER_TOKEN=... $0" >&2
     exit 1
 fi
 
@@ -65,7 +99,12 @@ cd "$GO_SSH_DIR"
 # install into /opt needs elevation.
 BUILD_TMP="$(mktemp -d)"
 trap 'rm -rf "$BUILD_TMP"' EXIT
-go build -o "$BUILD_TMP/container-rl-ssh" ./cmd/container-rl-ssh/
+# -buildvcs=false: the toolchain otherwise shells out to git to stamp the
+# binary with the commit, which fails ("error obtaining VCS status: exit
+# status 128") whenever the build user does not own the checkout -- deploying
+# as root from a repo owned by someone else is exactly that case.  The stamp
+# buys us nothing here; the deployed version is whatever this tree contains.
+go build -buildvcs=false -o "$BUILD_TMP/container-rl-ssh" ./cmd/container-rl-ssh/
 sudo install -m 755 "$BUILD_TMP/container-rl-ssh" "$GO_BINARY"
 echo "  Built: $GO_BINARY"
 
@@ -148,4 +187,4 @@ echo ""
 echo "=== Done ==="
 echo "  SSH:  ssh play-container.tech"
 echo "  Model: $PROD_MODEL.zip"
-echo "  (Override model: MODEL_PATH=/path/to/model.zip sudo -E $0)"
+echo "  (Override model: MODEL_PATH=/path/to/model.zip $0)"
