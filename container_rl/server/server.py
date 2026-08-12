@@ -17,7 +17,7 @@ import threading
 from typing import Any
 
 from container_rl.server.database import Database
-from container_rl.server.game_manager import GameManager
+from container_rl.server.game_manager import GameManager, _state_to_json_data
 from container_rl.server.protocol import pack_message, recv_message
 
 logger = logging.getLogger("container.server")
@@ -192,19 +192,40 @@ class ClientHandler:
             state = self.server.manager.get_state(self.game_id)
             from container_rl.server.protocol import serialize_state
             blob = serialize_state(state)
-            self.send("state_update", {
-                "state": blob.hex(),
-                "current_player": int(state.current_player),
-                "actions_taken": int(state.actions_taken),
-                "auction_active": int(state.auction_active),
-                "produce_active": int(state.produce_active),
-                "shopping_active": int(state.shopping_active),
-                "game_over": int(state.game_over),
-            })
-            # If it's an AI player's turn, auto-play it
-            self.server.manager.play_ai_turn_if_needed(self.game_id)
         except Exception as e:
-            self.send("error", {"message": str(e)})
+            # Loading failed (most often a save written by an older build).
+            # This is the one error the joining client is waiting on, so make
+            # it say what went wrong rather than leaving them to time out.
+            logger.exception("get_state failed for game %s", self.game_id)
+            self.send("error", {"message": f"Could not load this game: {e}"})
+            return
+
+        try:
+            state_data = _state_to_json_data(state)
+        except Exception:
+            state_data = {}
+        self.send("state_update", {
+            "state": blob.hex(),
+            # Same shape as the state_update broadcast after every action --
+            # clients that read the decoded fields rather than the pickle got
+            # an empty board from this handler without it.
+            "state_data": state_data,
+            "current_player": int(state.current_player),
+            "actions_taken": int(state.actions_taken),
+            "auction_active": int(state.auction_active),
+            "produce_active": int(state.produce_active),
+            "shopping_active": int(state.shopping_active),
+            "game_over": int(state.game_over),
+        })
+
+        # If it's an AI player's turn, auto-play it.  Kept out of the block
+        # above on purpose: the client already has its state, so an AI failure
+        # must not be reported back as "get_state failed" -- doing so used to
+        # send an error to a client that had just been served correctly.
+        try:
+            self.server.manager.play_ai_turn_if_needed(self.game_id)
+        except Exception:
+            logger.exception("AI auto-play failed for game %s", self.game_id)
 
     def _send_lobby(self) -> None:
         if self.game_id is None:
