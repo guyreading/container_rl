@@ -40,8 +40,10 @@ from container_rl.env.container import (
     LOCATION_HARBOUR_OFFSET,
     LOCATION_OPEN_SEA,
     MAX_FACTORIES_PER_PLAYER,
+    NO_OP,
     PRICE_SLOTS,
     PRODUCE_CHOICES,
+    PURCHASE_STOP,
     SHIP_CAPACITY,
     ActionEncoder,
     EnvState,
@@ -163,6 +165,24 @@ def _send_action(action_idx: int) -> None:
 
 def _send_multi_action(arr: list[int]) -> None:
     CLIENT.send("action_multi", {"action": arr})
+
+def _mh(atype, opp=None, color=None, slot=None, purchase=NO_OP) -> list[int]:
+    """Build a multi-head action array from plain 0-based game values.
+
+    Every head reserves index 0 for no-op, so the env reads each one back as
+    ``head - 1``.  Callers pass what they mean — colour 0 = Red, price slot
+    0 = $1, opponent index 0 = the player to the left — and this shifts it.
+
+    *purchase* is passed through untouched: that head has its own encoding
+    (0 = no-op, 1-30 = values, ``PURCHASE_STOP`` = stop shopping).
+    """
+    return [
+        atype + 1,
+        NO_OP if opp is None else opp + 1,
+        NO_OP if color is None else color + 1,
+        NO_OP if slot is None else slot + 1,
+        purchase,
+    ]
 
 # ── rendering ────────────────────────────────────────────────────────────
 
@@ -364,6 +384,10 @@ def _submenu_produce(live, state, nc, np_):
         live.refresh(); _time.sleep(1.2)
         return True
 
+    # Collect every price up front so ESC on the first prompt still cancels
+    # the whole action — once the opening produce is sent the $1 union dues
+    # are paid and the turn is committed.
+    chosen: dict[int, int] = {}
     first = True
     for color in active_colors:
         hdr = f"[bold]Produce [{_cs(color)}]{_cn(color,nc)}[/{_cs(color)}] — pick a price:[/bold]"
@@ -371,19 +395,22 @@ def _submenu_produce(live, state, nc, np_):
         ch = _input_choice(live, state, nc, np_, opts, hdr)
         if ch is None:
             if first: return True
-            break
-        slot = LEAVE_IDLE if ch==len(opts) else ch-1
-        arr = [ACTION_PRODUCE, 0, color, slot, 0]
-        _send_multi_action(arr)
+            break  # cancelled mid-batch: remaining factories are left idle
+        chosen[color] = LEAVE_IDLE if ch==len(opts) else ch-1
         first = False
+
+    # The env splits producing into an opening action (pays the dues and
+    # marks every owned colour pending) followed by one action per factory.
+    _send_multi_action(_mh(ACTION_PRODUCE))
+    _wait_for_state(live, nc, np_)
+
+    for _ in range(nc + 1):
+        if STATE is None or not int(STATE.produce_active): break
+        pending = [c for c in range(nc) if int(STATE.produce_pending[c])>0]
+        color = pending[0] if pending else 0
+        slot = chosen.get(color, LEAVE_IDLE) if pending else LEAVE_IDLE
+        _send_multi_action(_mh(ACTION_PRODUCE, color=color, slot=slot))
         _wait_for_state(live, nc, np_)
-        if STATE is None: return True
-    # flush pending if cancelled mid-batch
-    if STATE and int(STATE.produce_active)>0:
-        for c in range(NUM_COLORS):
-            if int(STATE.produce_pending[c])>0:
-                _send_multi_action([ACTION_PRODUCE, 0, c, LEAVE_IDLE, 0])
-                _wait_for_state(live, nc, np_)
     return False
 
 def _submenu_buy_from_factory(live, state, nc, np_):
@@ -416,8 +443,13 @@ def _submenu_buy_from_factory(live, state, nc, np_):
             if first: return True
             continue
         h_slot = HARBOUR_PRICE_MIN+hch-1
-        arr = [ACTION_BUY_FROM_FACTORY_STORE, opp_idx, 0, h_slot, color*PRICE_SLOTS+src_slot]
-        _send_multi_action(arr); first=False
+        if first and not _open_shop(live, ACTION_BUY_FROM_FACTORY_STORE, opp_idx, nc, np_):
+            return False
+        # The env picks the cheapest matching slot at the seller itself, so
+        # the purchase head carries the destination harbour price instead.
+        _send_multi_action(_mh(ACTION_BUY_FROM_FACTORY_STORE, opp=opp_idx,
+                               color=color, purchase=h_slot))
+        first=False
         _wait_for_state(live, nc, np_)
         seller = PLAYER_NAMES.get(target, f"Player {target+1}")
         FEEDBACK = f"[bold]Buy {_cn(color,nc)} from {seller}'s factory at ${src_slot+1} (harbour ${h_slot+1})[/bold]"
@@ -434,8 +466,26 @@ def _submenu_buy_from_factory(live, state, nc, np_):
             return False
     # STOP
     if STATE and int(STATE.shopping_active)>0:
-        _send_multi_action([ACTION_BUY_FROM_FACTORY_STORE, 0, 0, 0, nc*PRICE_SLOTS])
+        _send_multi_action(_mh(ACTION_BUY_FROM_FACTORY_STORE, purchase=PURCHASE_STOP))
         _wait_for_state(live, nc, np_)
+    return False
+
+def _open_shop(live, atype, opp_idx, nc, np_) -> bool:
+    """Send the opening shopping action (picks who we are buying from).
+
+    The env treats this as step 1 — it opens the shop but buys nothing, so
+    every purchase that follows is a separate action.  Returns False if the
+    shop did not open (nothing affordable, or no space to put it).
+    """
+    _send_multi_action(_mh(atype, opp=opp_idx, purchase=PURCHASE_STOP))
+    _wait_for_state(live, nc, np_)
+    if STATE is not None and int(STATE.shopping_active) > 0:
+        return True
+    if STATE is not None:
+        live.update(_render(STATE, nc, np_,
+            "[yellow]Nothing you can take from there right now.[/yellow]", PLAYER_INDEX))
+        live.refresh()
+        _key(1.0)
     return False
 
 def _submenu_move_load(live, state, nc, np_):
@@ -461,7 +511,11 @@ def _submenu_move_load(live, state, nc, np_):
             break
         if ch==len(opts): break
         color = clist[ch-1]; slot = cheapest[color]
-        _send_multi_action([ACTION_MOVE_LOAD, opp_idx, 0, 0, color*PRICE_SLOTS+slot])
+        if first and not _open_shop(live, ACTION_MOVE_LOAD, opp_idx, nc, np_):
+            return False
+        # Ship loads have no destination price; any non-STOP purchase value
+        # means "load one of this colour".
+        _send_multi_action(_mh(ACTION_MOVE_LOAD, opp=opp_idx, color=color, purchase=1))
         first=False
         _wait_for_state(live, nc, np_)
         seller = PLAYER_NAMES.get(target, f"Player {target+1}")
@@ -478,7 +532,7 @@ def _submenu_move_load(live, state, nc, np_):
             return False
     # STOP
     if STATE and int(STATE.shopping_active)>0:
-        _send_multi_action([ACTION_MOVE_LOAD, 0, 0, 0, nc*PRICE_SLOTS])
+        _send_multi_action(_mh(ACTION_MOVE_LOAD, purchase=PURCHASE_STOP))
         _wait_for_state(live, nc, np_)
     return False
 
@@ -793,7 +847,10 @@ def _gameplay():
                         bid = _input_number(live, st, NUM_COLORS, NUM_PLAYERS,
                             f"[bold]Auction![/bold] Cargo: {cargo}\n{PLAYER_NAMES.get(PLAYER_INDEX, f'P{PLAYER_INDEX+1}')}: bid (0=pass, max ${int(st.cash[PLAYER_INDEX])}):")
                         bid = bid if bid is not None else 0
-                        _send_multi_action([ACTION_MOVE_AUCTION,PLAYER_INDEX,0,0,bid])
+                        # Auction steps are the exception to the 1-indexed
+                        # heads: the env reads the opponent head as a raw
+                        # player index and the purchase head as the bid.
+                        _send_multi_action([ACTION_MOVE_AUCTION+1,PLAYER_INDEX,0,0,bid])
                         _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
                     else:
                         _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
@@ -810,7 +867,8 @@ def _gameplay():
                         [f"[green]Accept[/green] (+${mx}×2)",f"[red]Reject[/red] (-${mx})"],
                         f"[bold]Highest bid: ${mx}[/bold]")
                     acc = 1 if ch==1 else 0
-                    _send_multi_action([ACTION_MOVE_AUCTION,PLAYER_INDEX,0,0,acc])
+                    # Raw heads again — see the bidding branch above.
+                    _send_multi_action([ACTION_MOVE_AUCTION+1,PLAYER_INDEX,0,0,acc])
                     _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
                 else:
                     _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
@@ -825,12 +883,13 @@ def _gameplay():
             if int(st.produce_active) or int(st.shopping_active):
                 if cur==PLAYER_INDEX:
                     if int(st.produce_active):
-                        for c in range(NUM_COLORS):
-                            if int(st.produce_pending[c])>0:
-                                _send_multi_action([ACTION_PRODUCE,0,c,LEAVE_IDLE,0])
-                                _wait_for_state(live,NUM_COLORS,NUM_PLAYERS); break
+                        pending = [c for c in range(NUM_COLORS) if int(st.produce_pending[c])>0]
+                        _send_multi_action(_mh(ACTION_PRODUCE,
+                                               color=pending[0] if pending else 0,
+                                               slot=LEAVE_IDLE))
+                        _wait_for_state(live,NUM_COLORS,NUM_PLAYERS)
                     if int(st.shopping_active):
-                        _send_multi_action([ACTION_BUY_FROM_FACTORY_STORE,0,0,0,NUM_COLORS*PRICE_SLOTS])
+                        _send_multi_action(_mh(ACTION_BUY_FROM_FACTORY_STORE, purchase=PURCHASE_STOP))
                         _wait_for_state(live,NUM_COLORS,NUM_PLAYERS)
                 else:
                     _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
@@ -892,7 +951,11 @@ def _gameplay():
                 if r is True: continue
                 if r: aidx = encoder.encode(atype, r)
             elif atype == ACTION_PRODUCE:
-                if int(st.cash[PLAYER_INDEX]) < 1:
+                if int(st.produced_this_turn) > 0:
+                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                        "[yellow]You have already produced this turn.[/yellow]", PLAYER_INDEX))
+                    live.refresh(); _time.sleep(1.2); cancelled = True
+                elif int(st.cash[PLAYER_INDEX]) < 1:
                     live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
                         "[yellow]Cannot afford produce — need $1 for union dues.[/yellow]", PLAYER_INDEX))
                     live.refresh(); _time.sleep(1.2); cancelled = True
