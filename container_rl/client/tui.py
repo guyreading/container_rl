@@ -70,6 +70,12 @@ STATE: EnvState | None = None
 STATE_META: dict = {}
 FEEDBACK: str = ""
 
+# How long to wait for the first ``state_update`` after joining.  Generous on
+# purpose: rebuilding a game's env from the database (and loading the AI model
+# on a server that has just restarted) takes far longer than a round trip.  We
+# bail out early on an explicit error, so a long ceiling costs nothing.
+STATE_LOAD_TIMEOUT = 30.0
+
 # ── terminal helpers ─────────────────────────────────────────────────────
 
 _ORIG_TERMIOS = None
@@ -585,20 +591,75 @@ def _show_final_scores(state, nc, np_):
 
 def _gameplay():
     global STATE, STATE_META, FEEDBACK
-    # get initial state
+    # Start from a clean slate.  These are module globals: joining a second
+    # game in the same session would otherwise short-circuit the wait loop
+    # below on the *previous* game's state and render the wrong board.
+    STATE = None
+    STATE_META = {}
+
+    # Ask for the initial state.  The server may have to rebuild the game's
+    # env from the database first -- nothing is held in memory across a server
+    # restart -- so allow well over the round-trip time, but stop waiting the
+    # moment it tells us it cannot.
     CLIENT.send("get_state")
-    deadline = _time.time()+10
-    while _time.time()<deadline:
-        msgs = _drain_server()
-        for m in msgs:
-            if m.get("type")=="state_update":
-                STATE = deserialize_state(bytes.fromhex(m["payload"]["state"]))
-                STATE_META = m.get("payload",{})
-                break
-        if STATE: break
+    err = None
+    deadline = _time.time() + STATE_LOAD_TIMEOUT
+    while _time.time() < deadline:
+        # Work through the whole batch rather than stopping at the first
+        # state_update: an AI opponent may already have moved by the time we
+        # join, and dropping the rest of the batch would leave us rendering a
+        # position the server has moved on from.  Last update wins.
+        for m in _drain_server():
+            t = m.get("type", ""); p = m.get("payload", {})
+            if t == "state_update":
+                blob = p.get("state")
+                if not blob:
+                    err = err or "The server sent an empty game state."
+                    continue
+                try:
+                    STATE = deserialize_state(bytes.fromhex(blob))
+                except Exception as e:  # unreadable save: report, don't crash
+                    err = err or f"Could not read the saved game: {e}"
+                    continue
+                STATE_META = p
+                err = None  # a good state supersedes an earlier complaint
+            elif t == "error":
+                # The server could not load the game -- e.g. a save written by
+                # an older build.  Surface *its* message: without this branch
+                # we waited out the full timeout and then quit with a generic
+                # error, which over ssh looked like being logged out.  An error
+                # trailing a good state (a failed AI turn, say) is not ours.
+                if STATE is None:
+                    err = p.get("message") or "The server could not load this game."
+            elif t == "disconnected":
+                err = "Lost connection to the game server."
+        if STATE is not None or err:
+            break
+        # Keep drawing so a slow load reads as progress, not as a freeze.
+        console.clear()
+        console.print(Align.center(
+            Panel.fit(
+                f"[bold]Loading game {GAME_CODE}…[/bold]\n[dim]Waiting for the server[/dim]",
+                border_style="yellow",
+            ),
+            vertical="middle", height=console.height))
         _time.sleep(0.1)
+
     if STATE is None:
-        console.print("[red]Failed to receive game state.[/red]"); _key(2); return
+        # Go back to the menu instead of returning out of main(): a bare
+        # ``return`` here unwinds the whole TUI, and over ssh that ends the
+        # session -- which is what "picking a game logs me out" really was.
+        console.clear()
+        console.print(Align.center(
+            Panel.fit(
+                f"[bold red]Could not open game {GAME_CODE}[/bold red]\n\n"
+                f"{err or 'Timed out waiting for the game state.'}\n\n"
+                "[dim]Press any key to go back.[/dim]",
+                border_style="red",
+            ),
+            vertical="middle", height=console.height))
+        _key(None)
+        return BACK
 
     encoder = ActionEncoder(NUM_PLAYERS, NUM_COLORS)
 
@@ -1199,11 +1260,26 @@ def main():
 
             else:  # ch == 2
                 while True:
+                    # Same reset as the outer loop, for the same reason: every
+                    # path back to the game list (lobby back-button, a game we
+                    # could not open) re-enters here with the previous game's
+                    # globals still set, and the wait loop below breaks as soon
+                    # as ``GAME_ID`` is truthy -- so without this the next pick
+                    # would run under the old game's id, code and player index.
+                    GAME_ID = None
+                    GAME_CODE = ""
+                    PLAYER_INDEX = 0
+                    GAME_STATUS = "lobby"
+                    PLAYER_NAMES = {}
+                    STATE = None
+                    STATE_META = {}
+
                     cfg = _join_screen()
                     if cfg is None: return
                     if cfg is BACK: break  # back to main menu
                     MY_NAME = cfg["player_name"]
                     CLIENT.send("join_game", cfg)
+                    join_err = None
                     for _i in range(50):
                         msgs = _drain_server()
                         for m in msgs:
@@ -1215,10 +1291,27 @@ def main():
                                 pp = m["payload"]
                                 NUM_PLAYERS = pp.get("num_players_needed", NUM_PLAYERS)
                                 PLAYER_NAMES = {int(pl["player_index"]): pl["name"] for pl in pp.get("players", [])}
-                        if GAME_ID: break
+                            # A refused join ("not accepting players", "not in
+                            # this game") used to be dropped on the floor: we
+                            # sat out the whole loop and then blamed it on a
+                            # timeout.  Report what the server actually said.
+                            if m.get("type") == "error":
+                                join_err = m.get("payload", {}).get("message") or join_err
+                            if m.get("type") == "disconnected":
+                                join_err = "Lost connection to the game server."
+                        if GAME_ID or join_err: break
                         _time.sleep(0.1)
                     if GAME_ID is None:
-                        console.print("[red]Failed to join game.[/red]"); _key(2)
+                        console.clear()
+                        console.print(Align.center(
+                            Panel.fit(
+                                "[bold red]Could not join that game[/bold red]\n\n"
+                                f"{join_err or 'The server did not respond.'}\n\n"
+                                "[dim]Press any key to go back.[/dim]",
+                                border_style="red",
+                            ),
+                            vertical="middle", height=console.height))
+                        _key(None)
                         continue
                     is_active = GAME_STATUS == "active"
                     if not is_active:
