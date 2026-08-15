@@ -60,3 +60,5 @@ site/
 # IDE files
 # .idea/
 # .vscode/
+
+container-rl-ssh/*
