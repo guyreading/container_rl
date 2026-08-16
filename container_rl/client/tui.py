@@ -1143,18 +1143,18 @@ def _main_menu():
             return selected + 1
 
 def _create_screen():
-    """Create game with slider bars for player count (2-5) and AI opponents.
+    """Create game with slider bars for player count (3-5) and AI opponents.
 
     ↑↓/jk switch between the two selectors.  ←→/hl adjust the selected bar.
     Colours always 5.
     """
-    num_players = 2
+    num_players = 3
     ai_players = 0
     selected = 0  # 0 = num_players, 1 = ai_players
     while True:
         bar_p = ["█" if i < num_players else "░" for i in range(5)]
         bar_a = ["█" if i < ai_players else "░" for i in range(5)]
-        left_p = "◂" if num_players > 2 else " "
+        left_p = "◂" if num_players > 3 else " "
         right_p = "▸" if num_players < 5 else " "
         left_a = "◂" if ai_players > 0 else " "
         right_a = "▸" if ai_players < num_players - 1 else " "
@@ -1180,7 +1180,7 @@ def _create_screen():
         elif ch in ("\x1b[B", "j", "J"):
             selected = 1
         elif ch in ("\x1b[D", "h", "H"):
-            if selected == 0 and num_players > 2:
+            if selected == 0 and num_players > 3:
                 num_players -= 1
                 if ai_players >= num_players:
                     ai_players = num_players - 1
