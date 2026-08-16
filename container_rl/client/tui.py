@@ -18,6 +18,7 @@ from rich.console import Console, Group
 from rich.align import Align
 from rich.columns import Columns
 from rich.live import Live
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -313,13 +314,16 @@ def _render(state, nc, np_, feedback="", my_player=None, hist_msg=""):
     turn = int(state.current_player)
     acts = int(state.actions_taken)
     name = PLAYER_NAMES.get(turn, f"Player {turn+1}")
-    hdr = f"🚢 CONTAINER  │  {name}'s turn  │  Action {acts+1}/2"
+    # ``escape`` the player name: it is user-supplied, and the header is parsed
+    # as markup below so the ``[green]``/``[yellow]`` tags render as colour
+    # rather than as literal text.
+    hdr = f"🚢 CONTAINER  │  {escape(name)}'s turn  │  Action {acts+1}/2"
     if int(state.auction_active): hdr += "  │  [yellow]AUCTION[/yellow]"
     if int(state.produce_active): hdr += "  │  [yellow]PRODUCING[/yellow]"
     if int(state.shopping_active): hdr += "  │  [yellow]SHOPPING[/yellow]"
     if my_player is not None and turn == my_player:
         hdr += "  [green](YOU)[/green]"
-    elems.append(Panel(Text(hdr, style="bold white on blue")))
+    elems.append(Panel(Text.from_markup(hdr, style="bold", justify="center")))
     if hist_msg:
         elems.append(Panel(Text.from_markup(hist_msg), border_style="yellow"))
     elems.append(Panel(_supply(state,nc), title="Supply", border_style="yellow"))
