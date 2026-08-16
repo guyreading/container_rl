@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import os
 import select
@@ -109,6 +110,38 @@ def _enter_raw():
 def _exit_raw():
     if _ORIG_TERMIOS is not None:
         termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, _ORIG_TERMIOS)
+
+def _alt_screen(enable: bool) -> None:
+    """Switch the terminal to, or back from, the alternate screen buffer.
+
+    This is what makes the whole TUI vanish when you leave it: everything is
+    drawn on a scratch screen, and dropping that screen restores the shell
+    exactly as it was, with only the closing message printed after it.  Over
+    ssh that is the difference between logging out cleanly and leaving the
+    board smeared across the user's terminal.
+
+    ``main`` owns this for the whole session -- anything else that touches the
+    alternate screen has to put it back the way it found it.
+    """
+    console.set_alt_screen(enable)
+    console.show_cursor(not enable)
+
+@contextlib.contextmanager
+def _game_live(renderable):
+    """``Live`` for the game board, on the alternate screen ``main`` owns.
+
+    ``Live(screen=True)`` treats the alternate screen as its own: it enters on
+    the way in and *unconditionally* leaves on the way out (rich's
+    ``set_alt_screen`` keeps no nesting count, so it does not notice we were
+    already there).  Left alone, that drops us back to the real terminal the
+    moment a game ends -- and every menu after it, plus "Goodbye!", is then
+    drawn straight into the user's scrollback.  Re-enter behind it.
+    """
+    try:
+        with Live(renderable, console=console, screen=True, auto_refresh=False) as live:
+            yield live
+    finally:
+        _alt_screen(True)
 
 def _ch():
     r, _, _ = select.select([sys.stdin], [], [], 0)
@@ -792,7 +825,7 @@ def _gameplay():
 
     encoder = ActionEncoder(NUM_PLAYERS, NUM_COLORS)
 
-    with Live(_render(STATE, NUM_COLORS, NUM_PLAYERS,"",PLAYER_INDEX), console=console, screen=True, auto_refresh=False) as live:
+    with _game_live(_render(STATE, NUM_COLORS, NUM_PLAYERS,"",PLAYER_INDEX)) as live:
         while True:
             _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
             if STATE is None: return
@@ -1325,9 +1358,7 @@ def main():
     CLIENT = GameClient(args.host, args.port)
     _enter_raw()
     try:
-        sys.stdout.write("\033[?1049h")
-        sys.stdout.flush()
-        console.show_cursor(False)
+        _alt_screen(True)
         try:
             CLIENT.connect()
         except Exception as e:
@@ -1502,9 +1533,7 @@ def main():
                     if result is BACK: continue  # back to game list
                     return
     finally:
-        console.show_cursor(True)
-        sys.stdout.write("\033[?1049l")
-        sys.stdout.flush()
+        _alt_screen(False)
         _exit_raw()
         if CLIENT: CLIENT.disconnect()
         console.print("[dim]Goodbye![/dim]")
