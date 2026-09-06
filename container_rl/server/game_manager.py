@@ -7,6 +7,7 @@ import threading
 from typing import Any, Callable
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from container_rl.env.container import (
     ACTION_BUY_FACTORY,
@@ -20,6 +21,8 @@ from container_rl.env.container import (
     ACTION_PRODUCE,
     ACTION_REPAY_LOAN,
     ACTION_TAKE_LOAN,
+    HEAD_OPPONENT,
+    HEAD_PURCHASE,
     LEAVE_IDLE,
     PURCHASE_STOP,
     ActionEncoder,
@@ -284,6 +287,21 @@ class GameManager:
                     "error": True,
                 }
 
+            # An auction names its bidder by a raw player index on the
+            # opponent head, and the env takes that at face value.  Left
+            # unchecked, one seat can enter a bid in another's name and spend
+            # their cash -- so a bid is only ever accepted for the sender.
+            if auction_active and getattr(action, "ndim", 1) == 1 \
+                    and hasattr(action, "__len__") and len(action) >= 5 \
+                    and int(action[HEAD_OPPONENT]) != player_index:
+                return {
+                    "turn_ended": False,
+                    "desc": "You can only bid for yourself.",
+                    "reward": 0.0,
+                    "game_over": False,
+                    "error": True,
+                }
+
             encoder = self.get_encoder(game_id)
             obs, reward, term, trunc, info = env.step(action)
             self._save_state(game_id, env.state)
@@ -379,12 +397,20 @@ class GameManager:
     def _ai_step(self, env: ContainerJaxEnv, model: Any, ms_size: int) -> Any:
         """Choose one action for the current player and apply it.
 
-        Returns whatever ``env.step`` returns.  The model is advisory: if it
-        is missing or raises (e.g. a checkpoint whose observation space no
-        longer matches the env), we fall back to a uniform choice among the
-        legal actions so the game keeps moving.
+        Returns whatever ``env.step`` returns.
         """
-        state = env.state
+        return env.step(self._ai_choose(env, env.state, model, ms_size))
+
+    def _ai_choose(self, env: ContainerJaxEnv, state: EnvState, model: Any,
+                   ms_size: int) -> Any:
+        """Pick one multi-head action for *state*'s current player.
+
+        The state is passed in rather than read off the env because an auction
+        bid is asked from a seat other than the one whose turn it is.  The
+        model is advisory: if it is missing or raises (e.g. a checkpoint whose
+        observation space no longer matches the env), we fall back to a uniform
+        choice among the legal actions so the game keeps moving.
+        """
         params = env.func_env.params
         obs_full = np.asarray(
             env.func_env.observation(state, jax.random.PRNGKey(0), params),
@@ -415,7 +441,7 @@ class GameManager:
         if action is None:
             action = self._random_legal_action(per_head)
 
-        return env.step(np.atleast_1d(action))
+        return np.atleast_1d(action)
 
     @staticmethod
     def _head_masks(env: ContainerJaxEnv, state: EnvState) -> list[Any]:
@@ -468,6 +494,25 @@ class GameManager:
             state = env.state
             if int(state.game_over) > 0:
                 break
+
+            # An open auction comes first: bidding is the one move made out of
+            # turn, so the seat that opened it stays ``current_player`` and the
+            # loop below would walk straight past every AI that owes a bid.
+            # Nothing then arrived to close the round, and the seller's client
+            # waited on it for good.
+            if int(state.auction_active) > 0:
+                if self._play_ai_auction_bids(game_id, model, ms_size):
+                    self._broadcast_state(game_id)
+                state = env.state
+                if int(state.auction_active) > 0 and (
+                        int(state.auction_round) == 0
+                        or int(state.auction_seller) not in ai_slots):
+                    # Either a human still owes a bid or a human has to accept
+                    # or reject.  Stop here in both cases: a turn taken now
+                    # would be the AI acting inside somebody else's auction,
+                    # and the bidder head would let it bid in their name.
+                    break
+
             cp = int(state.current_player)
             if cp not in ai_slots:
                 break
@@ -481,26 +526,82 @@ class GameManager:
 
             # ── 3. Broadcast updated state ──
             new_state = env.state
-            state_blob = serialize_state(new_state)
-            try:
-                state_data = _state_to_json_data(new_state)
-            except Exception:
-                state_data = {}
-            self._broadcast(game_id, "state_update", {
-                "state": state_blob.hex(),
-                "state_data": state_data,
-                "current_player": int(new_state.current_player),
-                "actions_taken": int(new_state.actions_taken),
-                "auction_active": int(new_state.auction_active),
-                "produce_active": int(new_state.produce_active),
-                "shopping_active": int(new_state.shopping_active),
-                "game_over": int(new_state.game_over),
-            })
+            self._broadcast_state(game_id)
 
             # ── 4. Check for game over ──
             if bool(term) or int(new_state.game_over) > 0:
                 self.db.set_game_status(game_id, "finished")
                 break
+
+    def _broadcast_state(self, game_id: int) -> None:
+        """Send the current position to everyone at the table."""
+        state = self._envs[game_id].state
+        try:
+            state_data = _state_to_json_data(state)
+        except Exception:
+            state_data = {}
+        self._broadcast(game_id, "state_update", {
+            "state": serialize_state(state).hex(),
+            "state_data": state_data,
+            "current_player": int(state.current_player),
+            "actions_taken": int(state.actions_taken),
+            "auction_active": int(state.auction_active),
+            "produce_active": int(state.produce_active),
+            "shopping_active": int(state.shopping_active),
+            "game_over": int(state.game_over),
+        })
+
+    def _play_ai_auction_bids(self, game_id: int, model: Any, ms_size: int) -> bool:
+        """Enter the bids the AI seats owe in an open auction.  True if any.
+
+        Only the AI's own seats are bid for.  The bidder is named by a raw
+        player index on the opponent head and the env does not check it
+        against whoever sent the action, so an ordinary AI turn taken during
+        an auction can enter a bid for a human and spend their money -- which
+        is what the old ``_ai_step`` loop here did whenever an AI opened one.
+        """
+        env = self._envs.get(game_id)
+        if env is None:
+            return False
+        ai_slots = self._get_ai_slots(game_id)
+        if not ai_slots:
+            return False
+
+        bid_placed = False
+        for _ in range(MAX_AI_CONTINUATION_STEPS):
+            state = env.state
+            if int(state.auction_active) == 0 or int(state.auction_round) != 0:
+                break
+            seller = int(state.auction_seller)
+            owing = [p for p in ai_slots
+                     if p != seller and int(state.auction_bids[p]) < 0]
+            if not owing:
+                break
+            for player in owing:
+                env.step(np.array(
+                    [ACTION_MOVE_AUCTION + 1, player, 0, 0,
+                     self._ai_bid(env, model, ms_size, player)],
+                    dtype=np.int64))
+                bid_placed = True
+            self._save_state(game_id, env.state)
+        return bid_placed
+
+    def _ai_bid(self, env: ContainerJaxEnv, model: Any, ms_size: int,
+                player: int) -> int:
+        """What *player* bids, asked of the model from that seat's chair.
+
+        Both the observation and the masks are keyed to ``current_player``, so
+        the seat is swapped in for the question only -- the real state is left
+        exactly as it is and stepped separately with an explicit bidder.
+        """
+        state = env.state
+        view = state._replace(
+            current_player=jnp.asarray(player, dtype=state.current_player.dtype))
+        action = self._ai_choose(env, view, model, ms_size)
+        bid = int(np.atleast_1d(action)[HEAD_PURCHASE])
+        # The env clips to the bidder's cash; do it here too so what is
+        # recorded in the log is what actually happens.
+        return max(0, min(bid, int(state.cash[player])))
 
     def _play_ai_continuation(self, game_id: int, model: Any,
                                nc: int, np_: int, ms_size: int) -> None:
@@ -516,12 +617,20 @@ class GameManager:
             state = env.state
             steps += 1
 
-        steps = 0
-        while bool(state.auction_active) and steps < MAX_AI_CONTINUATION_STEPS:
-            self._ai_step(env, model, ms_size)
-            self._save_state(game_id, env.state)
+        # An auction the AI just opened: collect our own bids, then close it
+        # if the seller is one of ours.  Any human bidder is left to answer in
+        # their own time -- the auction stays open until they do.
+        if bool(env.state.auction_active):
+            self._play_ai_auction_bids(game_id, model, ms_size)
             state = env.state
-            steps += 1
+            steps = 0
+            while bool(state.auction_active) and int(state.auction_round) == 1 \
+                    and int(state.auction_seller) in self._get_ai_slots(game_id) \
+                    and steps < MAX_AI_CONTINUATION_STEPS:
+                self._ai_step(env, model, ms_size)
+                self._save_state(game_id, env.state)
+                state = env.state
+                steps += 1
 
     # ------------------------------------------------------------------
     # helpers
@@ -569,7 +678,6 @@ def _describe_action(action, encoder: ActionEncoder, num_colors: int, state=None
                      player_names: dict[int, str] | None = None,
                      actor: int | None = None) -> str:
     """Return a human-readable description of *action* (flat int or multi-head array)."""
-    import jax.numpy as jnp
     try:
         if hasattr(action, "ndim") and action.ndim == 1 and action.shape[0] >= 5:
             # Every head reserves index 0 for no-op, so each one decodes as
