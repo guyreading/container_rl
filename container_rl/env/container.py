@@ -551,10 +551,14 @@ class ContainerFunctional(
             # Don't advance turn if still mid-shopping, mid-produce, mid-auction,
             # or if the auction failed (no turn consumed for a bad auction attempt).
             auction_failed = (atype == ACTION_MOVE_AUCTION) & (~s.auction_active.astype(jnp.bool_))
+            # An accepted produce stays in produce mode and ends its turn from
+            # _finish_producing, so a produce reaching _advance_turn here was
+            # rejected — pass was_produced=False so it consumes an action like
+            # any other rejected action instead of being a free retry.
             s = jax.lax.cond(
                 auction_failed | (s.shopping_active > 0) | (s.produce_active > 0) | (s.auction_active > 0),
                 lambda x: x,
-                lambda x: self._advance_turn(x, atype, np_, was_produced),
+                lambda x: self._advance_turn(x, atype, np_, False),
                 s,
             )
             return s
@@ -1237,10 +1241,16 @@ class ContainerFunctional(
     # ========================================================================
 
     def _action_produce(self, state, action, params):
-        """Enter produce mode.  On the first call each turn this initialises
+        """Enter produce mode.  Once per turn this initialises
         ``produce_pending`` from the player's owned factory colours and enters
         recurrent mode.  The actual per-factory processing (colour + price)
         happens in ``_produce_shopping_step``.
+
+        Producing is a once-a-turn action, so a second attempt in the same
+        turn is rejected outright rather than opening another batch.  Entering
+        the batch regardless used to let a player run the factories again for
+        free — no union dues the second time, and ``_advance_turn`` charged no
+        action for it — so a whole factory store could be filled for $1.
         """
         player = state.current_player
         np_ = params.num_players
@@ -1256,23 +1266,27 @@ class ContainerFunctional(
         supply_ok_colors = (state.container_supply > 0) & owned
         any_possible = has_space & jnp.any(supply_ok_colors)
 
-        do_pay = any_possible & (~already_produced)
+        # Matches the ACTION_PRODUCE entry in ``_action_masks``: if the mask
+        # says producing is illegal, the action must be a no-op here too.
+        do_produce = any_possible & (~already_produced)
 
         new_cash = state.cash.at[player].set(
-            jnp.where(do_pay, state.cash[player] - 1, state.cash[player])
+            jnp.where(do_produce, state.cash[player] - 1, state.cash[player])
         )
         new_cash = new_cash.at[right_player].set(
-            jnp.where(do_pay, state.cash[right_player] + 1, state.cash[right_player])
+            jnp.where(do_produce, state.cash[right_player] + 1, state.cash[right_player])
         )
         state = state._replace(cash=new_cash)
 
-        pending = owned.astype(jnp.int32)
+        pending = jnp.where(do_produce, owned.astype(jnp.int32),
+                            jnp.zeros_like(state.produce_pending))
 
         state = state._replace(
-            produce_active=jnp.array(1, dtype=jnp.int32),
+            produce_active=jnp.where(do_produce, jnp.array(1, dtype=jnp.int32),
+                                     jnp.array(0, dtype=jnp.int32)),
             produce_pending=pending,
             produced_this_turn=jnp.where(
-                do_pay,
+                do_produce,
                 jnp.array(1, dtype=state.produced_this_turn.dtype),
                 state.produced_this_turn,
             ),

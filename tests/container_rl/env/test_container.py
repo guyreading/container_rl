@@ -621,6 +621,138 @@ class TestAdvanceTurn:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Produce (once a turn)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestActionProduce:
+    """Producing is a once-a-turn action.
+
+    Entering the batch unconditionally used to let a player run the factories
+    again in the same turn for free: no second union dues, and _advance_turn
+    charged no action for the repeat, so a whole factory store could be filled
+    for $1.
+    """
+
+    @staticmethod
+    def _three_factory_state(**overrides):
+        np_, nc = 2, 5
+        defaults = dict(
+            factory_colors=jnp.zeros((np_, nc), dtype=jnp.int32).at[0, 0:3].set(1).at[1, 3].set(1),
+            factory_store=jnp.zeros((np_, nc, PRICE_SLOTS), dtype=jnp.int32),
+        )
+        defaults.update(overrides)
+        return _make_state(**defaults)
+
+    def _produce_batch(self, func_env, state, params, key, colors=(0, 1, 2)):
+        """Open a produce batch and put one container in each named factory."""
+        state = func_env.transition(state, jnp.array([ACTION_PRODUCE + 1, 0, 0, 0, 0]), key, params)
+        for c in colors:
+            state = func_env.transition(
+                state, jnp.array([ACTION_PRODUCE + 1, 0, c + 1, 1, 0]), key, params,
+            )
+        return state
+
+    def test_first_produce_of_the_turn_runs_every_factory(self):
+        func_env = _make_func_env()
+        params = _make_params()
+        key = random.PRNGKey(0)
+        state = self._three_factory_state()
+
+        state = self._produce_batch(func_env, state, params, key)
+
+        assert int(state.factory_store[0].sum()) == 3
+        assert int(state.cash[0]) == INITIAL_CASH - 1   # union dues, once
+        assert int(state.cash[1]) == INITIAL_CASH + 1   # paid to the left
+        assert int(state.produce_active) == 0
+
+    def test_second_produce_in_the_same_turn_is_rejected(self):
+        func_env = _make_func_env()
+        params = _make_params()
+        key = random.PRNGKey(0)
+        state = self._three_factory_state()
+
+        state = self._produce_batch(func_env, state, params, key)
+        assert int(state.current_player) == 0  # one action left this turn
+        after_first = state
+
+        state = func_env.transition(
+            state, jnp.array([ACTION_PRODUCE + 1, 0, 0, 0, 0]), key, params,
+        )
+
+        assert int(state.produce_active) == 0             # no second batch opened
+        assert int(state.produce_pending.sum()) == 0
+        assert int(state.factory_store[0].sum()) == 3     # nothing extra produced
+        assert int(state.cash[0]) == int(after_first.cash[0])   # and no extra dues
+
+    def test_rejected_produce_consumes_an_action(self):
+        """Otherwise a repeat attempt is a free retry that never ends the turn."""
+        func_env = _make_func_env()
+        params = _make_params()
+        key = random.PRNGKey(0)
+        state = self._three_factory_state()
+
+        state = self._produce_batch(func_env, state, params, key)
+        assert int(state.actions_taken) == 1
+
+        state = func_env.transition(
+            state, jnp.array([ACTION_PRODUCE + 1, 0, 0, 0, 0]), key, params,
+        )
+        assert int(state.current_player) == 1  # second action spent, turn over
+
+    def test_produce_reopens_on_the_next_turn(self):
+        func_env = _make_func_env()
+        params = _make_params()
+        key = random.PRNGKey(0)
+        state = self._three_factory_state()
+
+        state = self._produce_batch(func_env, state, params, key)
+        # Spend the rest of the round so P0 is back on turn with a clean slate.
+        encoder = ActionEncoder(2, 5)
+        pass_action = jnp.array(encoder.encode(ACTION_PASS, {}), dtype=jnp.int32)
+        while int(state.current_player) != 0 or int(state.actions_taken) != 0:
+            state = func_env.transition(state, pass_action, key, params)
+
+        assert int(state.produced_this_turn) == 0
+        state = self._produce_batch(func_env, state, params, key)
+        assert int(state.factory_store[0].sum()) == 6
+        assert int(state.cash[0]) == INITIAL_CASH - 2  # dues paid once per turn
+
+    def test_produce_rejected_when_the_store_is_full(self):
+        func_env = _make_func_env()
+        params = _make_params()
+        key = random.PRNGKey(0)
+        # 3 factories hold 6; start at capacity.
+        full = jnp.zeros((2, 5, PRICE_SLOTS), dtype=jnp.int32).at[0, 0, 0].set(6)
+        state = self._three_factory_state(factory_store=full)
+
+        state = func_env.transition(
+            state, jnp.array([ACTION_PRODUCE + 1, 0, 0, 0, 0]), key, params,
+        )
+
+        assert int(state.produce_active) == 0
+        assert int(state.cash[0]) == INITIAL_CASH  # no dues for a no-op
+        assert int(state.produced_this_turn) == 0
+
+    def test_produce_matches_its_action_mask(self):
+        """A produce the mask forbids must be a no-op in the handler too."""
+        func_env = _make_func_env()
+        params = _make_params()
+        key = random.PRNGKey(0)
+        state = self._three_factory_state()
+
+        state = self._produce_batch(func_env, state, params, key)
+        masks = func_env._action_masks(state, params)
+        assert int(masks["action_type"][ACTION_PRODUCE + 1]) == 0
+
+        before = state
+        state = func_env.transition(
+            state, jnp.array([ACTION_PRODUCE + 1, 0, 0, 0, 0]), key, params,
+        )
+        assert int(state.factory_store[0].sum()) == int(before.factory_store[0].sum())
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Game End Check
 # ══════════════════════════════════════════════════════════════════════════════
 
