@@ -665,20 +665,65 @@ def _hist_msg() -> str:
     return (f"[bold yellow]Move {HIST_IDX}/{len(HISTORY)-1} — history view[/bold yellow]"
             "  [dim]←→ browse  •  → to the end for live play  •  esc lobby[/dim]")
 
+def _idle(timeout=0.3) -> str:
+    """Pause between polls without going deaf.
+
+    Returns ``"quit"``, ``"back"``, ``"history"``, or ``""`` for nothing
+    pressed.  The branches with nothing to do used to ``sleep`` here, so a
+    game that stopped advancing — an auction still short a bid, say — left the
+    player with a screen that answered no key at all, not even q.  Ctrl-C is
+    not a signal in raw mode, just another byte nobody reads, so the only way
+    out was to kill the connection.  Waiting is fine; waiting with no exit is
+    indistinguishable from a crash.
+    """
+    ch = _key(timeout)
+    if ch in ("q", "Q"): return "quit"
+    if ch == "\x1b": return "back"
+    if ch == "\x1b[D": return "history"
+    return ""
+
 # ── state polling ────────────────────────────────────────────────────────
 
+def _apply_state(p: dict) -> None:
+    """Adopt the position carried by a ``state_update`` payload.
+
+    A blob we cannot read is reported rather than raised.  This runs on every
+    message from the server, and an exception here unwinds the whole client --
+    over ssh that is the game ending mid-turn with no explanation.
+    """
+    global STATE, STATE_META, FEEDBACK
+    STATE_META = p
+    blob = p.get("state")
+    if not blob:
+        return
+    try:
+        st = deserialize_state(bytes.fromhex(blob))
+    except Exception as e:
+        FEEDBACK = f"[red]Could not read the position the server sent: {e}[/red]"
+        return
+    STATE = st
+    _push_history(blob, st)
+
 def _wait_for_state(live, nc, np_, timeout=10.0):
+    """Wait for the server's answer to a move we just sent.
+
+    The whole batch is worked through before returning.  ``_drain_server``
+    empties the socket, so whatever is left unread is not seen again:
+    stopping at the first ``state_update`` threw away every position behind
+    it.  During an auction — where each bid is broadcast to everyone — that
+    left the seller looking at the moment the auction opened while the game
+    had already moved to the decision, and since nothing further was coming,
+    it stayed there.  Last position in the batch wins.
+    """
     global STATE, STATE_META, FEEDBACK
     deadline = _time.time()+timeout
     while _time.time()<deadline:
+        answered = False
         for m in _drain_server():
             t = m.get("type", ""); p = m.get("payload", {})
             if t == "state_update":
-                STATE_META = p
-                if p.get("state"):
-                    STATE = deserialize_state(bytes.fromhex(p["state"]))
-                    _push_history(p["state"], STATE)
-                return STATE
+                _apply_state(p)
+                answered = True
             elif t == "action_result":
                 FEEDBACK = f"[bold]{p.get('desc','')}[/bold]"
                 _describe_last(p.get("desc", ""))
@@ -686,10 +731,12 @@ def _wait_for_state(live, nc, np_, timeout=10.0):
                     FEEDBACK += "  [bold red]GAME OVER[/bold red]"
             elif t == "error":
                 FEEDBACK = f"[red]{p.get('message','')}[/red]"
-                return STATE  # return immediately on error to show it
+                answered = True  # show it rather than waiting out the timeout
             elif t == "disconnected":
                 STATE = None
                 return STATE
+        if answered:
+            return STATE
         live.update(_render(STATE, nc, np_, "Waiting for server…", PLAYER_INDEX))
         live.refresh()
         _time.sleep(0.1)
@@ -700,10 +747,7 @@ def _update_state_from_server(live, nc, np_):
     for m in _drain_server():
         t = m.get("type",""); p = m.get("payload",{})
         if t=="state_update":
-            STATE_META=p
-            if p.get("state"):
-                STATE = deserialize_state(bytes.fromhex(p["state"]))
-                _push_history(p["state"], STATE)
+            _apply_state(p)
         elif t=="action_result":
             _describe_last(p.get("desc",""))
             if p.get("game_over"): FEEDBACK="[bold red]GAME OVER[/bold red]"
@@ -1020,8 +1064,16 @@ def _gameplay():
                     # Any non-seller can bid — check if we already bid.
                     if int(st.auction_bids[PLAYER_INDEX]) < 0:
                         cargo = _desc_cargo(st.auction_cargo, NUM_COLORS)
+                        cash = int(st.cash[PLAYER_INDEX])
+                        # Cap the prompt at what we can pay: the env clips a
+                        # bigger bid anyway, so offering it only invites a
+                        # number that means something other than it says.
+                        # There is no way to type a 0 — the prompt is
+                        # 1-indexed like every other — so passing is esc.
                         bid = _input_number(live, st, NUM_COLORS, NUM_PLAYERS,
-                            f"[bold]Auction![/bold] Cargo: {cargo}\n{PLAYER_NAMES.get(PLAYER_INDEX, f'P{PLAYER_INDEX+1}')}: bid (0=pass, max ${int(st.cash[PLAYER_INDEX])}):")
+                            f"[bold]Auction![/bold] Cargo: {cargo}\n"
+                            f"{PLAYER_NAMES.get(PLAYER_INDEX, f'P{PLAYER_INDEX+1}')}: "
+                            f"bid up to ${cash} (esc = pass):", cash)
                         bid = bid if bid is not None else 0
                         # Auction steps are the exception to the 1-indexed
                         # heads: the env reads the opponent head as a raw
@@ -1036,7 +1088,9 @@ def _gameplay():
                             live.update(_render(STATE or st, NUM_COLORS, NUM_PLAYERS,
                                                 "[dim]Bid submitted — waiting for others…[/dim]", PLAYER_INDEX))
                             live.refresh()
-                            _time.sleep(0.1)
+                            sig = _idle(0.3)
+                            if sig == "quit": return
+                            if sig == "back": return BACK
                 elif rnd == 1 and PLAYER_INDEX == seller:
                     mx = max(0, int(jnp.max(st.auction_bids)))
                     ch = _input_choice(live,st,NUM_COLORS,NUM_PLAYERS,
@@ -1052,7 +1106,15 @@ def _gameplay():
                         live.update(_render(STATE, NUM_COLORS, NUM_PLAYERS,
                                             "[dim]Auction in progress…[/dim]", PLAYER_INDEX))
                         live.refresh()
-                    _time.sleep(0.3)
+                    # This is where the seller sits while the bids come in --
+                    # the longest wait in the game, and the one place a stall
+                    # used to be unescapable.
+                    sig = _idle(0.3)
+                    if sig == "quit": return
+                    if sig == "back": return BACK
+                    if sig == "history" and len(HISTORY) > 1:
+                        VIEWING_HISTORY = True
+                        HIST_IDX = len(HISTORY) - 2
                 continue
 
             # ── produce/shopping modes — wait ──
@@ -1073,7 +1135,9 @@ def _gameplay():
                         live.update(_render(STATE, NUM_COLORS, NUM_PLAYERS,
                                             "[dim]Waiting for other player…[/dim]", PLAYER_INDEX))
                         live.refresh()
-                    _time.sleep(0.3)
+                    sig = _idle(0.3)
+                    if sig == "quit": return
+                    if sig == "back": return BACK
                 continue
 
             # ── not our turn ──
