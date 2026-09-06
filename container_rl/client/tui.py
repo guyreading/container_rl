@@ -360,6 +360,17 @@ def _opps(p, np_):
 # ── input helpers ────────────────────────────────────────────────────────
 
 def _input_number(live, state, nc, np_, prompt, max_val=999):
+    """Read a number between 1 and *max_val*.  ESC/q cancels and returns None.
+
+    The return value is always either None or inside ``1..max_val`` — callers
+    turn it straight into a list index, so anything else is a crash waiting to
+    happen.  Prompts with nine options or fewer answer on a single keypress,
+    and that shortcut used to hand back whatever digit was pressed: at the
+    two-option opponent picker a stray ``4`` came back as 4, and the list
+    index that followed raised IndexError out of the whole client — which over
+    ssh means the session just ends mid-game.  Out-of-range digits are ignored
+    instead, so a mistyped key is a no-op rather than a disconnect.
+    """
     buf = ""
     while True:
         live.update(_render(state, nc, np_, f"{prompt} [{buf}]", PLAYER_INDEX))
@@ -372,15 +383,28 @@ def _input_number(live, state, nc, np_, prompt, max_val=999):
         elif ch in ("\x7f","\x08"): buf=buf[:-1]
         elif ch in ("\x1b","q","Q"): return None
         elif ch.isdigit():
+            if not buf and max_val<=9:
+                # Single-keypress menus: only accept a digit that names one of
+                # the options.  0 is never an option — the list is 1-indexed.
+                v = int(ch)
+                if 1<=v<=max_val: return v
+                continue
             buf+=ch
-            if len(buf)==1 and max_val<=9: return int(buf)
     return None
 
 def _input_choice(live, state, nc, np_, options, header=""):
+    """Pick one of *options*.  Returns a 1-based index, or None if cancelled.
+
+    The bound check is deliberately repeated here rather than trusted from
+    :func:`_input_number`: every caller indexes a list with what comes back,
+    and an out-of-range answer takes the client down with it.
+    """
     p = header+"\n\n" if header else ""
     p += "\n".join(f"  {i+1}. {o}" for i,o in enumerate(options))
     p += "\n\n[dim]Number to select, ESC to cancel[/dim]"
-    return _input_number(live, state, nc, np_, p, len(options))
+    ch = _input_number(live, state, nc, np_, p, len(options))
+    if ch is None or not 1<=ch<=len(options): return None
+    return ch
 
 def _pick_opponent(live, state, nc, np_):
     cand = _opps(int(state.current_player), np_)
@@ -751,6 +775,121 @@ def _show_final_scores(state, nc, np_):
 
 # ── gameplay loop ────────────────────────────────────────────────────────
 
+def _take_action(live, ch, st, encoder):
+    """Run whatever action key *ch* selected, submenus and all."""
+    amap = {"0":ACTION_PASS," ":ACTION_PASS,"1":ACTION_BUY_FACTORY,"2":ACTION_BUY_WAREHOUSE,
+            "3":ACTION_PRODUCE,"4":ACTION_BUY_FROM_FACTORY_STORE,"5":ACTION_MOVE_LOAD,
+            "6":ACTION_MOVE_SEA,"7":ACTION_MOVE_AUCTION,"8":ACTION_TAKE_LOAN,"9":ACTION_REPAY_LOAN}
+    atype = amap[ch]
+    cancelled = False; aidx = None
+
+    if atype == ACTION_BUY_FACTORY:
+        r = _submenu_buy_factory(live, st, NUM_COLORS, NUM_PLAYERS)
+        if r is True: return
+        if r: aidx = encoder.encode(atype, r)
+    elif atype == ACTION_PRODUCE:
+        if int(st.produced_this_turn) > 0:
+            live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                "[yellow]You have already produced this turn.[/yellow]", PLAYER_INDEX))
+            live.refresh(); _time.sleep(1.2); cancelled = True
+        elif int(st.cash[PLAYER_INDEX]) < 1:
+            live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                "[yellow]Cannot afford produce — need $1 for union dues.[/yellow]", PLAYER_INDEX))
+            live.refresh(); _time.sleep(1.2); cancelled = True
+        else:
+            cancelled = _submenu_produce(live, st, NUM_COLORS, NUM_PLAYERS)
+    elif atype == ACTION_BUY_FROM_FACTORY_STORE:
+        cancelled = _submenu_buy_from_factory(live, st, NUM_COLORS, NUM_PLAYERS)
+    elif atype == ACTION_MOVE_LOAD:
+        cancelled = _submenu_move_load(live, st, NUM_COLORS, NUM_PLAYERS)
+    elif atype == ACTION_MOVE_AUCTION:
+        ship_loc = int(st.ship_location[PLAYER_INDEX])
+        if ship_loc != LOCATION_OPEN_SEA:
+            live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                "[yellow]Can only go to auction from Open Sea.[/yellow]", PLAYER_INDEX))
+            live.refresh(); _time.sleep(1.2); cancelled = True
+        else:
+            aidx = encoder.encode(atype, {})
+    elif atype == ACTION_MOVE_SEA:
+        ship_loc = int(st.ship_location[PLAYER_INDEX])
+        if ship_loc == LOCATION_OPEN_SEA:
+            live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                "[yellow]Already in Open Sea.[/yellow]", PLAYER_INDEX))
+            live.refresh(); _time.sleep(1.2); cancelled = True
+        else:
+            aidx = encoder.encode(atype, {})
+    elif atype == ACTION_BUY_WAREHOUSE:
+        wh = int(st.warehouse_count[PLAYER_INDEX])
+        cost = wh + 3
+        if wh >= 5:
+            live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                "[yellow]You already have the maximum number of warehouses (5).[/yellow]", PLAYER_INDEX))
+            live.refresh(); _time.sleep(1.2); cancelled = True
+        elif int(st.cash[PLAYER_INDEX]) < cost:
+            live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                f"[yellow]Cannot afford — need ${cost}, have ${int(st.cash[PLAYER_INDEX])}.[/yellow]", PLAYER_INDEX))
+            live.refresh(); _time.sleep(1.2); cancelled = True
+        else:
+            aidx = encoder.encode(atype, {})
+    elif atype == ACTION_TAKE_LOAN:
+        loans = int(st.loans[PLAYER_INDEX])
+        if loans >= 2:
+            live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                "[yellow]You already have the maximum number of loans (2).[/yellow]", PLAYER_INDEX))
+            live.refresh(); _time.sleep(1.2); cancelled = True
+        else:
+            aidx = encoder.encode(atype, {})
+    elif atype == ACTION_REPAY_LOAN:
+        loans = int(st.loans[PLAYER_INDEX])
+        if loans < 1:
+            live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                "[yellow]You have no loans to repay.[/yellow]", PLAYER_INDEX))
+            live.refresh(); _time.sleep(1.2); cancelled = True
+        elif int(st.cash[PLAYER_INDEX]) < 10:
+            live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
+                f"[yellow]Cannot afford — need $10, have ${int(st.cash[PLAYER_INDEX])}.[/yellow]", PLAYER_INDEX))
+            live.refresh(); _time.sleep(1.2); cancelled = True
+        else:
+            aidx = encoder.encode(atype, {})
+    elif atype in (ACTION_PASS,):
+        aidx = encoder.encode(atype, {})
+
+    if cancelled: return
+    if aidx is not None:
+        _send_action(aidx)
+        _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
+        # Auction pre-check: warn if ship not at Open Sea or no cargo.
+        if atype == ACTION_MOVE_AUCTION and STATE and not int(STATE.auction_active):
+            live.update(_render(STATE, NUM_COLORS, NUM_PLAYERS,
+                                "[yellow]Must be at Open Sea with cargo to hold an auction[/yellow]",
+                                PLAYER_INDEX))
+            live.refresh()
+            _key(1.5)
+
+def _dispatch_action(live, ch, st, encoder):
+    """Run an action, and survive it going wrong.
+
+    Anything raised in here used to unwind straight out of ``main``: over ssh
+    that shows as the session ending mid-game, with the traceback going to the
+    log file nobody is watching.  A menu is never worth the player's
+    connection, so report the failure on screen and let them keep playing —
+    the server still holds the authoritative state, so the turn is simply
+    un-taken.
+    """
+    try:
+        _take_action(live, ch, st, encoder)
+    except Exception:
+        import traceback as _tb
+        _tb.print_exc(file=sys.stderr)
+        with contextlib.suppress(OSError):
+            sys.stderr.flush()
+        if STATE is not None:
+            live.update(_render(STATE, NUM_COLORS, NUM_PLAYERS,
+                                "[red]That action hit a snag and was cancelled — "
+                                "your turn is unchanged.[/red]", PLAYER_INDEX))
+            live.refresh()
+            _key(2.0)
+
 def _gameplay():
     global STATE, STATE_META, FEEDBACK, HIST_IDX, VIEWING_HISTORY
     # Start from a clean slate.  These are module globals: joining a second
@@ -977,94 +1116,7 @@ def _gameplay():
                 continue
             if ch not in "0123456789 ": continue
 
-            amap = {"0":ACTION_PASS," ":ACTION_PASS,"1":ACTION_BUY_FACTORY,"2":ACTION_BUY_WAREHOUSE,
-                    "3":ACTION_PRODUCE,"4":ACTION_BUY_FROM_FACTORY_STORE,"5":ACTION_MOVE_LOAD,
-                    "6":ACTION_MOVE_SEA,"7":ACTION_MOVE_AUCTION,"8":ACTION_TAKE_LOAN,"9":ACTION_REPAY_LOAN}
-            atype = amap[ch]
-            cancelled = False; aidx = None
-
-            if atype == ACTION_BUY_FACTORY:
-                r = _submenu_buy_factory(live, st, NUM_COLORS, NUM_PLAYERS)
-                if r is True: continue
-                if r: aidx = encoder.encode(atype, r)
-            elif atype == ACTION_PRODUCE:
-                if int(st.produced_this_turn) > 0:
-                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
-                        "[yellow]You have already produced this turn.[/yellow]", PLAYER_INDEX))
-                    live.refresh(); _time.sleep(1.2); cancelled = True
-                elif int(st.cash[PLAYER_INDEX]) < 1:
-                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
-                        "[yellow]Cannot afford produce — need $1 for union dues.[/yellow]", PLAYER_INDEX))
-                    live.refresh(); _time.sleep(1.2); cancelled = True
-                else:
-                    cancelled = _submenu_produce(live, st, NUM_COLORS, NUM_PLAYERS)
-            elif atype == ACTION_BUY_FROM_FACTORY_STORE:
-                cancelled = _submenu_buy_from_factory(live, st, NUM_COLORS, NUM_PLAYERS)
-            elif atype == ACTION_MOVE_LOAD:
-                cancelled = _submenu_move_load(live, st, NUM_COLORS, NUM_PLAYERS)
-            elif atype == ACTION_MOVE_AUCTION:
-                ship_loc = int(st.ship_location[PLAYER_INDEX])
-                if ship_loc != LOCATION_OPEN_SEA:
-                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
-                        "[yellow]Can only go to auction from Open Sea.[/yellow]", PLAYER_INDEX))
-                    live.refresh(); _time.sleep(1.2); cancelled = True
-                else:
-                    aidx = encoder.encode(atype, {})
-            elif atype == ACTION_MOVE_SEA:
-                ship_loc = int(st.ship_location[PLAYER_INDEX])
-                if ship_loc == LOCATION_OPEN_SEA:
-                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
-                        "[yellow]Already in Open Sea.[/yellow]", PLAYER_INDEX))
-                    live.refresh(); _time.sleep(1.2); cancelled = True
-                else:
-                    aidx = encoder.encode(atype, {})
-            elif atype == ACTION_BUY_WAREHOUSE:
-                wh = int(st.warehouse_count[PLAYER_INDEX])
-                cost = wh + 3
-                if wh >= 5:
-                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
-                        "[yellow]You already have the maximum number of warehouses (5).[/yellow]", PLAYER_INDEX))
-                    live.refresh(); _time.sleep(1.2); cancelled = True
-                elif int(st.cash[PLAYER_INDEX]) < cost:
-                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
-                        f"[yellow]Cannot afford — need ${cost}, have ${int(st.cash[PLAYER_INDEX])}.[/yellow]", PLAYER_INDEX))
-                    live.refresh(); _time.sleep(1.2); cancelled = True
-                else:
-                    aidx = encoder.encode(atype, {})
-            elif atype == ACTION_TAKE_LOAN:
-                loans = int(st.loans[PLAYER_INDEX])
-                if loans >= 2:
-                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
-                        "[yellow]You already have the maximum number of loans (2).[/yellow]", PLAYER_INDEX))
-                    live.refresh(); _time.sleep(1.2); cancelled = True
-                else:
-                    aidx = encoder.encode(atype, {})
-            elif atype == ACTION_REPAY_LOAN:
-                loans = int(st.loans[PLAYER_INDEX])
-                if loans < 1:
-                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
-                        "[yellow]You have no loans to repay.[/yellow]", PLAYER_INDEX))
-                    live.refresh(); _time.sleep(1.2); cancelled = True
-                elif int(st.cash[PLAYER_INDEX]) < 10:
-                    live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
-                        f"[yellow]Cannot afford — need $10, have ${int(st.cash[PLAYER_INDEX])}.[/yellow]", PLAYER_INDEX))
-                    live.refresh(); _time.sleep(1.2); cancelled = True
-                else:
-                    aidx = encoder.encode(atype, {})
-            elif atype in (ACTION_PASS,):
-                aidx = encoder.encode(atype, {})
-
-            if cancelled: continue
-            if aidx is not None:
-                _send_action(aidx)
-                _wait_for_state(live, NUM_COLORS, NUM_PLAYERS)
-                # Auction pre-check: warn if ship not at Open Sea or no cargo.
-                if atype == ACTION_MOVE_AUCTION and STATE and not int(STATE.auction_active):
-                    live.update(_render(STATE, NUM_COLORS, NUM_PLAYERS,
-                                        "[yellow]Must be at Open Sea with cargo to hold an auction[/yellow]",
-                                        PLAYER_INDEX))
-                    live.refresh()
-                    _key(1.5)
+            _dispatch_action(live, ch, st, encoder)
 
 
 # ── main menu ────────────────────────────────────────────────────────────
@@ -1536,6 +1588,18 @@ def main():
                     result = _gameplay()
                     if result is BACK: continue  # back to game list
                     return
+    except Exception as e:
+        # Last line of defence.  An exception escaping here exits the process,
+        # and when the TUI is somebody's ssh login shell that reads as being
+        # kicked off the server with no explanation — stderr is the log file,
+        # not their terminal.  Say what happened before the screen goes.
+        import traceback as _tb
+        _tb.print_exc(file=_sys.stderr)
+        with contextlib.suppress(OSError):
+            _sys.stderr.flush()
+        console.print(f"[red]Something went wrong: {e}[/red]")
+        console.print("[dim]Details are in /tmp/container-tui.log.  Press any key.[/dim]")
+        _key(10)
     finally:
         _alt_screen(False)
         _exit_raw()
