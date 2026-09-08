@@ -72,6 +72,7 @@ class GameManager:
         self._ai_model_failed = False  # load/inference failed; use random legal play
         self._ai_slots: dict[int, list[int]] = {}  # game_id -> [ai_player_indices]
         self._mask_sizes: dict[tuple[int, int], int] = {}  # cache mask_size per (np, nc)
+        self._finished: set[int] = set()  # games already written off as finished
 
     # ------------------------------------------------------------------
     # create / join
@@ -318,7 +319,7 @@ class GameManager:
             game_over = bool(term) or int(new_state.game_over) > 0
 
             if game_over:
-                self.db.set_game_status(game_id, "finished")
+                self._mark_finished_if_over(game_id)
 
             # Broadcast to all connected players for this game
             state_blob = serialize_state(new_state)
@@ -469,6 +470,31 @@ class GameManager:
                 return
             self._play_ai_turns(game_id)
 
+    def _mark_finished_if_over(self, game_id: int) -> bool:
+        """Record the finish if the game is over.  True the first time it is.
+
+        Every exit from the AI loop goes through here.  ``game_over`` can be
+        set by any step that loop takes — including the ones inside
+        ``_play_ai_auction_bids``, which is where a game that runs out while
+        the AI seats are still bidding crosses the line — and three of the
+        loop's four exits used to leave without writing anything.  Nothing
+        later covered for it either: ``process_action`` refuses outright once
+        the game is over, so the row stayed on ``active`` for good,
+        ``finished_at`` was never stamped, and ``list_joinable_games`` went on
+        offering the finished game back to the players who were in it.
+
+        The ``_finished`` guard is what keeps a later call — a rejoin, say —
+        from stamping a second, wrong ``finished_at`` over the real one.
+        """
+        env = self._envs.get(game_id)
+        if env is None or int(env.state.game_over) <= 0:
+            return False
+        if game_id in self._finished:
+            return False
+        self._finished.add(game_id)
+        self.db.set_game_status(game_id, "finished")
+        return True
+
     def _play_ai_turns(self, game_id: int) -> None:
         """Continuously play AI turns until a human player's turn or game over.
 
@@ -530,8 +556,10 @@ class GameManager:
 
             # ── 4. Check for game over ──
             if bool(term) or int(new_state.game_over) > 0:
-                self.db.set_game_status(game_id, "finished")
                 break
+
+        # Whichever way the loop was left, the game may have ended on the way.
+        self._mark_finished_if_over(game_id)
 
     def _broadcast_state(self, game_id: int) -> None:
         """Send the current position to everyone at the table."""

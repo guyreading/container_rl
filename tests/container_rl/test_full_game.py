@@ -32,9 +32,9 @@ Two deliberate choices worth knowing about:
   are the bytes a player actually sends.
 * The game runs the shipped configuration, which offers ten of the env's
   eleven action types: ``ACTION_DOMESTIC_SALE`` needs ``use_domestic_sale``,
-  and the server never sets it.  The eleventh therefore gets its own test —
-  which currently xfails, because turning the flag on breaks mask building
-  outright.  ``test_the_domestic_sale_variant_is_playable`` has the details.
+  and the server never sets it.  The eleventh therefore gets its own test,
+  ``test_the_domestic_sale_variant_is_playable``, rather than a second full
+  game.
 * Two moves cannot be reached by playing well, only by being offered them.
   Seat 0 bids only when an opponent sells, and an opponent playing at random
   may never get a ship to sea, so that one is staged directly in
@@ -537,31 +537,26 @@ def test_the_table_is_told_about_the_finish(finished_game):
 
 
 @pytest.mark.slow
-@pytest.mark.xfail(
-    reason="a game that ends on an AI's move can leave the row 'active' — see docstring",
-    strict=False,
-)
 def test_a_finished_game_is_marked_finished(finished_game):
-    """The row this game leaves behind says it is still being played.
+    """The row the game leaves behind has to say the game is over.
 
-    ``_play_ai_turns`` only writes ``finished`` on the branch it takes after
-    stepping an AI seat.  Three of its four exits — the game already over at
-    the top of the loop, an auction still owed a human answer, and the next
-    turn belonging to a human — leave the loop without writing anything, and
-    the env can cross the end of the game inside ``_play_ai_auction_bids``
-    just before one of them.  ``process_action`` cannot cover for it either:
-    it refuses outright once ``game_over`` is set, so no later move puts the
-    status right.
+    This one is the reason ``_mark_finished_if_over`` exists.  This very game
+    ends inside ``_play_ai_auction_bids``, with the auction still open and the
+    next turn belonging to seat 0 — and ``_play_ai_turns`` used to write
+    ``finished`` only on the branch it takes after stepping an AI seat, so
+    that exit wrote nothing.  Nothing later covered for it, because
+    ``process_action`` refuses outright once ``game_over`` is set.
 
-    A row left on ``active`` is not cosmetic.  ``list_joinable_games`` shows
+    A row left on ``active`` is not cosmetic: ``list_joinable_games`` shows
     active games back to the players who were in them, so the finished game
-    keeps being offered as one to rejoin, and ``finished_at`` is never
-    stamped.  Marked xfail rather than deleted: the assertion is what the
-    server should do, and this is the test that should go green when it does.
+    kept being offered as one to rejoin, and ``finished_at`` was never
+    stamped.
     """
     manager, game_id, _tester, _sent = finished_game
+    game = manager.db.get_game_by_id(game_id)
 
-    assert manager.db.get_game_by_id(game_id)["status"] == "finished"
+    assert game["status"] == "finished"
+    assert game["finished_at"], "the game was closed without a finish time"
 
 
 def _staged_game(tmp_path):
@@ -624,26 +619,19 @@ def test_seat_zero_can_bid_in_an_opponents_auction(tmp_path):
     assert int(after.auction_active) == 0 or int(after.auction_round) == 1
 
 
-@pytest.mark.xfail(
-    reason="use_domestic_sale=True cannot build its masks at all — see docstring",
-    strict=True,
-)
 def test_the_domestic_sale_variant_is_playable(tmp_path):
-    """The eleventh move cannot be played, because the variant does not run.
+    """The eleventh move, which the shipped configuration does not offer.
 
-    ``ACTION_DOMESTIC_SALE`` only appears on the menu when
-    ``use_domestic_sale`` is set, and the server never sets it — so the full
-    game above covers the ten moves the shipped configuration offers and this
-    is the eleventh, tested on its own.
+    ``ACTION_DOMESTIC_SALE`` only reaches the menu when ``use_domestic_sale``
+    is set, and the server never sets it — so the full game above covers the
+    ten moves the shipped configuration has, and the eleventh is played here.
 
-    It does not get as far as the move.  The price-slot mask that the flag
-    switches on reads a whole price row, ``state.factory_store[player, c]``,
-    which is ``PRICE_SLOTS`` wide, and tries to ``jnp.where`` it against a mask
-    that is ``PRICE_SLOTS + 1`` wide because of the no-op at index 0.  Those do
-    not broadcast, so ``_action_masks`` raises for every state — and since
-    ``observation`` builds the masks, an env with the variant on cannot even
-    ``reset``.  Strict xfail: when the widths are reconciled this should start
-    passing, and it should be noticed when it does.
+    It used not to get as far as the move.  The price-slot mask the flag
+    switches on read one colour's price row at a time, ``PRICE_SLOTS`` wide,
+    and tried to ``jnp.where`` it against a mask that is ``PRICE_SLOTS + 1``
+    wide because of the no-op at index 0.  Those do not broadcast, so
+    ``_action_masks`` raised for every state — and since ``observation``
+    builds the masks, an env with the variant on could not even ``reset``.
     """
     manager, game_id, env, sent = _staged_game(tmp_path)
     env.func_env.params = env.func_env.params.replace(use_domestic_sale=True)
@@ -651,13 +639,23 @@ def test_the_domestic_sale_variant_is_playable(tmp_path):
     state = manager.get_state(game_id)
     assert int(state.current_player) == HUMAN
 
+    tester = HumanSeat(NUM_PLAYERS, NUM_COLORS, use_domestic_sale=True)
+
     # Reachable, not merely accepted: the env dispatches the action whatever
     # the flag says, so what the flag has to buy is a legal move on the menu.
     masks = env.func_env._action_masks(state, env.func_env.params)
     assert int(masks["action_type"][ACTION_DOMESTIC_SALE + 1]) == 1, \
         "the variant is on but the move is still masked out"
 
-    tester = HumanSeat(NUM_PLAYERS, NUM_COLORS, use_domestic_sale=True)
+    # Seat 0 opens holding exactly one container, of its own colour, at $2.
+    # That one container is the whole of what may be offered: a mask that
+    # waved every price through would invite a player to "sell" an empty slot,
+    # and the sale would take the action and silently do nothing.
+    colour, slot = tester._own_container(state)
+    assert np.flatnonzero(np.asarray(masks["price_slot"])).tolist() == [slot + 1], \
+        "the price slots on offer are not the ones with a container in them"
+    assert int(masks["color"][colour + 1]) == 1, "the colour held is not on offer"
+
     action = tester.build(state, ACTION_DOMESTIC_SALE)
     assert action is not None, "seat 0 starts with a container; it has one to sell"
 
