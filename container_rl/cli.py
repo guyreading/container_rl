@@ -274,7 +274,12 @@ def _render_frame(
     header = f"🚢 CONTAINER  │  Player {turn + 1}'s turn  │  Action {actions + 1}/2"
     if hist_msg:
         header += f"  │  {hist_msg}"
-    elements.append(Panel(Text(header, style="bold white on blue")))
+    # ``from_markup``: the history note appended above is markup, and a plain
+    # ``Text`` would print ``[bold yellow]...[/bold yellow]`` verbatim across the
+    # top line.  The band that used to sit behind it ("white on blue") is gone
+    # for the same reason it went from the ssh client -- it fought with every
+    # other panel on the board.
+    elements.append(Panel(Text.from_markup(header, style="bold", justify="center")))
 
     # ── supply ──
     elements.append(Panel(_supply_bar(state, nc), title="Supply", border_style="yellow"))
