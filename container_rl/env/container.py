@@ -1033,13 +1033,25 @@ class ContainerFunctional(
                               jnp.where((jnp.arange(slot_size) >= 1) & (jnp.arange(slot_size) <= PRODUCE_CHOICES), 1, 0),
                               slot_mask)
         if params.use_domestic_sale:
-            for c in range(nc):
-                slot_mask = jnp.where(is_produce, slot_mask,
-                                      jnp.where(state.factory_store[player, c] > 0,
-                                                jnp.ones(slot_size, dtype=jnp.int32), slot_mask))
-                slot_mask = jnp.where(is_produce, slot_mask,
-                                      jnp.where(state.harbour_store[player, c] > 0,
-                                                jnp.ones(slot_size, dtype=jnp.int32), slot_mask))
+            # Mirror of the colour mask above, reduced the other way: that one
+            # sums a colour's row across the price slots, this one sums a price
+            # slot's column across the colours.  A slot is on offer if the
+            # player holds anything at that price in either store.
+            #
+            # Summing matters.  Reading one colour's row at a time gives a
+            # PRICE_SLOTS-wide vector, and the mask is PRICE_SLOTS + 1 wide
+            # because of the no-op at index 0 — the two do not broadcast, so
+            # doing it per colour raised for every state, and since
+            # ``observation`` builds the masks, a game with the variant on
+            # could not even be reset.
+            has_slot = (jnp.sum(state.factory_store[player], axis=0)
+                        + jnp.sum(state.harbour_store[player], axis=0)) > 0  # (PRICE_SLOTS,)
+            has_slot11 = jnp.concatenate(
+                [jnp.zeros(1, dtype=jnp.bool_), has_slot])  # (slot_size,)
+            slot_mask = jnp.where(is_produce,
+                                  slot_mask,
+                                  jnp.where(has_slot11, jnp.ones((), dtype=jnp.int32),
+                                            slot_mask))
         slot_mask = jnp.where(is_produce, slot_mask,
                               jnp.concatenate([jnp.zeros(1, dtype=jnp.int32),
                                                (slot_mask[1:] > 0).astype(jnp.int32)]))

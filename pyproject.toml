@@ -83,6 +83,14 @@ select = [
     "UP",  # pyupgrade
 ]
 
+[tool.pytest.ini_options]
+markers = [
+    # tests/container_rl/test_full_game.py plays a whole game through the
+    # server with the env in eager mode, so it costs minutes rather than
+    # milliseconds.  Skip it with: pytest -m "not slow"
+    "slow: plays a full game end to end",
+]
+
 [tool.coverage.run]
 branch = true
 parallel = true
