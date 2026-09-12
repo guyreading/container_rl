@@ -6,6 +6,7 @@ The environment supports 2-4 players, with the agent controlling player 0.
 
 from typing import TYPE_CHECKING, NamedTuple
 
+import gymnasium as gym
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -2076,6 +2077,27 @@ class ContainerJaxEnv(FunctionalJaxEnv, EzPickle):
         env = ContainerFunctional(**kwargs)
         env.transform(jax.jit)
         super().__init__(env, metadata=self.metadata, render_mode=render_mode)
+
+    def reset_state_only(self, *, seed: int | None = None) -> EnvState:
+        """Initialise a new episode and return the state, skipping the obs.
+
+        ``reset()`` also builds the policy observation, and the bulk of that
+        is ``_action_masks`` -- the single most expensive thing the env does.
+        The server only ever wants the freshly-seeded ``state``: it serialises
+        that into the database and computes masks later, per request, for
+        whoever is actually to move.  Paying for an observation nobody reads
+        is most of the cost of starting a game (~5x at four players).
+
+        The rng is drawn exactly as ``reset()`` draws it, so the state this
+        returns is identical to the one ``reset(seed=seed)`` would leave on
+        the env.
+        """
+        gym.Env.reset(self, seed=seed)
+        if seed is not None:
+            self.rng = random.PRNGKey(seed)
+        rng, self.rng = random.split(self.rng)
+        self.state = self.func_env.initial(rng=rng)
+        return self.state
 
 
 
