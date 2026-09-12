@@ -35,6 +35,7 @@ from container_rl.env.container import (
     ACTION_PRODUCE,
     ACTION_REPAY_LOAN,
     ACTION_TAKE_LOAN,
+    CONTAINER_SUPPLY_CHOICES,
     FACTORY_STORAGE_MULTIPLIER,
     HARBOUR_PRICE_CHOICES,
     HARBOUR_PRICE_MIN,
@@ -50,6 +51,7 @@ from container_rl.env.container import (
     SHIP_CAPACITY,
     ActionEncoder,
     EnvState,
+    default_container_supply,
 )
 from container_rl.server.protocol import deserialize_state
 
@@ -1274,30 +1276,42 @@ def _main_menu():
             return selected + 1
 
 def _create_screen():
-    """Create game with slider bars for player count (3-5) and AI opponents.
+    """Create game with slider bars for players, AI opponents and containers.
 
-    ↑↓/jk switch between the two selectors.  ←→/hl adjust the selected bar.
-    Colours always 5.
+    ↑↓/jk switch between the selectors.  ←→/hl adjust the selected bar.
+    Colours always 5.  The container bar picks the starting supply per colour
+    and follows the rules default (4 per player) until it is adjusted by hand.
     """
     num_players = 3
     ai_players = 0
-    selected = 0  # 0 = num_players, 1 = ai_players
+    supply_idx = CONTAINER_SUPPLY_CHOICES.index(default_container_supply(num_players))
+    supply_pinned = False  # True once the player moves the container bar
+    selected = 0  # 0 = num_players, 1 = ai_players, 2 = containers
     while True:
+        containers = CONTAINER_SUPPLY_CHOICES[supply_idx]
         bar_p = ["█" if i < num_players else "░" for i in range(5)]
         bar_a = ["█" if i < ai_players else "░" for i in range(5)]
+        bar_c = ["█" if i <= supply_idx else "░" for i in range(len(CONTAINER_SUPPLY_CHOICES))]
         left_p = "◂" if num_players > 3 else " "
         right_p = "▸" if num_players < 5 else " "
         left_a = "◂" if ai_players > 0 else " "
         right_a = "▸" if ai_players < num_players - 1 else " "
+        left_c = "◂" if supply_idx > 0 else " "
+        right_c = "▸" if supply_idx < len(CONTAINER_SUPPLY_CHOICES) - 1 else " "
 
         sel_p = " [bold yellow]◀[/]" if selected == 0 else ""
         sel_a = " [bold yellow]◀[/]" if selected == 1 else ""
+        sel_c = " [bold yellow]◀[/]" if selected == 2 else ""
+        std = default_container_supply(num_players)
+        note_c = "standard" if containers == std else f"standard is {std}"
 
         body = f"[bold]Create New Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]\n\n"
         body += f"  [dim]{left_p}[/dim]  [bold yellow]{''.join(bar_p)}[/bold yellow] {num_players}  [dim]{right_p}[/dim]{sel_p}\n"
         body += f"  [dim]Players[/dim]\n"
         body += f"  [dim]{left_a}[/dim]  [bold yellow]{''.join(bar_a)}[/bold yellow] {ai_players}  [dim]{right_a}[/dim]{sel_a}\n"
-        body += f"  [dim]AI opponents[/dim]\n\n"
+        body += f"  [dim]AI opponents[/dim]\n"
+        body += f"  [dim]{left_c}[/dim]  [bold yellow]{''.join(bar_c)}[/bold yellow] {containers}  [dim]{right_c}[/dim]{sel_c}\n"
+        body += f"  [dim]Containers per colour ({note_c})[/dim]\n\n"
         if ai_players > 0:
             body += f"[dim]AI will fill the last {ai_players} slot(s).[/dim]\n\n"
         body += f"[dim]←→/hl adjust  •  ↑↓/jk select  •  Enter to create  •  Esc to back[/dim]"
@@ -1307,24 +1321,40 @@ def _create_screen():
         if ch in ("\x1b", "q", "Q"):
             return None
         if ch in ("\x1b[A", "k", "K"):
-            selected = 0
+            selected = (selected - 1) % 3
         elif ch in ("\x1b[B", "j", "J"):
-            selected = 1
+            selected = (selected + 1) % 3
         elif ch in ("\x1b[D", "h", "H"):
             if selected == 0 and num_players > 3:
                 num_players -= 1
                 if ai_players >= num_players:
                     ai_players = num_players - 1
+                if not supply_pinned:
+                    supply_idx = CONTAINER_SUPPLY_CHOICES.index(default_container_supply(num_players))
             elif selected == 1 and ai_players > 0:
                 ai_players -= 1
+            elif selected == 2 and supply_idx > 0:
+                supply_idx -= 1
+                supply_pinned = True
         elif ch in ("\x1b[C", "l", "L"):
             if selected == 0 and num_players < 5:
                 num_players += 1
+                if not supply_pinned:
+                    supply_idx = CONTAINER_SUPPLY_CHOICES.index(default_container_supply(num_players))
             elif selected == 1 and ai_players < num_players - 1:
                 ai_players += 1
+            elif selected == 2 and supply_idx < len(CONTAINER_SUPPLY_CHOICES) - 1:
+                supply_idx += 1
+                supply_pinned = True
         elif ch in ("\r", "\n"):
             break
-    return {"player_name": MY_NAME, "num_players": num_players, "num_colors": 5, "ai_count": ai_players}
+    return {
+        "player_name": MY_NAME,
+        "num_players": num_players,
+        "num_colors": 5,
+        "ai_count": ai_players,
+        "containers_per_color": CONTAINER_SUPPLY_CHOICES[supply_idx],
+    }
 
 def _join_screen():
     console.clear()

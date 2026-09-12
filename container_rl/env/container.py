@@ -45,7 +45,10 @@ INITIAL_CASH = 20
 LOAN_AMOUNT = 10
 LOAN_INTEREST = 1
 FACTORY_STORAGE_MULTIPLIER = 2  # storage = factories * 2
-INITIAL_CONTAINER_SUPPLY = 12  # per color
+CONTAINERS_PER_PLAYER = 4  # rules: supply per colour = 4 x number of players
+# Starting supplies per colour offered in the lobby.  Covers every rules default
+# (12/16/20 for 3/4/5 players) plus the "play with fewer containers" variants.
+CONTAINER_SUPPLY_CHOICES = (4, 6, 8, 9, 12, 15, 16, 20)
 
 # Hard cap on episode length.  Games normally end when two container colours
 # are exhausted; this is the backstop for games (and training rollouts) where
@@ -120,6 +123,11 @@ def mask_size(num_players: int, num_colors: int) -> int:
         + (PRICE_SLOTS + 1)
         + PURCHASE_SIZE
     )
+
+
+def default_container_supply(num_players: int) -> int:
+    """Standard starting container supply per colour: 4 per player."""
+    return num_players * CONTAINERS_PER_PLAYER
 
 
 def _secret_card_deck(num_colors: int) -> jnp.ndarray:
@@ -433,6 +441,7 @@ class ContainerParams:
     num_players: int = 2
     num_colors: int = 5
     use_domestic_sale: bool = False  # whether to include variant action
+    containers_per_color: int = 0  # 0 = rules default (4 x num_players)
 
 
 # ============================================================================
@@ -1789,8 +1798,9 @@ class ContainerFunctional(
             color = i % params.num_colors
             factory_store = factory_store.at[i, color, 1].set(1)  # price slot 1 = $2
 
-        # Container supply: 4 per player per color
-        container_supply = jnp.full(params.num_colors, params.num_players * 4, dtype=jnp.int32)
+        # Container supply: configurable per colour, defaulting to 4 per player
+        supply = params.containers_per_color or default_container_supply(params.num_players)
+        container_supply = jnp.full(params.num_colors, supply, dtype=jnp.int32)
 
         state = EnvState(
             cash=jnp.full(params.num_players, INITIAL_CASH, dtype=jnp.int32),

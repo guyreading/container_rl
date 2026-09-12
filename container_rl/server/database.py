@@ -10,7 +10,7 @@ ssh_keys
 
 games
     id, code (unique), status (lobby|active|finished),
-    num_players, num_colors, seed, created_at, finished_at
+    num_players, num_colors, containers_per_color, seed, created_at, finished_at
 
 game_players
     game_id, player_index, player_id, is_ai, joined_at
@@ -81,6 +81,7 @@ class Database:
                     status TEXT NOT NULL DEFAULT 'lobby',
                     num_players INTEGER NOT NULL,
                     num_colors INTEGER NOT NULL DEFAULT 5,
+                    containers_per_color INTEGER NOT NULL DEFAULT 0,
                     seed INTEGER NOT NULL,
                     created_at TEXT DEFAULT (datetime('now')),
                     finished_at TEXT
@@ -119,6 +120,12 @@ class Database:
         if "is_ai" not in cols:
             conn.execute(
                 "ALTER TABLE game_players ADD COLUMN is_ai INTEGER NOT NULL DEFAULT 0"
+            )
+        game_cols = {r["name"] for r in conn.execute("PRAGMA table_info(games)")}
+        if "containers_per_color" not in game_cols:
+            # 0 means "rules default", so old games keep the supply they started with.
+            conn.execute(
+                "ALTER TABLE games ADD COLUMN containers_per_color INTEGER NOT NULL DEFAULT 0"
             )
 
     # ------------------------------------------------------------------
@@ -187,16 +194,21 @@ class Database:
 
     def create_game(
         self, num_players: int, num_colors: int = 5, seed: int | None = None,
+        containers_per_color: int = 0,
     ) -> tuple[int, str]:
-        """Create a new game.  Returns (game_id, game_code)."""
+        """Create a new game.  Returns (game_id, game_code).
+
+        *containers_per_color* is the starting container supply per colour;
+        0 means the rules default of 4 per player.
+        """
         code = _generate_code()
         if seed is None:
             seed = int(time.time() * 1000) % (2**31)
         with self._connect() as conn:
             cur = conn.execute(
-                """INSERT INTO games (code, num_players, num_colors, seed)
-                   VALUES (?, ?, ?, ?)""",
-                (code, num_players, num_colors, seed),
+                """INSERT INTO games (code, num_players, num_colors, containers_per_color, seed)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (code, num_players, num_colors, containers_per_color, seed),
             )
             game_id = cur.lastrowid
         return game_id, code

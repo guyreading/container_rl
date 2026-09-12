@@ -81,11 +81,16 @@ class GameManager:
     def create_game(
         self, player_name: str, password: str | None,
         num_players: int, num_colors: int = 5, seed: int | None = None,
-        ai_count: int = 0,
+        ai_count: int = 0, containers_per_color: int = 0,
     ) -> dict:
-        """Create a new game and join as the first player (slot 0)."""
+        """Create a new game and join as the first player (slot 0).
+
+        *containers_per_color*: starting supply per colour; 0 = rules default.
+        """
         player_id = self.db.upsert_player(player_name, password)
-        game_id, code = self.db.create_game(num_players, num_colors, seed)
+        game_id, code = self.db.create_game(
+            num_players, num_colors, seed, containers_per_color,
+        )
         self.db.assign_player_slot(game_id, player_id, 0)
         self._seed_ai_slots(game_id, num_players, ai_count)
         return {"game_id": game_id, "code": code, "player_index": 0, "ai_count": ai_count}
@@ -93,14 +98,17 @@ class GameManager:
     def create_game_trusted(
         self, player_name: str,
         num_players: int, num_colors: int = 5, seed: int | None = None,
-        ai_count: int = 0,
+        ai_count: int = 0, containers_per_color: int = 0,
     ) -> dict:
         """Create a new game with a trusted player name (no password check).
 
         *ai_count*: how many AI opponents (filled from the last slots).
+        *containers_per_color*: starting supply per colour; 0 = rules default.
         """
         player_id = self.db.upsert_player_trusted(player_name)
-        game_id, code = self.db.create_game(num_players, num_colors, seed)
+        game_id, code = self.db.create_game(
+            num_players, num_colors, seed, containers_per_color,
+        )
         self.db.assign_player_slot(game_id, player_id, 0)
         self._seed_ai_slots(game_id, num_players, ai_count)
         return {"game_id": game_id, "code": code, "player_index": 0, "ai_count": ai_count}
@@ -214,6 +222,7 @@ class GameManager:
             env = ContainerJaxEnv(
                 num_players=game["num_players"],
                 num_colors=game["num_colors"],
+                containers_per_color=game.get("containers_per_color", 0),
             )
             env.reset(seed=game["seed"])
             self._envs[game_id] = env
@@ -236,6 +245,7 @@ class GameManager:
             env = ContainerJaxEnv(
                 num_players=game["num_players"],
                 num_colors=game["num_colors"],
+                containers_per_color=game.get("containers_per_color", 0),
             )
             blob = self.db.load_state(game_id)
             if blob:
