@@ -338,6 +338,11 @@ class GameServer:
         sel.register(server_sock, selectors.EVENT_READ, data=None)
 
         self._running = True
+        # Warm JAX before anyone connects.  The accept loop below is single
+        # threaded, so the first game's cold start would otherwise block every
+        # other client too, not just the player who created it.
+        threading.Thread(target=self.manager.warm_up, name="jax-warmup",
+                         daemon=True).start()
         logger.info("Server listening on %s:%d", self.host, self.port)
         print(f"Container game server listening on {self.host}:{self.port}")
         print(f"Maintainer token: {self.maintainer_token}")

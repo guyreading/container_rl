@@ -58,6 +58,10 @@ _MASK_HEADS = ("action_type", "opponent", "color", "price_slot", "purchase")
 MAX_AI_TURN_STEPS = 200
 MAX_AI_CONTINUATION_STEPS = 50
 
+# Player counts warmed at boot: the ones the create screen can produce first,
+# then the rest of the range the protocol accepts.
+WARMUP_PLAYER_COUNTS = (3, 4, 5, 2, 6)
+
 
 class GameManager:
     def __init__(self, db: Database, broadcast: Callable[[int, str, Any], None],
@@ -224,7 +228,7 @@ class GameManager:
                 num_colors=game["num_colors"],
                 containers_per_color=game.get("containers_per_color", 0),
             )
-            env.reset(seed=game["seed"])
+            env.reset_state_only(seed=game["seed"])
             self._envs[game_id] = env
             self._encoders[game_id] = ActionEncoder(game["num_players"], game["num_colors"])
             self._save_state(game_id, env.state)
@@ -233,6 +237,30 @@ class GameManager:
             # broadcast state_update before the caller has sent game_started.
             # Callers invoke play_ai_turn_if_needed() after announcing the start.
             return True
+
+    def warm_up(self, num_colors: int = 5) -> None:
+        """Pay JAX's first-use costs at boot instead of on a player's first game.
+
+        Two separate costs hide behind the first ``reset``: bringing up the
+        JAX backend at all (~4s, once per process) and filling JAX's eager
+        dispatch caches for each array shape the env uses (~0.1-0.8s, once
+        per player count).  Neither is compilation we can skip -- jit is off
+        for the server -- so the only thing to do with them is move them off
+        the path a player waits on.
+
+        A full ``reset`` is used deliberately: it warms the mask/observation
+        shapes too, which every later ``get_state`` and action goes through.
+        The envs built here are thrown away; only the caches survive.
+        """
+        for num_players in WARMUP_PLAYER_COUNTS:
+            try:
+                env = ContainerJaxEnv(num_players=num_players, num_colors=num_colors)
+                env.reset(seed=0)
+            except Exception:
+                logger.exception("Warm-up failed for %d players", num_players)
+                return
+        logger.info("JAX warm-up complete for player counts %s",
+                    ", ".join(str(n) for n in WARMUP_PLAYER_COUNTS))
 
     def load_or_create_env(self, game_id: int) -> ContainerJaxEnv:
         """Return the live env for *game_id*, loading from DB if needed."""
@@ -251,7 +279,7 @@ class GameManager:
             if blob:
                 env.state = deserialize_state(blob)
             else:
-                env.reset(seed=game["seed"])
+                env.reset_state_only(seed=game["seed"])
             self._envs[game_id] = env
             self._encoders[game_id] = ActionEncoder(game["num_players"], game["num_colors"])
             return env

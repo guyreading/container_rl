@@ -1423,6 +1423,21 @@ def _show_game_list(games: list[dict]) -> str | None:
         return games[selected]["code"]
     return _read_line("Enter game code:")
 
+def _show_wait(message: str) -> None:
+    """Draw a centered status panel while the server works.
+
+    Without this the create screen simply stops responding for however long
+    the server takes, which reads as a hang rather than as progress.
+    """
+    console.clear()
+    console.print(
+        Align.center(
+            Panel(Text.from_markup(f"[bold]{message}[/bold]"), border_style="green"),
+            vertical="middle", height=console.height,
+        )
+    )
+
+
 def _lobby():
     global PLAYER_NAMES, NUM_PLAYERS, GAME_CODE
     lobby_players = [{"player_index": idx, "name": name} for idx, name in PLAYER_NAMES.items()]
@@ -1600,8 +1615,11 @@ def main():
                 if cfg is BACK: continue
                 MY_NAME = cfg["player_name"]
                 CLIENT.send("create_game", cfg)
+                _waiting_for_start = cfg.get("ai_count", 0) > 0
+                _show_wait("Creating game...")
                 _started = False
-                for _i in range(50):
+                _create_err = None
+                for _i in range(100):
                     msgs = _drain_server()
                     for m in msgs:
                         if m.get("type") == "game_created":
@@ -1615,9 +1633,28 @@ def main():
                         if m.get("type") == "game_started":
                             _started = True
                             GAME_STATUS = "active"
-                    if GAME_ID and (GAME_STATUS == "active" or _started):
+                        if m.get("type") == "error":
+                            _create_err = m.get("payload", {}).get("message", "")
+                    # Only an AI-filled game starts on its own, and only that
+                    # case is worth holding the screen for.  A game waiting on
+                    # human players never sends ``game_started`` here, so
+                    # waiting for one just burned the full timeout -- five
+                    # seconds of dead create screen before the lobby appeared.
+                    # ``_lobby`` listens for ``game_started`` itself, so
+                    # leaving early costs nothing either way.
+                    if _create_err is not None:
                         break
-                    _time.sleep(0.1)
+                    if GAME_ID and (GAME_STATUS == "active" or _started
+                                    or not _waiting_for_start):
+                        break
+                    if _i == 2:
+                        _show_wait("Setting up the board...")
+                    # ``_key`` rather than ``sleep``: a raw-mode wait that does
+                    # not read answers no key at all for its whole duration.
+                    _key(0.05)
+                if _create_err is not None:
+                    console.print(f"[red]{_create_err}[/red]"); _key(2)
+                    continue
                 if GAME_ID is None:
                     console.print("[red]Failed to create game.[/red]"); _key(2)
                     continue
