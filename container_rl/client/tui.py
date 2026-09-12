@@ -1307,11 +1307,8 @@ def _create_screen():
 
         body = f"[bold]Create New Game[/bold]\n[dim]Playing as: {MY_NAME}[/dim]\n\n"
         body += f"  [dim]Players[/dim]                          [dim]{left_p}[/dim]  [bold yellow]{''.join(bar_p)}[/bold yellow] {num_players}  [dim]{right_p}[/dim]{sel_p}\n\n"
-        # body += f"  \n\n"
         body += f"  [dim]AI opponents[/dim]                     [dim]{left_a}[/dim]  [bold yellow]{''.join(bar_a)}[/bold yellow] {ai_players}  [dim]{right_a}[/dim]{sel_a}\n\n"
-        # body += f"  [dim]AI opponents[/dim]\n\n"
         body += f"  [dim]No Containers {note_c}[/dim]   [dim]{left_c}[/dim]  [bold yellow]{''.join(bar_c)}[/bold yellow] {containers}  [dim]{right_c}[/dim]{sel_c}\n"
-        # body += f"  [dim]Containers per colour ({note_c})[/dim]\n\n"
         if ai_players > 0:
             body += f"[dim]AI will fill the last {ai_players} slot(s).[/dim]\n\n"
         body += f"[dim]←→/hl adjust  •  ↑↓/jk select  •  Enter to create  •  Esc to back[/dim]"
