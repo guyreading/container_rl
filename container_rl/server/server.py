@@ -16,6 +16,7 @@ import sys
 import threading
 from typing import Any
 
+from container_rl.env.container import CONTAINER_SUPPLY_CHOICES
 from container_rl.server.database import Database
 from container_rl.server.game_manager import GameManager, _state_to_json_data
 from container_rl.server.protocol import pack_message, recv_message
@@ -80,6 +81,7 @@ class ClientHandler:
             num_players = int(p.get("num_players", 2))
             num_colors = int(p.get("num_colors", 5))
             ai_count = int(p.get("ai_count", 0))
+            containers_per_color = int(p.get("containers_per_color", 0))
             seed = p.get("seed")
             if seed is not None:
                 seed = int(seed)
@@ -89,10 +91,15 @@ class ClientHandler:
                 raise ValueError("num_players must be 2–6.")
             if ai_count < 0 or ai_count >= num_players:
                 raise ValueError(f"ai_count must be 0–{num_players - 1}.")
+            if containers_per_color and containers_per_color not in CONTAINER_SUPPLY_CHOICES:
+                raise ValueError(
+                    "containers_per_color must be one of "
+                    f"{', '.join(str(c) for c in CONTAINER_SUPPLY_CHOICES)}."
+                )
 
             trusted = self.server._is_localhost(self.addr)
-            result = self.server.manager.create_game_trusted(name, num_players, num_colors, seed, ai_count=ai_count) if trusted else \
-                     self.server.manager.create_game(name, password, num_players, num_colors, seed, ai_count=ai_count)
+            result = self.server.manager.create_game_trusted(name, num_players, num_colors, seed, ai_count=ai_count, containers_per_color=containers_per_color) if trusted else \
+                     self.server.manager.create_game(name, password, num_players, num_colors, seed, ai_count=ai_count, containers_per_color=containers_per_color)
             self.game_id = result["game_id"]
             self.player_index = result["player_index"]
             self.server._register_client(self)
