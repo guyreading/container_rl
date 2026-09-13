@@ -1,7 +1,9 @@
 """Container game as a Gymnasium functional JAX environment.
 
 This implements the Container board game as described in container_rules.md.
-The environment supports 2-4 players, with the agent controlling player 0.
+The environment supports 2-5 players, with the agent controlling player 0.
+Observation and action shapes are the same for every player count, so one
+policy can be trained on and play any of them.
 """
 
 from typing import TYPE_CHECKING, NamedTuple
@@ -29,7 +31,7 @@ RenderStateType = tuple["pygame.Surface", str, int]  # noqa: F821
 # Constants & Configuration
 # ============================================================================
 
-MAX_PLAYERS = 4
+MAX_PLAYERS = 5  # the rules support 2-5; observation and action shapes are sized for 5
 MAX_COLORS = 5
 MAX_FACTORIES_PER_PLAYER = 4
 MAX_WAREHOUSES_PER_PLAYER = 5
@@ -49,6 +51,14 @@ CONTAINERS_PER_PLAYER = 4  # rules: supply per colour = 4 x number of players
 # Starting supplies per colour offered in the lobby.  Covers every rules default
 # (12/16/20 for 3/4/5 players) plus the "play with fewer containers" variants.
 CONTAINER_SUPPLY_CHOICES = (4, 6, 8, 9, 12, 15, 16, 20)
+
+# Value written into every observation element of a seat with no player in it
+# (a 3-player game fills seats 3 and 4 with it).  It has to differ from 0, which
+# is a real reading for nearly every per-seat feature, and it avoids -1, which is
+# the special 5/10 secret card.  Cash can in principle go negative after a
+# rejected auction, so no single value is collision-proof on its own: the
+# ``seat_present`` flags in the game-state block are the unambiguous signal.
+NULL_OBS = -2.0
 
 # Hard cap on episode length.  Games normally end when two container colours
 # are exhausted; this is the backstop for games (and training rollouts) where
@@ -102,12 +112,19 @@ def head_sizes(num_players: int, num_colors: int) -> list[int]:
     (initial action) mode no-op is masked out on every head; during
     sequential (continuation) mode irrelevant heads are forced to no-op.
 
+    The opponent head is always ``MAX_PLAYERS`` wide — no-op plus one slot
+    for each of the up to four other seats, clockwise — whatever
+    ``num_players`` is.  Slots for seats nobody occupies are masked, so a
+    policy trained at one player count can act at any other.
+    ``num_players`` is kept in the signature for callers but no longer
+    affects the result.
+
     Purchase head (always 32): index 0=no-op, 1-5=harbour $2-$6,
     6-30=auction bids, 31=STOP.  No longer depends on num_colors.
     """
     return [
         NUM_ACTION_TYPES + 1,           # action_type + no-op
-        num_players,                     # opponent + no-op (0=no-op, 1..np-1=opponents)
+        MAX_PLAYERS,                     # no-op + opponent seats 1..MAX_PLAYERS-1 (absent seats masked)
         num_colors + 1,                  # color + no-op
         PRICE_SLOTS + 1,                 # price_slot + no-op
         PURCHASE_SIZE,                   # 32: no-op + 30 values + STOP
@@ -116,12 +133,38 @@ def head_sizes(num_players: int, num_colors: int) -> list[int]:
 
 def mask_size(num_players: int, num_colors: int) -> int:
     """Total size of action mask vector appended to observation."""
+    return sum(head_sizes(num_players, num_colors))
+
+
+def seat_obs_size(num_colors: int) -> int:
+    """Observation elements describing one seat (see ``observation``)."""
     return (
-        (NUM_ACTION_TYPES + 1)
-        + num_players
-        + (num_colors + 1)
-        + (PRICE_SLOTS + 1)
-        + PURCHASE_SIZE
+        4                              # cash, loans, warehouse_count, ship_location
+        + num_colors * 2               # factory_colors, island_store
+        + num_colors * PRICE_SLOTS * 2  # factory_store, harbour_store
+        + SHIP_CAPACITY                # ship_contents
+        + num_colors                   # secret_card_values
+    )
+
+
+def game_obs_size(num_colors: int) -> int:
+    """Observation elements describing shared game state (see ``observation``)."""
+    return (
+        MAX_PLAYERS                    # seat_present flags
+        + num_colors                   # container_supply
+        + 4                            # turn_phase, current_player, game_over, actions_taken
+        + 3                            # auction_active, auction_seller, auction_cargo_count
+        + 4                            # shopping_active, shopping_action_type, shopping_target, shopping_harbour_price
+        + 1 + num_colors               # produce_active + produce_pending
+    )
+
+
+def observation_size(num_colors: int) -> int:
+    """Full observation length — identical for every player count."""
+    return (
+        MAX_PLAYERS * seat_obs_size(num_colors)
+        + game_obs_size(num_colors)
+        + mask_size(MAX_PLAYERS, num_colors)
     )
 
 
@@ -494,23 +537,16 @@ class ContainerFunctional(
             head_sizes(self.params.num_players, self.params.num_colors)
         )
 
+        if not 2 <= self.params.num_players <= MAX_PLAYERS:
+            raise ValueError(
+                f"num_players must be between 2 and {MAX_PLAYERS}, "
+                f"got {self.params.num_players}"
+            )
         _np = self.params.num_players
         _nc = self.params.num_colors
-        obs_size = (
-            _np * 4                    # cash, loans, warehouse_count, ship_location per player
-            + _np * _nc * 2           # factory_colors, island_store
-            + _np * _nc * PRICE_SLOTS * 2  # factory_store, harbour_store
-            + _np * SHIP_CAPACITY      # ship_contents
-            + _nc                      # container_supply
-            + 4                        # turn_phase, current_player, game_over, actions_taken
-            + _np * _nc                 # secret_card_values per player per colour
-            + 3                        # auction_active, auction_seller, auction_cargo_count
-            + 4                        # shopping_active, shopping_action_type, shopping_target, shopping_harbour_price
-            + 1 + _nc                  # produce_active + produce_pending (nc colours)
-            + mask_size(_np, _nc)     # action masks
-        )
+        # Bounds are open: NULL_OBS is negative and cash can dip below zero.
         self.observation_space = spaces.Box(
-            low=0, high=100, shape=(obs_size,), dtype=np.float32
+            low=-np.inf, high=np.inf, shape=(observation_size(_nc),), dtype=np.float32
         )
 
         self._action_offsets = self._compute_offsets_array(_np, _nc)
@@ -864,6 +900,17 @@ class ContainerFunctional(
         p = player
         shift = -p
 
+        # A harbour location names its owner by absolute seat.  Re-key it to
+        # the rotated seat too, or "in seat 2's harbour" in the observation
+        # would point at whoever sits at absolute index 2.
+        rolled_loc = jnp.roll(state.ship_location, shift, axis=0)
+        in_harbour = rolled_loc >= LOCATION_HARBOUR_OFFSET
+        relative_loc = jnp.where(
+            in_harbour,
+            LOCATION_HARBOUR_OFFSET + (rolled_loc - LOCATION_HARBOUR_OFFSET - p) % num_players,
+            rolled_loc,
+        ).astype(state.ship_location.dtype)
+
         state = state._replace(
             # ---- per-player arrays (roll axis 0) ---------------------------
             cash=jnp.roll(state.cash, shift, axis=0),
@@ -874,7 +921,7 @@ class ContainerFunctional(
             harbour_store=jnp.roll(state.harbour_store, shift, axis=0),
             island_store=jnp.roll(state.island_store, shift, axis=0),
             ship_contents=jnp.roll(state.ship_contents, shift, axis=0),
-            ship_location=jnp.roll(state.ship_location, shift, axis=0),
+            ship_location=relative_loc,
             secret_card_values=jnp.roll(state.secret_card_values, shift, axis=0),
             auction_bids=jnp.roll(state.auction_bids, shift, axis=0),
 
@@ -936,7 +983,7 @@ class ContainerFunctional(
         is_auction = state.auction_active > 0
 
         at_size = NUM_ACTION_TYPES + 1
-        opp_size = np_
+        opp_size = MAX_PLAYERS  # fixed width; seats >= np_ are never set below
         col_size = nc + 1
         slot_size = PRICE_SLOTS + 1
         pur_size = PURCHASE_SIZE
@@ -1132,7 +1179,8 @@ class ContainerFunctional(
         at_mask = jnp.where(is_auction,
                             jnp.zeros(at_size, dtype=jnp.int32).at[ACTION_MOVE_AUCTION + 1].set(1), at_mask)
         # Opponent head is repurposed as direct player index during auction.
-        # All player indices (0..np-1) must be selectable.
+        # All player indices (0..np-1) must be selectable; slots past the last
+        # player stay 0, so an absent seat can never be named as a bidder.
         opp_auction = jnp.zeros(opp_size, dtype=jnp.int32)
         for i in range(np_):
             opp_auction = opp_auction.at[i].set(1)
@@ -1865,8 +1913,22 @@ class ContainerFunctional(
     ) -> jax.Array:
         """Convert state to an ego-centric observation for the acting player.
 
-        Per-player arrays are rotated so that *current_player* lands at
-        positional slot 0 — the policy always sees "my" data first.
+        Layout, identical for every player count::
+
+            [ seat 0 | seat 1 | seat 2 | seat 3 | seat 4 ]   MAX_PLAYERS x seat_obs_size
+            [ game state ]                                    game_obs_size
+            [ action masks ]                                  mask_size
+
+        Seat 0 is the acting player; seats 1.. follow clockwise, the order the
+        opponent head counts in, so opponent index *j* and seat *j* always name
+        the same player.  Each seat block holds cash, loans, warehouse_count,
+        ship_location, factory_colors, island_store, factory_store,
+        harbour_store, ship_contents and secret_card_values.  Seats past
+        ``num_players`` are filled with ``NULL_OBS``, and the game-state block
+        opens with a ``seat_present`` flag per seat.
+
+        Player indices inside the observation (``auction_seller``,
+        ``shopping_target``, harbour locations) are seat-relative too.
         Action masks (computed on the original state) are appended at the
         end so that ``MaskablePPO`` can zero out invalid actions.
         """
@@ -1874,69 +1936,55 @@ class ContainerFunctional(
             params = self.params
         player = state.current_player
         num_players = params.num_players
+        nc = params.num_colors
 
         # Compute masks on the ORIGINAL state (already keyed to current_player internally).
         masks = self._action_masks(state, params)
 
-        # Rotate state so the acting player is at index 0.
+        # Rotate state so the acting player is at seat 0.
         centered = self._center_on_player(state, player, num_players)
 
-        parts: list[jax.Array] = []
-        parts.append(centered.cash.astype(jnp.float32))
-        parts.append(centered.loans.astype(jnp.float32))
-        parts.append(centered.warehouse_count.astype(jnp.float32))
-        parts.append(centered.ship_location.astype(jnp.float32))
-
-        parts.append(centered.factory_colors.reshape(-1).astype(jnp.float32))
-        parts.append(centered.island_store.reshape(-1).astype(jnp.float32))
-        parts.append(centered.factory_store.reshape(-1).astype(jnp.float32))
-        parts.append(centered.harbour_store.reshape(-1).astype(jnp.float32))
-        parts.append(centered.ship_contents.reshape(-1).astype(jnp.float32))
-
-        parts.append(centered.container_supply.astype(jnp.float32))
-        parts.append(
-            jnp.array(
-                [
-                    centered.turn_phase.astype(jnp.float32),
-                    centered.current_player.astype(jnp.float32),
-                    centered.game_over.astype(jnp.float32),
-                    centered.actions_taken.astype(jnp.float32),
-                ]
-            )
+        # ---- Seat blocks ----------------------------------------------------
+        seat_features = (
+            centered.cash[:, None],
+            centered.loans[:, None],
+            centered.warehouse_count[:, None],
+            centered.ship_location[:, None],
+            centered.factory_colors,
+            centered.island_store,
+            centered.factory_store.reshape(num_players, -1),
+            centered.harbour_store.reshape(num_players, -1),
+            centered.ship_contents,
+            centered.secret_card_values,
         )
-        parts.append(centered.secret_card_values.reshape(-1).astype(jnp.float32))
-        parts.append(
-            jnp.array(
-                [
-                    centered.auction_active.astype(jnp.float32),
-                    centered.auction_seller.astype(jnp.float32),
-                ]
-            )
+        occupied = jnp.concatenate(
+            [f.astype(jnp.float32) for f in seat_features], axis=1
         )
-        parts.append(jnp.sum(centered.auction_cargo > 0).astype(jnp.float32)[None])
+        seats = jnp.full((MAX_PLAYERS, seat_obs_size(nc)), NULL_OBS, dtype=jnp.float32)
+        seats = seats.at[:num_players].set(occupied)
 
-        # Shopping continuation state (4 scalars)
-        parts.append(
-            jnp.array([
-                centered.shopping_active.astype(jnp.float32),
-                centered.shopping_action_type.astype(jnp.float32),
-                centered.shopping_target.astype(jnp.float32),
-                centered.shopping_harbour_price.astype(jnp.float32),
-            ])
-        )
+        # ---- Game state -----------------------------------------------------
+        def _scalars(*xs):
+            return jnp.stack([jnp.asarray(x).astype(jnp.float32) for x in xs])
 
-        # Produce continuation state (1 + nc scalars)
-        parts.append(centered.produce_active.astype(jnp.float32)[None])
-        parts.append(centered.produce_pending.astype(jnp.float32))
+        game = jnp.concatenate([
+            (jnp.arange(MAX_PLAYERS) < num_players).astype(jnp.float32),  # seat_present
+            centered.container_supply.astype(jnp.float32),
+            _scalars(centered.turn_phase, centered.current_player,
+                     centered.game_over, centered.actions_taken),
+            _scalars(centered.auction_active, centered.auction_seller,
+                     jnp.sum(centered.auction_cargo > 0)),
+            _scalars(centered.shopping_active, centered.shopping_action_type,
+                     centered.shopping_target, centered.shopping_harbour_price),
+            _scalars(centered.produce_active),
+            centered.produce_pending.astype(jnp.float32),
+        ])
 
-        # Append action masks (computed pre-rotation, already player-relative)
-        parts.append(masks["action_type"].astype(jnp.float32))
-        parts.append(masks["opponent"].astype(jnp.float32))
-        parts.append(masks["color"].astype(jnp.float32))
-        parts.append(masks["price_slot"].astype(jnp.float32))
-        parts.append(masks["purchase"].astype(jnp.float32))
+        # ---- Action masks (computed pre-rotation, already player-relative) --
+        mask_parts = [masks[k].astype(jnp.float32)
+                      for k in ("action_type", "opponent", "color", "price_slot", "purchase")]
 
-        obs = jnp.concatenate(parts)
+        obs = jnp.concatenate([seats.reshape(-1), game, *mask_parts])
         obs_size = self.observation_space.shape[0]
         # No padding or truncation here, deliberately.  The action masks are
         # the last ``mask_size`` entries and consumers slice them off the tail
@@ -1948,7 +1996,7 @@ class ContainerFunctional(
             raise AssertionError(
                 f"observation length {obs.shape[0]} != declared observation_space "
                 f"size {obs_size}; the action-mask tail slice would be misaligned. "
-                f"Update the obs_size accounting in ContainerFunctional.__init__."
+                f"Update seat_obs_size / game_obs_size to match observation()."
             )
         return obs.astype(jnp.float32)
 

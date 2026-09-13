@@ -918,7 +918,7 @@ class TestActionMasksParallel:
         from container_rl.env.container import head_sizes
         state = _make_state()
         masks = self._masks(state)
-        sizes = head_sizes(2, 5)  # 2 players, 5 colours → [12, 2, 6, 11, 32]
+        sizes = head_sizes(2, 5)  # 5 colours → [12, 5, 6, 11, 32]; opponent width is fixed at MAX_PLAYERS
         assert len(masks["action_type"]) == sizes[0]
         assert len(masks["opponent"]) == sizes[1]
         assert len(masks["color"]) == sizes[2]

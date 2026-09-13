@@ -2,11 +2,17 @@
 
 Usage:
     uv run python -m container_rl.train
+    uv run python -m container_rl.train --num-players 5
     uv run python -m container_rl.train --self-play --snapshot-every 50
+
+Observation and action shapes do not depend on the player count, so the
+vectorised envs can each run a different count (``--num-players 2,3,4,5``)
+and the resulting policy can play any of them.
 """
 
 import argparse
 import os
+from functools import partial
 from typing import Optional
 
 import gymnasium as gym
@@ -18,14 +24,14 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from container_rl import ContainerEnv
-from container_rl.env.container import head_sizes, mask_size
+from container_rl.env.container import MAX_PLAYERS, head_sizes, mask_size
 from container_rl.self_play import (
     OpponentPool,
     SelfPlayWrapper,
     elo_update,
 )
 
-NUM_PLAYERS = 4
+NUM_PLAYERS = MAX_PLAYERS
 NUM_COLORS = 5
 
 
@@ -114,6 +120,11 @@ class SelfPlayCallback(BaseCallback):
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train PPO agent on Container environment")
     parser.add_argument("--num-envs", type=int, default=4)
+    parser.add_argument(
+        "--num-players", type=str, default="2,3,4,5",
+        help="Player count, or a comma-separated list assigned to the "
+             "vectorised envs round-robin (e.g. 2,3,4,5). Each must be 2-%d." % MAX_PLAYERS,
+    )
     parser.add_argument("--total-timesteps", type=int, default=2_000_000)
     parser.add_argument("--learning-rate", type=float, default=2.5e-4)
     parser.add_argument("--n-steps", type=int, default=128)
@@ -137,25 +148,34 @@ def main() -> None:
     parser.add_argument("--snapshot-every", type=int, default=50)
 
     args = parser.parse_args()
+    player_counts = [int(x) for x in args.num_players.split(",") if x.strip()]
+    if not player_counts or any(not 2 <= n <= MAX_PLAYERS for n in player_counts):
+        parser.error(f"--num-players values must each be between 2 and {MAX_PLAYERS}")
+    if args.num_envs < len(player_counts):
+        print(f"warning: {args.num_envs} envs cannot cover player counts {player_counts}; "
+              f"only {player_counts[:args.num_envs]} will be trained on")
     log_path = os.path.join(args.log_dir, args.run_name)
     opponent_pool = OpponentPool(max_size=args.opponent_pool_size)
 
-    def _make_env() -> gym.Env:
-        env = ContainerEnv(num_players=NUM_PLAYERS, num_colors=NUM_COLORS)
+    def _make_env(num_players: int) -> gym.Env:
+        env = ContainerEnv(num_players=num_players, num_colors=NUM_COLORS)
         if args.self_play:
-            models = opponent_pool.sample(NUM_PLAYERS - 1, 1000.0, device=args.device)
+            models = opponent_pool.sample(num_players - 1, 1000.0, device=args.device)
             opponent_models = {}
             for i, m in enumerate(models):
                 opponent_models[i + 1] = m
             env = SelfPlayWrapper(env, opponent_models, main_player=0)
-        env = ContainerMaskWrapper(env, num_players=NUM_PLAYERS, num_colors=NUM_COLORS)
+        env = ContainerMaskWrapper(env, num_players=num_players, num_colors=NUM_COLORS)
         env = Monitor(env)  # logs episode rewards/steps to TensorBoard
         return env
 
-    vec_env = DummyVecEnv([_make_env for _ in range(args.num_envs)])
+    env_player_counts = [player_counts[i % len(player_counts)] for i in range(args.num_envs)]
+    vec_env = DummyVecEnv([partial(_make_env, n) for n in env_player_counts])
     vec_env.seed(args.seed)
 
-    eval_env = _make_env()
+    # Evaluate at the largest count trained on: the hardest table, and the one
+    # that exercises every opponent slot.
+    eval_env = _make_env(max(player_counts))
     eval_env.reset(seed=args.seed + 1)
 
     eval_callback = EvalCallback(
@@ -190,6 +210,7 @@ def main() -> None:
 
     print(f"\nMaskablePPO training: {args.run_name}")
     print(f"  Environments: {args.num_envs}  Total timesteps: {args.total_timesteps}")
+    print(f"  Player counts per env: {env_player_counts}")
     print(f"  Action space: {vec_env.action_space}")
     print(f"  Observation shape: {vec_env.observation_space.shape}")
     if args.self_play:

@@ -79,7 +79,7 @@ def _head_slice(name, num_players=2, num_colors=5):
 # ══════════════════════════════════════════════════════════════════════════════
 
 
-@pytest.mark.parametrize("num_players,num_colors", [(2, 5), (3, 5), (4, 5), (4, 4)])
+@pytest.mark.parametrize("num_players,num_colors", [(2, 5), (3, 5), (4, 5), (5, 5), (4, 4)])
 def test_observation_length_matches_declared_space(num_players, num_colors):
     """``observation`` must fill ``observation_space`` exactly.
 

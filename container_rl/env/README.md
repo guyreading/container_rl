@@ -39,7 +39,7 @@ The action tensor is an `int32` array of shape `(5,)`:
 | Head index | Name | Size | Used by | Description |
 |---|---|---|---|---|
 | 0 | **Action Type** | 11 | all | One of the 11 action types |
-| 1 | **Opponent** | `n_players − 1` | BuyFromFactoryStore (3), MoveLoad (4) | Which opponent to target (clockwise from acting player) |
+| 1 | **Opponent** | `MAX_PLAYERS` (5), any player count | BuyFromFactoryStore (3), MoveLoad (4), Auction bidder | No-op + seats 1–4 clockwise from the acting player; seats past the last player are always masked |
 | 2 | **Color** | `n_colors` | BuyFactory (0), DomesticSale (10) | Which container colour |
 | 3 | **Price Slot** | `PRICE_SLOTS` (10) | DomesticSale (10) | Which price slot ($1–$10) to sell from |
 | 4 | **Purchase** | `n_colors × PRICE_SLOTS + 1` | BuyFromFactoryStore (3), MoveLoad (4) | Single purchase: `color × PRICE_SLOTS + price_slot`, or STOP at index `n_colors × PRICE_SLOTS` |
@@ -92,7 +92,7 @@ while env.state.shopping_active:
 | Key | Shape | Meaning |
 |---|---|---|
 | `action_type` | (11,) | 1 = action type is currently legal |
-| `opponent` | (n_players−1,) | 1 = opponent has purchasable stock |
+| `opponent` | (5,) | 1 = opponent has purchasable stock; absent seats always 0 |
 | `color` | (n_colors,) | 1 = colour is a valid choice |
 | `price_slot` | (PRICE_SLOTS,) | 1 = own store has containers at that price |
 | `purchase` | (n_colors×10+1,) | 1 = (color, slot) combo is affordable & in stock; STOP always valid |
@@ -101,23 +101,56 @@ These masks are appended to the observation vector so an RL policy can apply the
 
 ## Observation Space
 
-The observation is a flat `float32` vector of size:
+The observation is a flat `float32` vector whose size depends only on the number
+of colours, **never on the number of players**, so one policy can be trained on
+and play 2-, 3-, 4- and 5-player games:
 
 ```
-obs_size = np * 4                    # cash, loans, warehouse_count, ship_location per player
-         + np * nc * 2               # factory_colors, island_store
-         + np * nc * PRICE_SLOTS * 2 # factory_store, harbour_store
-         + np * SHIP_CAPACITY        # ship_contents
-         + nc                        # container_supply
-         + 4                         # turn_phase, current_player, game_over, actions_taken
-         + np * nc                   # secret_card_values per player per colour
-         + 5                         # auction_active, auction_seller, auction_cargo_count
-         + 4                         # shopping_active, shopping_action_type, shopping_target, shopping_harbour_price
-         + 1 + nc                    # produce_active + produce_pending
-         + mask_size                 # action_type(12) + opponent(np) + color(nc+1) + price_slot(11) + purchase(32)
+[ seat 0 | seat 1 | seat 2 | seat 3 | seat 4 ]   MAX_PLAYERS (5) x seat_obs_size(nc)
+[ game state ]                                    game_obs_size(nc)
+[ action masks ]                                  mask_size
 ```
 
-For 2 players, 5 colours: **335** elements (272 game state + 63 action masks).
+**Seat blocks.** Seat 0 is the acting player and seats 1–4 follow clockwise,
+the same order the opponent head counts in, so opponent index *j* and seat *j*
+are always the same player. Every seat block has the same layout:
+
+```
+seat_obs_size = 4                     # cash, loans, warehouse_count, ship_location
+              + nc * 2                # factory_colors, island_store
+              + nc * PRICE_SLOTS * 2  # factory_store, harbour_store
+              + SHIP_CAPACITY         # ship_contents
+              + nc                    # secret_card_values
+```
+
+Seats with no player (seats 3 and 4 in a 3-player game) have **every** element
+set to `NULL_OBS` (-2.0). It is non-zero because 0 is a real reading for most
+features, and not -1 because that is the 5/10 secret card. Player references
+inside the observation — harbour locations, `auction_seller`, `shopping_target`
+— are seat-relative too.
+
+**Game state.**
+
+```
+game_obs_size = MAX_PLAYERS           # seat_present: 1 = occupied, 0 = empty
+              + nc                    # container_supply
+              + 4                     # turn_phase, current_player, game_over, actions_taken
+              + 3                     # auction_active, auction_seller, auction_cargo_count
+              + 4                     # shopping_active, shopping_action_type, shopping_target, shopping_harbour_price
+              + 1 + nc                # produce_active + produce_pending
+```
+
+`seat_present` is the unambiguous "is anyone here" signal. Cash can go negative
+after a rejected auction, so no sentinel value is collision-proof on its own.
+
+**Action masks.** `action_type(12) + opponent(5) + color(nc+1) + price_slot(11) + purchase(32)`,
+always the last `mask_size` elements. `ContainerMaskWrapper` in `train.py`
+slices them off before the policy sees the observation.
+
+For 5 colours: **713** elements at every player count
+(5 × 124 seat + 27 game state + 66 masks); the policy's input is **647** once
+`ContainerMaskWrapper` strips the masks. Use `observation_size(nc)` rather than
+hard-coding either number.
 
 ## Reward
 
