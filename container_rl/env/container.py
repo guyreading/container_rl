@@ -504,7 +504,7 @@ class ContainerFunctional(
             + _nc                      # container_supply
             + 4                        # turn_phase, current_player, game_over, actions_taken
             + _np * _nc                 # secret_card_values per player per colour
-            + 5                        # auction_active, auction_seller, auction_cargo_count
+            + 3                        # auction_active, auction_seller, auction_cargo_count
             + 4                        # shopping_active, shopping_action_type, shopping_target, shopping_harbour_price
             + 1 + _nc                  # produce_active + produce_pending (nc colours)
             + mask_size(_np, _nc)     # action masks
@@ -1139,6 +1139,28 @@ class ContainerFunctional(
         opp_mask = jnp.where(is_auction, opp_auction, opp_mask)
         color_mask = jnp.where(is_auction, _noop_only(col_size), color_mask)
         slot_mask = jnp.where(is_auction, _noop_only(slot_size), slot_mask)
+
+        # ---- Guarantee every head has at least one selectable value ----------
+        # Parallel mode clears no-op on all heads, but the opponent, colour and
+        # price_slot heads can legitimately have nothing else to offer: no rival
+        # holds affordable stock, every colour is already owned, the player holds
+        # no goods to price.  That leaves the head all-zero, and sb3-contrib's
+        # MaskableCategorical turns an all-zero mask into a *uniform* one — the
+        # head then samples an invalid value at random with log_prob 0 and
+        # entropy 0, so the policy neither controls it nor learns from it.
+        #
+        # Re-enabling no-op is the correct escape hatch, not a papering-over: a
+        # head is only ever empty in states where every action_type that reads it
+        # is already masked off (asserted in test_mask_packing.py), so the head
+        # is genuinely inert and no-op is exactly its "unused" value.
+        def _ensure_selectable(m):
+            return jnp.where(jnp.sum(m) == 0, m.at[NO_OP].set(1), m)
+
+        at_mask = _ensure_selectable(at_mask)
+        opp_mask = _ensure_selectable(opp_mask)
+        color_mask = _ensure_selectable(color_mask)
+        slot_mask = _ensure_selectable(slot_mask)
+        pur_mask = _ensure_selectable(pur_mask)
 
         return {
             "action_type": at_mask,
@@ -1916,7 +1938,18 @@ class ContainerFunctional(
 
         obs = jnp.concatenate(parts)
         obs_size = self.observation_space.shape[0]
-        obs = jnp.pad(obs, (0, max(0, obs_size - obs.shape[0])), constant_values=0)[:obs_size]
+        # No padding or truncation here, deliberately.  The action masks are
+        # the last ``mask_size`` entries and consumers slice them off the tail
+        # (see ``ContainerMaskWrapper.action_masks``), so any mismatch between
+        # the declared ``obs_size`` and the parts assembled above would shift
+        # that slice and silently hand the policy one head's mask under
+        # another head's name.  Fail loudly instead.
+        if obs.shape[0] != obs_size:
+            raise AssertionError(
+                f"observation length {obs.shape[0]} != declared observation_space "
+                f"size {obs_size}; the action-mask tail slice would be misaligned. "
+                f"Update the obs_size accounting in ContainerFunctional.__init__."
+            )
         return obs.astype(jnp.float32)
 
     def terminal(

@@ -878,21 +878,35 @@ class TestActionMasksParallel:
 
     # ── Structural invariants ─────────────────────────────────────────
 
-    def test_no_op_masked_out_on_all_heads(self):
-        """Index 0 must be 0 on every head in parallel mode.
+    def test_no_op_masked_out_on_heads_with_real_options(self):
+        """Index 0 must be 0 on every head that has something else to offer.
 
         **Why**: the agent must NOT be allowed to select no‑op during a
         normal turn — only meaningful values should be available.  No‑op
         is reserved for heads that are irrelevant in sequential
         continuation modes.
+
+        A head with *nothing* legal is the one exception, and it is
+        deliberate.  ``price_slot`` is the case here: ``use_domestic_sale``
+        is off by default, so no parallel‑mode action reads that head and
+        it has no legal value to offer.  Leaving it fully masked is worse
+        than no‑op — sb3‑contrib renormalises an all‑zero mask into a
+        *uniform* one, so the head would sample invalid values at random
+        with no gradient.  ``_action_masks`` re‑enables no‑op in that case;
+        see ``test_mask_packing.py`` for the full argument.
+
+        This assertion used to cover all five heads unconditionally, which
+        only held because ``price_slot`` was entirely dead — index 0 read 0
+        along with every other index.
         """
         state = _make_state()
         masks = self._masks(state)
-        assert int(masks["action_type"][0]) == 0, "action_type no‑op should be masked"
-        assert int(masks["opponent"][0]) == 0, "opponent no‑op should be masked"
-        assert int(masks["color"][0]) == 0, "colour no‑op should be masked"
-        assert int(masks["price_slot"][0]) == 0, "price_slot no‑op should be masked"
-        assert int(masks["purchase"][0]) == 0, "purchase no‑op should be masked"
+        for head in ("action_type", "opponent", "color", "price_slot", "purchase"):
+            m = masks[head]
+            if int(jnp.sum(m[1:])) == 0:
+                assert int(m[0]) == 1, f"{head} has no options and no no‑op fallback"
+                continue
+            assert int(m[0]) == 0, f"{head} no‑op should be masked"
 
     def test_head_sizes(self):
         """Mask arrays must match the declared MultiDiscrete head sizes.
