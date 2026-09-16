@@ -16,7 +16,7 @@ import sys
 import threading
 from typing import Any
 
-from container_rl.env.container import CONTAINER_SUPPLY_CHOICES
+from container_rl.env.container import MAX_PLAYERS, CONTAINER_SUPPLY_CHOICES
 from container_rl.server.database import Database
 from container_rl.server.game_manager import GameManager, _state_to_json_data
 from container_rl.server.protocol import pack_message, recv_message
@@ -87,8 +87,10 @@ class ClientHandler:
                 seed = int(seed)
             if not name:
                 raise ValueError("Player name is required.")
-            if num_players < 2 or num_players > 6:
-                raise ValueError("num_players must be 2–6.")
+            # The env sizes its observation and action spaces for MAX_PLAYERS
+            # seats and refuses more, so reject here rather than at env creation.
+            if num_players < 2 or num_players > MAX_PLAYERS:
+                raise ValueError(f"num_players must be 2–{MAX_PLAYERS}.")
             if ai_count < 0 or ai_count >= num_players:
                 raise ValueError(f"ai_count must be 0–{num_players - 1}.")
             if containers_per_color and containers_per_color not in CONTAINER_SUPPLY_CHOICES:
