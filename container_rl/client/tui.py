@@ -255,20 +255,66 @@ def _ship(state, player):
     parts = ["·" if c==0 else f"[{_cs(c-1)}]■[/{_cs(c-1)}]" for c in cargo]
     return f"{' '.join(parts)}  @ {ls}"
 
-def _net_worth(state, player, nc):
+def _score_breakdown(state, player, nc) -> dict:
+    """Where a player's final score comes from, item by item.
+
+    This has to agree with ``ContainerFunctional._net_worth`` -- that is the
+    number the game is decided on and the AI is trained against.  The client
+    used to keep its own sum, valuing harbour goods at their asking price and
+    counting every island container, so the scores it showed (and the winner
+    it named at the end) could differ from the real result.  The rules:
+
+    * harbour goods are worth $2 each, whatever they are priced at;
+    * cargo still on the ship is worth $3 each;
+    * island containers score at the owner's secret card value, the 5/10 card
+      paying 10 only with a full set -- checked *before* the discard below;
+    * the most abundant island colour is discarded (in a tie involving the
+      5/10 colour, that one goes; otherwise the first of the tied colours);
+    * each outstanding loan costs $11.
+    """
     cash = int(state.cash[player])
-    hv = sum((s+1)*int(state.harbour_store[player,c,s]) for c in range(nc) for s in range(PRICE_SLOTS))
-    sv = sum(3 for c in state.ship_contents[player] if int(c)>0)
-    iv = 0
-    has_all = all(int(state.island_store[player, cc]) > 0 for cc in range(nc))
+    loans = int(state.loans[player])
+    harbour_goods = sum(int(state.harbour_store[player, c, s])
+                        for c in range(nc) for s in range(PRICE_SLOTS))
+    ship_cargo = sum(1 for c in state.ship_contents[player] if int(c) > 0)
+    island = [int(state.island_store[player, c]) for c in range(nc)]
+    cards = [int(state.secret_card_values[player, c]) for c in range(nc)]
+    has_all = all(n > 0 for n in island)
+
+    discarded = None
+    top = max(island) if island else 0
+    if top > 0:
+        tied = [c for c in range(nc) if island[c] == top]
+        ten_five = [c for c in tied if cards[c] == -1]
+        discarded = ten_five[0] if len(tied) > 1 and ten_five else tied[0]
+
+    island_val = 0
     for c in range(nc):
-        cnt = int(state.island_store[player, c])
-        if cnt > 0:
-            val = int(state.secret_card_values[player, c])
-            if val == -1:
-                val = 10 if has_all else 5
-            iv += val * cnt
-    return cash + hv + sv + iv - int(state.loans[player]) * 11
+        if c == discarded:
+            continue
+        val = cards[c] if cards[c] != -1 else (10 if has_all else 5)
+        island_val += val * island[c]
+
+    harbour_val = harbour_goods * 2
+    ship_val = ship_cargo * 3
+    loan_val = loans * 11
+    return {
+        "cash": cash,
+        "harbour_goods": harbour_goods,
+        "harbour": harbour_val,
+        "ship_cargo": ship_cargo,
+        "ship": ship_val,
+        "island_containers": sum(island),
+        "island": island_val,
+        "discarded": discarded,
+        "discarded_count": island[discarded] if discarded is not None else 0,
+        "loans": loans,
+        "loan_penalty": loan_val,
+        "total": cash + harbour_val + ship_val + island_val - loan_val,
+    }
+
+def _net_worth(state, player, nc):
+    return _score_breakdown(state, player, nc)["total"]
 
 def _player_card(state, player, nc, is_current, is_mine=False):
     cash = int(state.cash[player])
@@ -770,65 +816,140 @@ def _update_state_from_server(live, nc, np_):
     return STATE
 
 
-# ── final scores ──────────────────────────────────────────────────────────
+# ── game over ────────────────────────────────────────────────────────────
 
-def _show_final_scores(state, nc, np_):
-    """Show leaderboard and score breakdown at the end of the game."""
-    players = sorted(
-        [(p, _net_worth(state, p, nc)) for p in range(np_)],
-        key=lambda x: x[1], reverse=True,
-    )
+_ORDINALS = {1: "1st", 2: "2nd", 3: "3rd"}
 
-    # Leaderboard
-    lb = Table(title="[bold]🏆 Final Scores[/bold]", border_style="bold yellow", expand=True)
-    lb.add_column("Rank", style="dim", width=5, justify="center")
-    lb.add_column("Player", style="bold")
-    lb.add_column("Score", style="bold green", justify="right")
-    for rank, (p, total) in enumerate(players, 1):
-        marker = ["🥇", "🥈", "🥉"][rank - 1] if rank <= 3 else f"  {rank}"
-        name = PLAYER_NAMES.get(p, f"Player {p+1}")
-        lb.add_row(marker, name, f"${total}")
+def _ordinal(n: int) -> str:
+    return _ORDINALS.get(n, f"{n}th")
 
-    # Breakdown table
-    bt = Table(title="Score Breakdown", border_style="dim blue", expand=True)
-    bt.add_column("Player", style="bold")
-    bt.add_column("Cash", justify="right")
-    bt.add_column("Harbour Store", justify="right")
-    bt.add_column("Ship ($3 ea)", justify="right")
-    bt.add_column("Island", justify="right")
-    bt.add_column("Loans", justify="right")
-    bt.add_column("Total", style="bold green", justify="right")
+def _standings(state, nc, np_) -> list[tuple[int, int, dict]]:
+    """``(position, player, breakdown)``, best first.
 
-    for p, _ in players:
-        name = PLAYER_NAMES.get(p, f"Player {p+1}")
-        cash = int(state.cash[p])
-        hv = sum((s + 1) * int(state.harbour_store[p, c, s]) for c in range(nc) for s in range(PRICE_SLOTS))
-        sv = sum(3 for c in state.ship_contents[p] if int(c) > 0)
-        has_all = all(int(state.island_store[p, cc]) > 0 for cc in range(nc))
-        iv = 0
-        for c in range(nc):
-            cnt = int(state.island_store[p, c])
-            if cnt > 0:
-                val = int(state.secret_card_values[p, c])
-                if val == -1:
-                    val = 10 if has_all else 5
-                iv += val * cnt
-        loans = int(state.loans[p])
-        total = cash + hv + sv + iv - loans * 11
-        bt.add_row(
-            name,
-            f"${cash}",
-            f"${hv}",
-            f"${sv}",
-            f"${iv}",
-            f"[red]-${loans * 11}[/red]" if loans > 0 else "$0",
-            f"[bold green]${total}[/bold green]",
+    Equal scores share a position -- the env's rankings do not break ties, so
+    neither does the screen.  Ties are listed in seat order.
+    """
+    scored = [(p, _score_breakdown(state, p, nc)) for p in range(np_)]
+    scored.sort(key=lambda x: -x[1]["total"])
+    out = []
+    for i, (p, bd) in enumerate(scored):
+        if i and bd["total"] == out[-1][2]["total"]:
+            pos = out[-1][0]
+        else:
+            pos = i + 1
+        out.append((pos, p, bd))
+    return out
+
+def _secret_card(state, player, nc) -> str:
+    parts = []
+    for c in range(nc):
+        val = int(state.secret_card_values[player, c])
+        parts.append(f"[{_cs(c)}]■[/{_cs(c)}]{'5/10' if val == -1 else val}")
+    return " ".join(parts)
+
+def _island_counts(state, player, nc) -> str:
+    parts = [f"[{_cs(c)}]■[/{_cs(c)}]{int(state.island_store[player, c])}"
+             for c in range(nc) if int(state.island_store[player, c]) > 0]
+    return " ".join(parts) if parts else "[dim]none[/dim]"
+
+def _counted(value: int, count: int, each: int) -> str:
+    return f"${value} [dim]({count}×{each})[/dim]" if count else "$0"
+
+def _render_game_over(state, nc, np_, my_player=None):
+    """The end-of-game screen: who won, by how much, and how they got there."""
+    standings = _standings(state, nc, np_)
+    name = lambda p: escape(PLAYER_NAMES.get(p, f"Player {p+1}"))
+    best = standings[0][2]["total"]
+    winners = [p for pos, p, _ in standings if pos == 1]
+
+    # ── banner ──
+    if len(winners) == 1:
+        headline = f"🏆 {name(winners[0])} wins with ${best}!"
+    else:
+        headline = f"🏆 Tie for first at ${best}: " + " & ".join(name(p) for p in winners)
+    lines = [f"[bold yellow]GAME OVER[/bold yellow]", f"[bold]{headline}[/bold]"]
+    if my_player is not None and 0 <= my_player < np_:
+        mine = next((pos, bd) for pos, p, bd in standings if p == my_player)
+        shared = sum(1 for pos, _, _ in standings if pos == mine[0]) > 1
+        where = f"{_ordinal(mine[0])}{' (shared)' if shared else ''} of {np_}"
+        style = "green" if mine[0] == 1 else "cyan"
+        lines.append(f"[{style}]You finished {where} with ${mine[1]['total']}[/{style}]")
+
+    # ── how it ended ──
+    exhausted = [c for c in range(nc) if int(state.container_supply[c]) <= 0]
+    if len(exhausted) >= 2:
+        cols = " and ".join(f"[{_cs(c)}]{_cn(c, nc)}[/{_cs(c)}]" for c in exhausted)
+        reason = f"{cols} containers ran out"
+    else:
+        reason = "the move limit was reached"
+    left = sum(max(0, int(state.container_supply[c])) for c in range(nc))
+    lines.append(f"[dim]Ended after {int(state.step_count)} actions: [/dim]{reason}"
+                 f"[dim] ({left} left)[/dim]")
+    banner = Panel(Text.from_markup("\n".join(lines), justify="center"),
+                   border_style="bold yellow")
+
+    # ── standings and score breakdown ──
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    st_tbl = Table(title="[bold]Final standings[/bold]", border_style="yellow", expand=True)
+    st_tbl.add_column("Pos", justify="center")
+    st_tbl.add_column("Player", style="bold")
+    st_tbl.add_column("Score", justify="right", style="bold green")
+    st_tbl.add_column("Cash", justify="right")
+    st_tbl.add_column("Harbour", justify="right")
+    st_tbl.add_column("Ship", justify="right")
+    st_tbl.add_column("Island", justify="right")
+    st_tbl.add_column("Loans", justify="right")
+    for pos, p, bd in standings:
+        pname = name(p) + (" [green](you)[/green]" if p == my_player else "")
+        gap = "" if pos == 1 else f" [dim](-{best - bd['total']})[/dim]"
+        island = f"${bd['island']}"
+        if bd["discarded"] is not None:
+            c = bd["discarded"]
+            island += f" [dim]−{bd['discarded_count']}[/dim][{_cs(c)}]■[/{_cs(c)}]"
+        st_tbl.add_row(
+            f"{medals.get(pos, '')}{_ordinal(pos)}",
+            pname,
+            f"${bd['total']}{gap}",
+            f"${bd['cash']}",
+            _counted(bd["harbour"], bd["harbour_goods"], 2),
+            _counted(bd["ship"], bd["ship_cargo"], 3),
+            island,
+            f"[red]-${bd['loan_penalty']}[/red]" if bd["loans"] else "$0",
         )
 
-    console.clear()
-    parts = [lb, bt, Text.from_markup("[dim]← to review the moves  •  any other key to exit…[/dim]")]
-    console.print(Align.center(Group(*parts), vertical="middle", height=console.height))
+    # ── what each player built ──
+    stats = Table(title="[bold]Player statistics[/bold]", border_style="dim blue", expand=True)
+    stats.add_column("Player", style="bold")
+    stats.add_column("Factories")
+    stats.add_column("Wh", justify="right")
+    stats.add_column("Island containers")
+    stats.add_column("Secret card")
+    for _, p, _bd in standings:
+        facs = [f"[{_cs(c)}]■[/{_cs(c)}]" for c in range(nc) if int(state.factory_colors[p, c])]
+        stats.add_row(
+            name(p),
+            "".join(facs) if facs else "[dim]none[/dim]",
+            str(int(state.warehouse_count[p])),
+            _island_counts(state, p, nc),
+            _secret_card(state, p, nc),
+        )
 
+    footer = Text.from_markup(
+        "[dim]← review the moves  •  esc back to the menu  •  q quit[/dim]", justify="center")
+    return Align.center(Group(banner, st_tbl, stats, footer),
+                        vertical="middle", height=console.height)
+
+
+def _is_game_over(st) -> bool:
+    """Has the game finished?  Read off the position itself.
+
+    ``STATE_META`` is only whatever payload came with the last position, and
+    the position carries its own ``game_over`` flag -- so trust that, and use
+    the payload only as a fallback for a state we could not decode.
+    """
+    if st is not None and int(st.game_over) > 0:
+        return True
+    return bool(STATE_META.get("game_over", 0))
 
 # ── gameplay loop ────────────────────────────────────────────────────────
 
@@ -1031,7 +1152,7 @@ def _gameplay():
             if STATE is None: return
             st = STATE
             cur = int(st.current_player)
-            go = STATE_META.get("game_over",0)
+            go = _is_game_over(st)
             ac = int(st.auction_active)
 
             feedback_now = FEEDBACK
@@ -1061,14 +1182,22 @@ def _gameplay():
                         VIEWING_HISTORY = False
                 continue
 
+            # ── game over ──
+            # Checked before every waiting branch below: each of them loops
+            # until the game hands the turn to someone, and a finished game
+            # never does.  The screen stays up until the player picks a way
+            # out -- a stray keypress (space was "pass" a moment ago) must not
+            # be what ends their ssh session.
             if go:
-                _show_final_scores(st, NUM_COLORS, NUM_PLAYERS)
-                ch = _key(None)
+                live.update(_render_game_over(st, NUM_COLORS, NUM_PLAYERS, PLAYER_INDEX))
+                live.refresh()
+                ch = _key(0.5)
+                if ch in ("q", "Q"): return
+                if ch == "\x1b": return BACK
                 if ch == "\x1b[D" and len(HISTORY) > 1:
                     VIEWING_HISTORY = True
                     HIST_IDX = len(HISTORY) - 2
-                    continue
-                return
+                continue
 
             # ── auction mode ──
             if ac:
@@ -1160,7 +1289,10 @@ def _gameplay():
                     _update_state_from_server(live, NUM_COLORS, NUM_PLAYERS)
                     if STATE is None: return
                     st = STATE; new_cur = int(st.current_player)
-                    if new_cur == PLAYER_INDEX or int(st.auction_active):
+                    # A game that ends on someone else's move never passes
+                    # the turn back, so without the game-over check this loop
+                    # sat on "Waiting for … to play" for good.
+                    if new_cur == PLAYER_INDEX or int(st.auction_active) or _is_game_over(st):
                         break
                     name = PLAYER_NAMES.get(new_cur, f"Player {new_cur+1}")
                     live.update(_render(st, NUM_COLORS, NUM_PLAYERS,
