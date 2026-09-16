@@ -35,7 +35,16 @@ WORDS = [
     "RED", "BLUE", "GREEN", "GOLD", "SILVER", "IRON", "COPPER",
     "FALCON", "WOLF", "BEAR", "HAWK", "LYNX", "TIGER", "EAGLE",
     "RIVER", "STONE", "CLOUD", "STORM", "FLAME", "OCEAN",
+    "AMBER", "JADE", "PEARL", "RUBY", "CEDAR", "MAPLE", "OAK",
+    "PINE", "FOX", "OTTER", "RAVEN", "HERON", "COMET", "ORBIT",
+    "HARBOR", "ANCHOR", "CRANE", "DELTA", "MESA", "TUNDRA",
 ]
+CODE_NUM_MIN, CODE_NUM_MAX = 1000, 9999
+# 40 words x 9000 numbers = 360,000 codes.  Keep this large: codes are
+# picked at random, so collisions become likely long before the space is
+# exhausted (birthday paradox).
+CODE_SPACE = len(WORDS) * (CODE_NUM_MAX - CODE_NUM_MIN + 1)
+MAX_CODE_ATTEMPTS = 20
 
 
 def _hash_password(password: str) -> str:
@@ -45,7 +54,7 @@ def _hash_password(password: str) -> str:
 def _generate_code() -> str:
     import random as _random
     word = _random.choice(WORDS)
-    num = _random.randint(10, 99)
+    num = _random.randint(CODE_NUM_MIN, CODE_NUM_MAX)
     return f"{word}-{num}"
 
 
@@ -201,17 +210,26 @@ class Database:
         *containers_per_color* is the starting container supply per colour;
         0 means the rules default of 4 per player.
         """
-        code = _generate_code()
         if seed is None:
             seed = int(time.time() * 1000) % (2**31)
-        with self._connect() as conn:
-            cur = conn.execute(
-                """INSERT INTO games (code, num_players, num_colors, containers_per_color, seed)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (code, num_players, num_colors, containers_per_color, seed),
-            )
-            game_id = cur.lastrowid
-        return game_id, code
+        for _ in range(MAX_CODE_ATTEMPTS):
+            code = _generate_code()
+            try:
+                with self._connect() as conn:
+                    cur = conn.execute(
+                        """INSERT INTO games (code, num_players, num_colors, containers_per_color, seed)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (code, num_players, num_colors, containers_per_color, seed),
+                    )
+                    game_id = cur.lastrowid
+            except sqlite3.IntegrityError as e:
+                if "games.code" not in str(e):
+                    raise
+                continue  # code already taken — draw another
+            return game_id, code
+        raise RuntimeError(
+            f"Could not find a free game code after {MAX_CODE_ATTEMPTS} attempts."
+        )
 
     def get_game_by_code(self, code: str) -> dict | None:
         with self._connect() as conn:
